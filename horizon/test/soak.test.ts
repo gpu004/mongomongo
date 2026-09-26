@@ -41,6 +41,7 @@ test("scripted soak resumes an injected crash without resending the experiment a
     segments: number;
     packetTokens: number[];
     retrievalMs: number[];
+    recoveryMs: number | null;
     ledgerBytes: number;
     artifactBytes: number;
   }[];
@@ -57,5 +58,6 @@ test("scripted soak resumes an injected crash without resending the experiment a
     samples.some((sample) => sample.retrievalMs.length > 0) &&
       samples.every((sample) => sample.retrievalMs.every((ms) => Number.isFinite(ms) && ms >= 0)),
   );
+  assert.ok(samples.every((sample) => sample.recoveryMs !== null && sample.recoveryMs >= 0));
   assert.ok(samples.every((sample) => sample.ledgerBytes > 0 && sample.artifactBytes > 0));
 });

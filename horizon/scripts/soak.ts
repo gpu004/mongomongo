@@ -96,6 +96,7 @@ interface SoakSample {
   spentExperiments: number;
   packetTokens: number[];
   retrievalMs: number[];
+  recoveryMs: number | null;
   ledgerBytes: number;
   sessionBytes: number;
   artifactBytes: number;
@@ -152,6 +153,11 @@ for (let i = 0; i < missionCount; i++) {
       .filter((event) => event.type === "packet.built")
       .map((event) => (event.payload as { retrievalMs?: number }).retrievalMs)
       .filter((value): value is number => value !== undefined);
+    const recoveryMs =
+      events
+        .filter((event) => event.type === "recovery.measured")
+        .map((event) => (event.payload as { durationMs: number }).durationMs)
+        .at(-1) ?? null;
     const sample: SoakSample = {
       missionId,
       run: attempt,
@@ -162,6 +168,7 @@ for (let i = 0; i < missionCount; i++) {
       spentExperiments: mission?.spentExperiments ?? 0,
       packetTokens,
       retrievalMs,
+      recoveryMs,
       ledgerBytes: bytes(paths.db),
       sessionBytes: bytes(paths.sessions),
       artifactBytes: bytes(paths.artifacts),
@@ -199,6 +206,7 @@ const report = {
   injectedFaults: samples.filter((sample) => sample.faultInjected).length,
   replayedFaults: samples.filter((sample) => sample.replayedFault).length,
   maxPacketTokens: samples.reduce((max, sample) => Math.max(max, ...sample.packetTokens), 0),
+  maxRecoveryMs: samples.reduce((max, sample) => Math.max(max, sample.recoveryMs ?? 0), 0),
   maxLedgerBytes: samples.reduce((max, sample) => Math.max(max, sample.ledgerBytes), 0),
   maxSessionBytes: samples.reduce((max, sample) => Math.max(max, sample.sessionBytes), 0),
   maxArtifactBytes: samples.reduce((max, sample) => Math.max(max, sample.artifactBytes), 0),

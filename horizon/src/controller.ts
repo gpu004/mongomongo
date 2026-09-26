@@ -297,6 +297,7 @@ export class MissionController {
         if (orphans.length > 0)
           this.log(`recovery: removed ${orphans.length} orphaned container(s) from a previous run`);
       }
+      const recoveryStartedAt = performance.now();
       const recovery = recover(
         this.ledger,
         this.artifacts,
@@ -308,6 +309,12 @@ export class MissionController {
           contractHash: this.contractHash,
         },
         this.containerRuntime,
+      );
+      this.ledger.appendEvent(
+        `mission:${this.config.missionId}:recovery-measured:${randomUUID()}`,
+        "recovery.measured",
+        this.config.missionId,
+        { durationMs: performance.now() - recoveryStartedAt },
       );
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
