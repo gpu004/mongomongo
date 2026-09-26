@@ -21,7 +21,7 @@ Baseline measurements the prompt asks for that are **not** available: cost in cu
 
 ## 2. Architecture and ownership
 
-- **Canonical mission state**: SQLite ledger (`runs/<mission>/ledger.sqlite`), written only by the controller holding `controller.lock`. Missions, tasks, experiments, artifacts, verifications, episodes, lessons, learned scenarios, checkpoints, segments, events, outbox.
+- **Canonical mission state**: SQLite ledger (`runs/<mission>/state.sqlite`), written only by the controller holding `controller.lock`. Missions, tasks, experiments, artifacts, verifications, episodes, lessons, learned scenarios, checkpoints, segments, events, outbox.
 - **Materialized engineering knowledge**: `resources/features.json` + `resources/skills/*/SKILL.md` (versioned, read-only to the worker) and learned scenarios (additive, versioned, appended to the `learned` suite only after fixture validation).
 - **Episodic experience**: episodes rendered from ledger rows (`renderEpisode`), uploaded via the outbox to the memory adapter under `containerTag = horizon-<mission>`. Superseded episodes are kept but filtered from retrieval.
 - **Raw evidence**: `runs/<mission>/evidence/` and `reports/` on disk; only IDs travel into memory.
@@ -57,7 +57,7 @@ Code: everything under `horizon/` (see PR https://github.com/gpu004/mongomongo/p
 
 ```
 npm run check                      # tsc --noEmit: clean
-npm test                           # 43 tests, 43 pass (test helpers force the local memory adapter so a key in env never routes tests to the hosted service)
+npm test                           # node --test over test/*.test.ts, all pass (test helpers force the local memory adapter so a key in env never routes tests to the hosted service)
 node scripts/smoke-runner.ts       # seed pass/pass/pass; stale-cache smoke pass, correctness fail, perf fail; bypass structural fail
 node src/cli.ts mission create --config mission.example.json && node src/cli.ts run --mission search-p95-demo   # succeeded
 (Docker) mission search-p95-docker status=succeeded, observed container
@@ -69,7 +69,7 @@ node src/cli.ts memory-bench --episodes 1000,10000,100000           # §5.7
 node scripts/supermemory-probe.ts --episodes 12|20                  # §5.8 (hosted, SUPERMEMORY_API_KEY)
 ```
 
-Not run: Pi worker against a live model (no `ANTHROPIC_API_KEY`); any workload larger than 5000 documents or 3 repetitions.
+Not run: Pi worker against a live model (no valid provider API key was available — the plan.md §5 live-mission gate is therefore still open). The gate itself is now mechanised: `mission.live.example.json` selects `"worker": "pi"`, `scripts/live-mission.ts` runs create → interrupted run → resume → export → `live-gate`, and `horizon live-gate` verifies the run from the ledger (Pi-authored experiments, provider-reported usage, measured baseline, independently verified model candidate, checkpoint recovery, cross-segment retrieval after rotation, holdout, `succeeded`). Every scripted run in this repo fails that gate by construction (`worker_is_pi`, `usage_reported`, `model_candidate_verified`), so no scripted artifact can be mistaken for live evidence. Also not run: any workload larger than 5000 documents or 3 repetitions.
 
 ## 5. Results
 

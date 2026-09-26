@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "missionId": "search-p95-live",
+  "contractVersion": 1,
+  "objective": "Reduce p95 latency of GET /search on the fixed read-heavy workload by 30% without violating the search contract.",
+  "targetP95Reduction": 0.3,
+  "acceptanceMargin": 0.05,
+  "requiredImprovedRepetitions": 2,
+  "workload": {
+    "corpusSize": 2000,
+    "seed": 11,
+    "warmupRequests": 50,
+    "measuredRequests": 300,
+    "repetitions": 3,
+    "mutationRatio": 0.05
+  },
+  "holdoutWorkload": {
+    "corpusSize": 2500,
+    "seed": 97,
+    "warmupRequests": 50,
+    "measuredRequests": 300,
+    "repetitions": 3,
+    "mutationRatio": 0.1
+  },
+  "isolation": "subprocess",
+  "containerImage": "node:24-alpine",
+  "memoryLimitBytes": 536870912,
+  "startupTimeoutMs": 15000,
+  "requestTimeoutMs": 5000,
+  "budget": {
+    "maxWallMs": 1200000,
+    "maxExperiments": 6,
+    "maxInputTokens": 600000,
+    "maxOutputTokens": 60000,
+    "maxMemoryOperations": 200,
+    "cycleTimeoutMs": 240000
+  },
+  "segmentRotationCycles": 2,
+  "stagnationLimit": 3,
+  "model": {
+    "provider": "anthropic",
+    "id": "claude-sonnet-4-5"
+  },
+  "worker": "pi",
+  "memory": {
+    "enabled": true,
+    "containerTag": "horizon-search-p95-live",
+    "materializeCorrections": true
+  }
+}

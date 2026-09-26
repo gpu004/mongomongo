@@ -13,6 +13,7 @@ import {
 import { LocalMemoryAdapter } from "../src/memory-adapter.ts";
 import type { MissionConfig } from "../src/mission-contract.ts";
 import { missionPaths } from "../src/mission-paths.ts";
+import { resolveProviderApiKey } from "../src/pi-worker.ts";
 import { ScriptedWorker } from "../src/scripted-worker.ts";
 import type { Worker } from "../src/worker.ts";
 import { EXAMPLE_CONFIG, tempRunsRoot, testConfig } from "./helpers.ts";
@@ -144,7 +145,7 @@ test("cli compare with worker pi and no provider key fails before creating any m
   );
   const envKey = `${base.model.provider.toUpperCase().replace(/-/g, "_")}_API_KEY`;
   const env = { ...process.env };
-  delete env[envKey];
+  for (const key of resolveProviderApiKey(base.model.provider, env).envKeys) delete env[key];
   const proc = spawnSync(
     process.execPath,
     [CLI, "compare", "--config", configPath, "--runs-root", runsRoot],
