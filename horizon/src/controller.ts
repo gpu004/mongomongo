@@ -33,7 +33,7 @@ import {
   renderEpisode,
   SupermemoryAdapter,
 } from "./memory-adapter.ts";
-import { MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
+import { composeRetrievalQuery, MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
 import { contractHash, type MissionConfig } from "./mission-contract.ts";
 import {
   ensureMissionDirs,
@@ -46,11 +46,13 @@ import { ScriptedWorker } from "./scripted-worker.ts";
 import { type BrokerHooks, ToolBroker } from "./tool-broker.ts";
 import {
   firstComparison,
+  freezeAcceptanceMargin,
   repetitionSpread,
   rerunComparison,
   type TimingDecision,
+  type TimingPolicy,
 } from "./timing-policy.ts";
-import type { Worker, WorkerCycleResult } from "./worker.ts";
+import { type Worker, type WorkerCycleResult, WorkerUnavailableError } from "./worker.ts";
 
 export const RESOURCES_DIR = new URL("../resources/", import.meta.url).pathname;
 
@@ -62,6 +64,8 @@ export interface ControllerOptions {
   crashAt?: string;
   /** Stop after this many cycles regardless of budget (CLI --cycles). */
   maxCycles?: number;
+  /** Test hook: how `run()` waits for a persisted `nextWakeAt` (default: real sleep). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export type Verdict = "accepted" | "rejected" | "inconclusive";
@@ -139,6 +143,7 @@ export class MissionController {
   private readonly log: (line: string) => void;
   private readonly crashAt: string | undefined;
   private readonly maxCycles: number;
+  private readonly sleep: (ms: number) => Promise<void>;
   readonly evaluatorHash: string;
   readonly environmentHash: string;
   readonly contractHash: string;
@@ -158,6 +163,7 @@ export class MissionController {
     this.log = options.log ?? (() => {});
     this.crashAt = options.crashAt;
     this.maxCycles = options.maxCycles ?? Number.POSITIVE_INFINITY;
+    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.evaluatorHash = computeEvaluatorHash();
     this.environmentHash = computeEnvironmentHash(config.isolation, config.containerImage);
     this.contractHash = contractHash(config);
@@ -261,7 +267,8 @@ export class MissionController {
       );
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
-      this.ledger.updateMission(this.config.missionId, { status: "running" });
+      await this.honourWakeTime();
+      this.ledger.updateMission(this.config.missionId, { status: "running", nextWakeAt: null });
       await this.drainOutbox();
 
       let cycles = 0;
@@ -297,6 +304,7 @@ export class MissionController {
             this.finish("blocked", "worker has no further hypotheses");
             break;
           }
+          if (done === "blocked" || done === "waiting") break;
         }
       }
       await this.drainOutbox();
@@ -328,9 +336,67 @@ export class MissionController {
     );
   }
 
+  /** A `waiting` mission persisted its retry time; sleep it off (unbilled) before touching the worker again. */
+  private async honourWakeTime(): Promise<void> {
+    const mission = this.mission();
+    if (mission.status !== "waiting" || !mission.nextWakeAt) return;
+    const delay = Date.parse(mission.nextWakeAt) - Date.now();
+    if (delay <= 0) return;
+    this.log(`mission waiting until ${mission.nextWakeAt} (${Math.ceil(delay / 1000)}s)`);
+    await this.sleep(delay);
+    this.wallMark = Date.now();
+  }
+
+  /**
+   * The worker itself is unavailable (not the candidate). A missing credential
+   * blocks the mission; a rate limit parks it in `waiting` with `nextWakeAt` so
+   * `resume` can honour the retry time. Any experiment opened for this cycle is
+   * interrupted, exactly as after a crash.
+   */
+  private parkOnWorkerFault(
+    error: WorkerUnavailableError,
+    experimentId: string | null,
+  ): "blocked" | "waiting" {
+    if (experimentId)
+      this.ledger.transaction(() => {
+        this.ledger.updateExperiment(experimentId, {
+          status: "interrupted",
+          verdict: `worker unavailable: ${error.message}`,
+          finishedAt: new Date().toISOString(),
+        });
+        this.ledger.appendEvent(
+          `${experimentId}:interrupted:worker`,
+          "experiment.interrupted",
+          experimentId,
+          { previousStatus: "editing", reason: error.kind },
+        );
+      });
+    if (error.kind !== "rate_limited") {
+      this.finish("blocked", error.message);
+      return "blocked";
+    }
+    const nextWakeAt = new Date(Date.now() + (error.retryAfterMs ?? 0)).toISOString();
+    this.ledger.transaction(() => {
+      this.ledger.updateMission(this.config.missionId, {
+        status: "waiting",
+        activeTaskId: null,
+        nextWakeAt,
+      });
+      this.ledger.appendEvent(
+        `mission:${this.config.missionId}:waiting:${Date.now()}`,
+        "mission.waiting",
+        this.config.missionId,
+        { reason: error.message, nextWakeAt },
+      );
+      this.checkpoint("waiting", "optimize-search", null, "waiting:provider");
+    });
+    this.log(`mission waiting: ${error.message}; resume at or after ${nextWakeAt}`);
+    return "waiting";
+  }
+
   private finish(status: MissionStatus, detail = ""): void {
     this.ledger.transaction(() => {
-      this.ledger.updateMission(this.config.missionId, { status });
+      this.ledger.updateMission(this.config.missionId, { status, nextWakeAt: null });
       this.ledger.appendEvent(
         `mission:${this.config.missionId}:finish:${Date.now()}`,
         "mission.finished",
@@ -390,6 +456,36 @@ export class MissionController {
       throw new BaselineError("baseline not established");
     }
     const noise = repetitionSpread(perf.metrics.repetitionP95Ms);
+    const floor = freezeAcceptanceMargin(
+      this.config.acceptanceMargin,
+      noise,
+      this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
+    );
+    if (floor.kind === "repair") {
+      this.ledger.transaction(() => {
+        this.ledger.updateExperiment(experimentId, {
+          status: "inconclusive",
+          verdict: `baseline p95 ${perf.metrics.p95LatencyMs}ms; ${floor.reason}`,
+          finishedAt: new Date().toISOString(),
+        });
+        this.ledger.appendEvent(
+          `target:${this.config.missionId}:noise-floor:${perf.reportId}`,
+          "target.noise_floor_exceeded",
+          this.config.missionId,
+          {
+            repetitionSpread: noise,
+            acceptanceMargin: this.config.acceptanceMargin,
+            maxRepetitionSpread: this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
+            reportId: perf.reportId,
+          },
+        );
+      });
+      this.log(
+        `baseline p95 ${perf.metrics.p95LatencyMs}ms; repetition spread ${(noise * 100).toFixed(1)}% too large to distinguish useful changes`,
+      );
+      this.finish("blocked", floor.reason);
+      throw new BaselineError("baseline noise exceeds the measurable range");
+    }
     this.ledger.transaction(() => {
       this.ledger.updateExperiment(experimentId, {
         status: "accepted",
@@ -398,6 +494,7 @@ export class MissionController {
       });
       this.ledger.updateMission(this.config.missionId, {
         baselineP95Ms: perf.metrics.p95LatencyMs ?? null,
+        frozenAcceptanceMargin: floor.acceptanceMargin,
         bestP95Ms: perf.metrics.p95LatencyMs ?? null,
         bestArtifactHash: seed,
       });
@@ -415,8 +512,10 @@ export class MissionController {
         {
           repetitionSpread: noise,
           acceptanceMargin: this.config.acceptanceMargin,
+          frozenAcceptanceMargin: floor.acceptanceMargin,
+          marginRaised: floor.raised,
           targetP95Reduction: this.config.targetP95Reduction,
-          marginCoversNoise: this.config.acceptanceMargin >= noise,
+          marginCoversNoise: floor.acceptanceMargin >= noise,
         },
       );
       this.checkpoint("running", "optimize-search", null, "baseline-complete");
@@ -424,10 +523,19 @@ export class MissionController {
     this.log(
       `baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms; repetition spread ${(noise * 100).toFixed(1)}%)`,
     );
-    if (this.config.acceptanceMargin < noise)
+    if (floor.raised)
       this.log(
-        `  warning: acceptance margin ${this.config.acceptanceMargin} is below the measured repetition spread ${noise.toFixed(3)}; expect ambiguous timing verdicts`,
+        `  acceptance margin frozen at ${floor.acceptanceMargin} (configured ${this.config.acceptanceMargin} is below the measured repetition spread ${noise.toFixed(3)})`,
       );
+    else this.log(`  acceptance margin frozen at ${floor.acceptanceMargin}`);
+  }
+
+  /** Margin frozen after the baseline measured its noise; the configured value before that. */
+  private timingPolicy(mission: MissionRow): TimingPolicy {
+    return {
+      acceptanceMargin: mission.frozenAcceptanceMargin ?? this.config.acceptanceMargin,
+      requiredImprovedRepetitions: this.config.requiredImprovedRepetitions,
+    };
   }
 
   private async runHoldout(): Promise<void> {
@@ -472,10 +580,15 @@ export class MissionController {
   private async runCycle(
     cycle: number,
     recovery: RecoveryOutcome,
-  ): Promise<"continue" | "exhausted"> {
+  ): Promise<"continue" | "exhausted" | "blocked" | "waiting"> {
     const mission = this.mission();
     const parent = mission.bestArtifactHash ?? mission.seedArtifactHash!;
-    await this.ensureSegment();
+    try {
+      await this.ensureSegment();
+    } catch (error) {
+      if (error instanceof WorkerUnavailableError) return this.parkOnWorkerFault(error, null);
+      throw error;
+    }
 
     const experimentId = `exp-${String(mission.spentExperiments + 1).padStart(4, "0")}-${randomUUID().slice(0, 8)}`;
     this.ledger.transaction(() => {
@@ -526,13 +639,21 @@ export class MissionController {
       () => this.cycleDeadline,
     );
     const recoveryNote = recovery.actions.find((a) => a.kind === "interrupted_edit")?.detail;
-    const result = await this.worker.runCycle({
-      cycle,
-      packet,
-      broker,
-      deadlineAt: this.cycleDeadline,
-      ...(cycle === 1 && recoveryNote ? { recoveryNote } : {}),
-    });
+    let result: WorkerCycleResult;
+    try {
+      result = await this.worker.runCycle({
+        cycle,
+        packet,
+        broker,
+        deadlineAt: this.cycleDeadline,
+        ...(cycle === 1 && recoveryNote ? { recoveryNote } : {}),
+      });
+    } catch (error) {
+      broker.terminateChildren();
+      if (error instanceof WorkerUnavailableError)
+        return this.parkOnWorkerFault(error, experimentId);
+      throw error;
+    }
     broker.terminateChildren();
     this.spendTokens(result.usage);
     const audit = auditClaim(result.claim, broker.verifications);
@@ -709,7 +830,7 @@ export class MissionController {
       perf.metrics,
       mission.bestP95Ms,
       bestReps,
-      this.config,
+      this.timingPolicy(mission),
     );
     let accepted = perf;
     if (decision.kind === "ambiguous") {
@@ -800,7 +921,7 @@ export class MissionController {
         firstBestReps,
         candidate.metrics,
         bestReport.metrics,
-        this.config,
+        this.timingPolicy(mission),
       ),
       candidate,
     };
@@ -1235,6 +1356,25 @@ export class MissionController {
     };
   }
 
+  /** Cycle-start retrieval query composed from the active task, its hypothesis, and the last finished experiment's features, invariants and verdict. */
+  private retrievalQuery(experiments: ExperimentRow[], experimentId: string): string {
+    const task = this.ledger
+      .listTasks(this.config.missionId)
+      .find((t) => t.taskId === "optimize-search");
+    const last = experiments
+      .filter((e) => e.experimentId !== experimentId && e.verdict !== null)
+      .at(-1);
+    const episode = last ? this.ledger.getEpisode(`ep-${last.experimentId}-v1`) : undefined;
+    return composeRetrievalQuery({
+      taskId: "optimize-search",
+      hypothesis: last?.hypothesis ?? task?.hypothesis ?? null,
+      featureIds: episode?.featureIds ?? [],
+      invariantIds: episode?.invariantIds ?? [],
+      lastVerdict: last?.verdict ?? null,
+      lastFailureSignature: last?.failureSignature ?? null,
+    });
+  }
+
   private async buildPacket(
     mission: MissionRow,
     experimentId: string,
@@ -1254,10 +1394,7 @@ export class MissionController {
       .join("\n\n");
     const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
     const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
-    const query =
-      experiments.length > 0
-        ? "search engine cache invalidation normalization p95"
-        : "baseline read path";
+    const query = this.retrievalQuery(experiments, experimentId);
     const retrieval = this.config.memory.enabled
       ? await retrieveEpisodes(
           this.memory,
@@ -1277,7 +1414,7 @@ export class MissionController {
     const lastVerdict = experiments.at(-1)?.verdict ?? "no experiments yet";
     const pinned = [
       `Mission ${mission.missionId} (contract v${mission.contractVersion}, hash ${mission.contractHash.slice(0, 12)}). Objective: ${this.config.objective}`,
-      `Baseline p95 ${mission.baselineP95Ms ?? "unmeasured"}ms; current best ${mission.bestP95Ms ?? "n/a"}ms (artifact ${(mission.bestArtifactHash ?? "").slice(0, 12)}); target <= ${mission.baselineP95Ms !== null ? (mission.baselineP95Ms * (1 - this.config.targetP95Reduction)).toFixed(2) : "?"}ms; acceptance margin ${this.config.acceptanceMargin}.`,
+      `Baseline p95 ${mission.baselineP95Ms ?? "unmeasured"}ms; current best ${mission.bestP95Ms ?? "n/a"}ms (artifact ${(mission.bestArtifactHash ?? "").slice(0, 12)}); target <= ${mission.baselineP95Ms !== null ? (mission.baselineP95Ms * (1 - this.config.targetP95Reduction)).toFixed(2) : "?"}ms; acceptance margin ${this.timingPolicy(mission).acceptanceMargin}.`,
       `Budget: experiments ${mission.spentExperiments}/${this.config.budget.maxExperiments}; tokens in ${mission.spentInputTokens}/${this.config.budget.maxInputTokens}, out ${mission.spentOutputTokens}/${this.config.budget.maxOutputTokens}; cycle limit ${this.config.budget.cycleTimeoutMs}ms.`,
       `Constraints: edits only under src/; mutations via DocumentService; contract invariants are fixed; the verifier is the only source of truth. Experiment ${experimentId}.`,
       retrieval.degraded
@@ -1301,6 +1438,7 @@ export class MissionController {
       DEFAULT_PACKET_BUDGET,
     );
     this.ledger.appendEvent(`${experimentId}:packet`, "packet.built", experimentId, {
+      query,
       tokens: packet.tokens,
       sections: packet.sections,
       injected: packet.injectedEpisodeIds,
