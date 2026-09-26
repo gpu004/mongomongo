@@ -1,6 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { Ledger } from "../src/ledger.ts";
@@ -12,6 +19,8 @@ const { values } = parseArgs({
     config: { type: "string" },
     out: { type: "string" },
     missions: { type: "string" },
+    hours: { type: "string" },
+    experiments: { type: "string" },
     "max-runs": { type: "string" },
     "fault-every": { type: "string" },
   },
@@ -28,7 +37,18 @@ const configPath = resolve(
   values.config ?? new URL("../mission.example.json", import.meta.url).pathname,
 );
 const out = resolve(values.out ?? join("runs", `soak-${Date.now()}`));
-const missionCount = positiveInteger(values.missions, 10, "missions");
+const hours = values.hours === undefined ? undefined : Number(values.hours);
+if (hours !== undefined && (!Number.isFinite(hours) || hours <= 0))
+  throw new Error("hours must be a positive number");
+const targetExperiments =
+  values.experiments === undefined
+    ? undefined
+    : positiveInteger(values.experiments, 1, "experiments");
+const missionCount = positiveInteger(
+  values.missions,
+  hours !== undefined || targetExperiments !== undefined ? Number.MAX_SAFE_INTEGER : 10,
+  "missions",
+);
 const maxRuns = positiveInteger(values["max-runs"], 8, "max-runs");
 const faultEvery = positiveInteger(values["fault-every"], 2, "fault-every");
 const base = loadMissionConfig(configPath);
@@ -84,7 +104,12 @@ interface SoakSample {
 
 const samples: SoakSample[] = [];
 const suffix = randomUUID().slice(0, 8);
+const startedAt = Date.now();
+let completedMissions = 0;
+let completedExperiments = 0;
 for (let i = 0; i < missionCount; i++) {
+  if (hours !== undefined && Date.now() - startedAt >= hours * 3_600_000) break;
+  if (targetExperiments !== undefined && completedExperiments >= targetExperiments) break;
   const missionId = `soak-${suffix}-${i + 1}`;
   const config: MissionConfig = {
     ...base,
@@ -151,7 +176,7 @@ for (let i = 0; i < missionCount; i++) {
     ledger.close();
     samples.push(sample);
     console.log(JSON.stringify(sample));
-    writeFileSync(join(out, "samples.json"), JSON.stringify(samples, null, 2));
+    appendFileSync(join(out, "samples.jsonl"), `${JSON.stringify(sample)}\n`);
     finished =
       mission?.status === "succeeded" ||
       mission?.status === "budget_exhausted" ||
@@ -159,12 +184,16 @@ for (let i = 0; i < missionCount; i++) {
     if (finished) break;
   }
   if (!finished) throw new Error(`mission ${missionId} did not finish within ${maxRuns} runs`);
+  completedMissions++;
+  completedExperiments += samples.at(-1)?.spentExperiments ?? 0;
 }
 
 const report = {
   configPath,
   out,
-  missions: missionCount,
+  missions: completedMissions,
+  experiments: completedExperiments,
+  elapsedMs: Date.now() - startedAt,
   injectedFaults: samples.filter((sample) => sample.faultInjected).length,
   replayedFaults: samples.filter((sample) => sample.replayedFault).length,
   maxPacketTokens: Math.max(0, ...samples.flatMap((sample) => sample.packetTokens)),
@@ -173,5 +202,6 @@ const report = {
   maxArtifactBytes: Math.max(0, ...samples.map((sample) => sample.artifactBytes)),
   samples: samples.length,
 };
+writeFileSync(join(out, "samples.json"), JSON.stringify(samples, null, 2));
 writeFileSync(join(out, "report.json"), JSON.stringify(report, null, 2));
 console.log(JSON.stringify(report, null, 2));
