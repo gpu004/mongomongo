@@ -366,8 +366,6 @@ export class Ledger {
     this.db.close();
   }
 
-  // ---- lease --------------------------------------------------------------
-
   /**
    * Atomically claim the mission lease. Succeeds when nobody holds it, the
    * holder's lease has expired, or `owner` already holds it; every successful
@@ -452,8 +450,6 @@ export class Ledger {
     }
   }
 
-  // ---- events -------------------------------------------------------------
-
   /** Append an event; a duplicate key is harmless and returns the existing seq. */
   appendEvent(eventKey: string, type: string, entityId: string, payload: unknown): number {
     const existing = this.db.prepare("SELECT seq FROM event WHERE event_key = ?").get(eventKey) as
@@ -502,8 +498,6 @@ export class Ledger {
     };
     return Number(row.seq);
   }
-
-  // ---- mission ------------------------------------------------------------
 
   createMission(
     row: Omit<
@@ -610,8 +604,6 @@ export class Ledger {
     this.db.prepare(`UPDATE mission SET ${sets.join(", ")} WHERE mission_id = ?`).run(...values);
   }
 
-  // ---- tasks --------------------------------------------------------------
-
   upsertTask(task: TaskRow): void {
     this.db
       .prepare(
@@ -646,8 +638,6 @@ export class Ledger {
       nextAction: String(r.next_action),
     }));
   }
-
-  // ---- experiments --------------------------------------------------------
 
   insertExperiment(
     e: Omit<
@@ -751,8 +741,6 @@ export class Ledger {
     ).map(toExperiment);
   }
 
-  // ---- artifacts / verification ------------------------------------------
-
   insertArtifact(a: ArtifactRow): void {
     this.db
       .prepare(
@@ -816,8 +804,6 @@ export class Ledger {
         .all(missionId) as Row[]
     ).map(toVerification);
   }
-
-  // ---- episodes / lessons -------------------------------------------------
 
   insertEpisode(e: EpisodeRow): void {
     const inserted = this.db
@@ -1047,8 +1033,6 @@ export class Ledger {
     }));
   }
 
-  // ---- checkpoints / segments / outbox -----------------------------------
-
   writeCheckpoint(
     c: Omit<CheckpointRow, "checkpointId" | "seq" | "createdAt" | "lastEventSeq">,
   ): CheckpointRow {
@@ -1162,8 +1146,6 @@ export class Ledger {
         .changes,
     );
   }
-
-  // ---- execution environments -------------------------------------------
 
   /** Durable record written before `docker run`, so a crashed controller's container can be found on resume. */
   registerContainer(containerName: string, missionId: string, experimentId: string): void {

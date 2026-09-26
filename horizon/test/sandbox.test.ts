@@ -83,7 +83,6 @@ test("sandbox: docker run is non-root, capability-less, read-only, bounded and l
     `${OPERATION_LABEL}=exp-7`,
     `${ROLE_LABEL}=worker-exec`,
   ]);
-  // image then command, nothing after
   assert.deepEqual(args.slice(args.indexOf(PINNED)), [PINNED, "ls", "src"]);
 });
 

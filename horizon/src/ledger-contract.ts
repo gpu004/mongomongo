@@ -41,34 +41,28 @@ export interface AsyncLedger {
   close(): Promise<void>;
   transaction<T>(fn: (tx: AsyncLedger) => Promise<T>): Promise<T>;
 
-  // lease
   claimLease(missionId: string, owner: string, ttlMs: number, at?: Date): Promise<LeaseRow>;
   renewLease(lease: LeaseRow, ttlMs: number, at?: Date): Promise<LeaseRow>;
   releaseLease(lease: LeaseRow): Promise<void>;
   getLease(missionId: string): Promise<LeaseRow | undefined>;
 
-  // events
   appendEvent(eventKey: string, type: string, entityId: string, payload: unknown): Promise<number>;
   eventsSince(seq: number, limit?: number): Promise<EventRow[]>;
   findEvent(eventKey: string): Promise<EventRow | undefined>;
   lastEventSeq(): Promise<number>;
 
-  // mission
   createMission(row: NewMissionRow): Promise<void>;
   getMission(missionId: string): Promise<MissionRow | undefined>;
   updateMission(missionId: string, patch: MissionPatch): Promise<void>;
 
-  // tasks
   upsertTask(task: TaskRow): Promise<void>;
   listTasks(missionId: string): Promise<TaskRow[]>;
 
-  // experiments
   insertExperiment(e: NewExperimentRow): Promise<void>;
   updateExperiment(experimentId: string, patch: ExperimentPatch): Promise<void>;
   getExperiment(experimentId: string): Promise<ExperimentRow | undefined>;
   listExperiments(missionId: string): Promise<ExperimentRow[]>;
 
-  // artifacts / verification
   insertArtifact(a: ArtifactRow): Promise<void>;
   getArtifact(hash: string): Promise<ArtifactRow | undefined>;
   insertVerification(report: VerificationReport, path: string): Promise<void>;
@@ -79,7 +73,6 @@ export interface AsyncLedger {
   ): Promise<VerificationRow | undefined>;
   listVerifications(missionId: string): Promise<VerificationRow[]>;
 
-  // episodes / lessons
   insertEpisode(e: EpisodeRow): Promise<void>;
   isIndexed(episodeId: string): Promise<boolean>;
   isSuperseded(episodeId: string): Promise<boolean>;
@@ -104,13 +97,11 @@ export interface AsyncLedger {
   ): Promise<void>;
   listLearnedScenarios(missionId: string): Promise<LearnedScenarioRow[]>;
 
-  // execution environments
   registerContainer(containerName: string, missionId: string, experimentId: string): Promise<void>;
   releaseContainer(containerName: string, state?: ContainerState): Promise<void>;
   listLiveContainers(missionId: string): Promise<ContainerRow[]>;
   listContainers(missionId: string): Promise<ContainerRow[]>;
 
-  // checkpoints / segments / outbox
   writeCheckpoint(c: NewCheckpointRow): Promise<CheckpointRow>;
   latestCheckpoint(missionId: string): Promise<CheckpointRow | undefined>;
   countCheckpoints(missionId: string): Promise<number>;

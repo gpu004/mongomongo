@@ -25,7 +25,7 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ```sh
 npm install
 npm run check          # tsc --noEmit
-npm run lint           # oxlint .
+npm run lint           # oxlint . + scripts/lint-comments.ts (no section dividers, diff narration, or unjustified suppressions)
 npm run format:check   # oxfmt --check . (npm run format rewrites in place)
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, ledger contract
 MONGODB_URI=... npm test   # additionally runs the ledger contract tests against MongoDB in a throwaway database

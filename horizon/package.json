@@ -10,7 +10,7 @@
   "scripts": {
     "horizon": "node src/cli.ts",
     "check": "tsc --noEmit",
-    "lint": "oxlint .",
+    "lint": "oxlint . && node scripts/lint-comments.ts",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
