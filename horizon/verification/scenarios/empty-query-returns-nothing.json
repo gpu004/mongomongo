@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "empty-query-returns-nothing",
+  "suite": "correctness",
+  "description": "An empty or whitespace-only query returns no results.",
+  "invariantIds": [
+    "INV-EMPTY-QUERY"
+  ],
+  "sequence": [
+    {
+      "op": "insert",
+      "id": "a",
+      "title": "x",
+      "body": "y"
+    },
+    {
+      "op": "search",
+      "q": ""
+    },
+    {
+      "op": "search",
+      "q": "   "
+    }
+  ],
+  "example": "GET /search?q= -> {ids:[]}"
+}

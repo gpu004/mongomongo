@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "multi-term-substring-match",
+  "suite": "correctness",
+  "description": "Every term must be a substring of title+' '+body; token boundaries are not required.",
+  "invariantIds": [
+    "INV-SUBSTRING",
+    "INV-ALL-TERMS"
+  ],
+  "sequence": [
+    {
+      "op": "insert",
+      "id": "d1",
+      "title": "Database systems",
+      "body": "indexing and storage"
+    },
+    {
+      "op": "insert",
+      "id": "d2",
+      "title": "Data pipelines",
+      "body": "stream processing"
+    },
+    {
+      "op": "search",
+      "q": "data"
+    },
+    {
+      "op": "search",
+      "q": "data index"
+    },
+    {
+      "op": "search",
+      "q": "base stor"
+    },
+    {
+      "op": "search",
+      "q": "data missing"
+    }
+  ],
+  "example": "GET /search?q=data%20index -> {ids:[\"d1\"]}"
+}

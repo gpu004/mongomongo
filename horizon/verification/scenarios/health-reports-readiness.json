@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "health-reports-readiness",
+  "suite": "smoke",
+  "description": "Health endpoint responds and reports the document count; it does not claim correctness.",
+  "invariantIds": [
+    "INV-HEALTH"
+  ],
+  "sequence": [
+    {
+      "op": "health"
+    },
+    {
+      "op": "insert",
+      "id": "a",
+      "title": "Alpha",
+      "body": "first"
+    },
+    {
+      "op": "health"
+    }
+  ],
+  "example": "GET /health -> {ok:true,documents:1}"
+}

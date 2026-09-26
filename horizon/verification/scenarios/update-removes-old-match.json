@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "update-removes-old-match",
+  "suite": "correctness",
+  "description": "After an update, the old content no longer matches.",
+  "invariantIds": [
+    "INV-UPDATE-VISIBILITY"
+  ],
+  "sequence": [
+    {
+      "op": "insert",
+      "id": "u1",
+      "title": "Old title",
+      "body": "obsolete text"
+    },
+    {
+      "op": "search",
+      "q": "obsolete"
+    },
+    {
+      "op": "update",
+      "id": "u1",
+      "body": "fresh text"
+    },
+    {
+      "op": "search",
+      "q": "obsolete"
+    },
+    {
+      "op": "search",
+      "q": "fresh"
+    }
+  ],
+  "example": "PATCH /documents/u1 then GET /search?q=obsolete -> {ids:[]}"
+}

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "insert-visible-immediately",
+  "suite": "correctness",
+  "description": "A document is searchable as soon as the insert response returns; duplicate ids are rejected.",
+  "invariantIds": [
+    "INV-INSERT-VISIBILITY"
+  ],
+  "sequence": [
+    {
+      "op": "search",
+      "q": "lantern"
+    },
+    {
+      "op": "insert",
+      "id": "n1",
+      "title": "Lantern",
+      "body": "light"
+    },
+    {
+      "op": "search",
+      "q": "lantern"
+    },
+    {
+      "op": "insert",
+      "id": "n1",
+      "title": "Dup",
+      "body": "x"
+    },
+    {
+      "op": "search",
+      "q": "dup"
+    }
+  ],
+  "example": "POST /documents then GET /search?q=lantern -> {ids:[\"n1\"]}"
+}
