@@ -27,10 +27,7 @@ test("retrieval query is composed from task, hypothesis, features, invariants an
     "stale",
     "correctness",
   ]) {
-    assert.ok(
-      query.split(" ").includes(term),
-      `query "${query}" should contain "${term}"`,
-    );
+    assert.ok(query.split(" ").includes(term), `query "${query}" should contain "${term}"`);
   }
   // Terms are deduplicated and lower-cased; single characters are dropped.
   assert.equal(new Set(query.split(" ")).size, query.split(" ").length);
@@ -115,14 +112,13 @@ test("controller composes the packet retrieval query from the previous cycle's s
   assert.match(queries[1]!, /marker1/);
   assert.match(queries[1]!, /tokenizer/);
   assert.ok(firstVerdict, "first experiment has a verdict");
-  const verdictTerm = firstVerdict.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(Boolean)[0]!;
+  const verdictTerm = firstVerdict
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}_]+/u)
+    .filter(Boolean)[0]!;
   assert.ok(
     queries[1]!.split(" ").includes(verdictTerm),
     `second query carries the last verdict "${firstVerdict}": ${queries[1]}`,
   );
-  assert.equal(
-    new Set(queries).size,
-    queries.length,
-    "queries differ across cycles",
-  );
+  assert.equal(new Set(queries).size, queries.length, "queries differ across cycles");
 });

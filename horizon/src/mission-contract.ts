@@ -109,7 +109,7 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     fail("budget incomplete");
   if (typeof c.segmentRotationCycles !== "number" || c.segmentRotationCycles < 1)
     fail("segmentRotationCycles >= 1");
-  if (typeof c.stagnationLimit !== "number") fail("stagnationLimit required");
+  if (typeof c.stagnationLimit !== "number" || c.stagnationLimit < 1) fail("stagnationLimit >= 1");
   if (!c.model || typeof c.model.provider !== "string" || typeof c.model.id !== "string")
     fail("model required");
   if (c.worker !== "scripted" && c.worker !== "pi") fail("worker must be scripted|pi");
