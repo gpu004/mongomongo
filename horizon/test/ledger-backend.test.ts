@@ -73,7 +73,8 @@ test("openLedger returns a sqlite ledger without MONGODB_URI and a controller ru
   await controller.initialize();
   assert.equal(controller.ledger.backend, "sqlite");
   const created = await controller.ledger.findEvent("mission:backend-sqlite:created");
-  assert.equal((created?.payload as { ledgerBackend: string }).ledgerBackend, "sqlite");
+  assert.ok(created, "mission.created event recorded");
+  assert.equal((created.payload as { ledgerBackend: string }).ledgerBackend, "sqlite");
   await controller.close();
 });
 
