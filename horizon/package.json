@@ -10,6 +10,9 @@
   "scripts": {
     "horizon": "node src/cli.ts",
     "check": "tsc --noEmit",
+    "lint": "oxlint .",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
     "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
     "seed:serve": "node demo/search-service/src/http/server.ts"
   },

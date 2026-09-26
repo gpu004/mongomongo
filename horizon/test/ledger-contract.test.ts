@@ -67,6 +67,7 @@ function mission(ledger: AsyncLedger, missionId = MISSION) {
     bestP95Ms: 10,
     activeTaskId: null,
     nextWakeAt: null,
+    frozenAcceptanceMargin: null,
   });
 }
 
@@ -194,7 +195,10 @@ for (const makeBackend of backends) {
         ["r1", "r2"],
         "same identity tuple is recorded once",
       );
-      assert.equal((await ledger.findVerification("exp-1", "a".repeat(64), "smoke"))?.reportId, "r1");
+      assert.equal(
+        (await ledger.findVerification("exp-1", "a".repeat(64), "smoke"))?.reportId,
+        "r1",
+      );
       assert.equal(verifications[0]?.p95LatencyMs, 7.5);
 
       const lesson = {
@@ -265,7 +269,11 @@ for (const makeBackend of backends) {
       assert.equal(await ledger.countCheckpoints(MISSION), 2);
 
       await ledger.openSegment(MISSION, 1, "/tmp/s1", "sess-1");
-      assert.equal(await ledger.activeSegment(MISSION), undefined, "uncommitted segment is not active");
+      assert.equal(
+        await ledger.activeSegment(MISSION),
+        undefined,
+        "uncommitted segment is not active",
+      );
       await ledger.openSegment(MISSION, 2, null, null);
       assert.equal(await ledger.discardUncommittedSegments(MISSION), 2);
       await ledger.openSegment(MISSION, 1, "/tmp/s1", "sess-1");
@@ -300,7 +308,10 @@ for (const makeBackend of backends) {
           supersedes: "ep-2",
         }),
       );
-      assert.equal((await ledger.getEpisode("ep-1"))?.summary, "normalized cache invalidation kept p95 flat");
+      assert.equal(
+        (await ledger.getEpisode("ep-1"))?.summary,
+        "normalized cache invalidation kept p95 flat",
+      );
       assert.deepEqual(
         (await ledger.listEpisodes(MISSION)).map((e) => e.episodeId),
         ["ep-1", "ep-2", "ep-3"],
@@ -464,24 +475,28 @@ for (const makeBackend of backends) {
   });
 }
 
-test("[mongodb] doctor probe writes, transacts, indexes and cleans up", { skip: !mongoEnv }, async () => {
-  const env = { uri: mongoEnv!.uri, db: `horizon_test_${randomUUID().slice(0, 8)}` };
-  const result = await probeMongo(env);
-  assert.equal(result.error, null);
-  assert.equal(result.roundTrip, "ok");
-  assert.equal(result.transactions, "ok");
-  assert.deepEqual(result.missingIndexes, []);
-  assert.equal(result.cleanedUp, true);
-  assert.equal(result.ok, true);
-  assert.ok(!result.target.includes("@"), "target never carries credentials");
-  const ledger = await MongoLedger.connect(env, "probe-cleanup");
-  try {
-    assert.equal(await ledger.db.collection("doctor_probe").countDocuments(), 0);
-  } finally {
-    await ledger.close();
-    await dropDatabase(env);
-  }
-});
+test(
+  "[mongodb] doctor probe writes, transacts, indexes and cleans up",
+  { skip: !mongoEnv },
+  async () => {
+    const env = { uri: mongoEnv!.uri, db: `horizon_test_${randomUUID().slice(0, 8)}` };
+    const result = await probeMongo(env);
+    assert.equal(result.error, null);
+    assert.equal(result.roundTrip, "ok");
+    assert.equal(result.transactions, "ok");
+    assert.deepEqual(result.missingIndexes, []);
+    assert.equal(result.cleanedUp, true);
+    assert.equal(result.ok, true);
+    assert.ok(!result.target.includes("@"), "target never carries credentials");
+    const ledger = await MongoLedger.connect(env, "probe-cleanup");
+    try {
+      assert.equal(await ledger.db.collection("doctor_probe").countDocuments(), 0);
+    } finally {
+      await ledger.close();
+      await dropDatabase(env);
+    }
+  },
+);
 
 test("[mongodb] search window is bounded", { skip: !mongoEnv }, async () => {
   const backend = mongoBackend();
@@ -490,7 +505,9 @@ test("[mongodb] search window is bounded", { skip: !mongoEnv }, async () => {
     await mission(ledger);
     const total = RECENT_EPISODE_WINDOW + 5;
     for (let i = 0; i < total; i += 1)
-      await ledger.insertEpisode(episode(`ep-${i}`, i < 5 ? "ancient rare term" : "recent common term"));
+      await ledger.insertEpisode(
+        episode(`ep-${i}`, i < 5 ? "ancient rare term" : "recent common term"),
+      );
     const ancient = await ledger.searchEpisodes(MISSION, "ancient", 10);
     assert.equal(ancient.length, 0, "episodes older than the window are not searched locally");
     const recent = await ledger.searchEpisodes(MISSION, "recent", 3);

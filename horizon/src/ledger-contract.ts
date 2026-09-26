@@ -138,7 +138,12 @@ export type NewMissionRow = Omit<
 export type MissionPatch = Partial<Omit<MissionRow, "missionId" | "createdAt">>;
 export type NewExperimentRow = Omit<
   ExperimentRow,
-  "createdAt" | "finishedAt" | "reportIds" | "verdict" | "failureSignature" | "candidateArtifactHash"
+  | "createdAt"
+  | "finishedAt"
+  | "reportIds"
+  | "verdict"
+  | "failureSignature"
+  | "candidateArtifactHash"
 >;
 export type ExperimentPatch = Partial<
   Pick<

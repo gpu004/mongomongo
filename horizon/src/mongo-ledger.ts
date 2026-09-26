@@ -190,9 +190,13 @@ export class MongoLedger implements AsyncLedger {
     const missing: string[] = [];
     for (const [name, indexes] of Object.entries(REQUIRED_INDEXES)) {
       const existing = new Set(
-        (await this.db.collection(name).listIndexes().toArray().catch(() => [])).map(
-          (i: Document) => String(i.name),
-        ),
+        (
+          await this.db
+            .collection(name)
+            .listIndexes()
+            .toArray()
+            .catch(() => [])
+        ).map((i: Document) => String(i.name)),
       );
       for (const index of indexes)
         if (!existing.has(String(index.name))) missing.push(`${name}.${String(index.name)}`);
@@ -364,7 +368,7 @@ export class MongoLedger implements AsyncLedger {
           type,
           entityId,
           payload: canonicalJson(payload),
-        } ,
+        },
         tx.opts,
       );
       return seq;
@@ -420,11 +424,7 @@ export class MongoLedger implements AsyncLedger {
     const $set = definedEntries(patch);
     if (Object.keys($set).length === 0) return;
     await this.assertLease();
-    await this.col(COLLECTIONS.missions).updateOne(
-      { _id: missionId },
-      { $set },
-      this.opts,
-    );
+    await this.col(COLLECTIONS.missions).updateOne({ _id: missionId }, { $set }, this.opts);
   }
 
   // ---- tasks --------------------------------------------------------------
@@ -471,19 +471,12 @@ export class MongoLedger implements AsyncLedger {
     const $set = definedEntries(patch);
     if (Object.keys($set).length === 0) return;
     await this.assertLease();
-    await this.col(COLLECTIONS.experiments).updateOne(
-      { _id: experimentId },
-      { $set },
-      this.opts,
-    );
+    await this.col(COLLECTIONS.experiments).updateOne({ _id: experimentId }, { $set }, this.opts);
   }
 
   async getExperiment(experimentId: string): Promise<ExperimentRow | undefined> {
     return strip<ExperimentRow>(
-      await this.col(COLLECTIONS.experiments).findOne(
-        { _id: experimentId },
-        this.opts,
-      ),
+      await this.col(COLLECTIONS.experiments).findOne({ _id: experimentId }, this.opts),
     );
   }
 
@@ -627,7 +620,9 @@ export class MongoLedger implements AsyncLedger {
       for (const t of selective) if (tokens.has(t)) score += weights.get(t) ?? 0;
       if (score > 0) scored.push({ episode, score });
     }
-    scored.sort((a, b) => b.score - a.score || a.episode.episodeId.localeCompare(b.episode.episodeId));
+    scored.sort(
+      (a, b) => b.score - a.score || a.episode.episodeId.localeCompare(b.episode.episodeId),
+    );
     return scored.slice(0, limit).map((s) => s.episode);
   }
 
@@ -669,7 +664,13 @@ export class MongoLedger implements AsyncLedger {
     await this.col(COLLECTIONS.lessons).updateOne(
       { _id: lessonId },
       {
-        $set: { state, positiveEvidenceId, negativeEvidenceId, materializedScenarioId, transitions },
+        $set: {
+          state,
+          positiveEvidenceId,
+          negativeEvidenceId,
+          materializedScenarioId,
+          transitions,
+        },
         $setOnInsert: { ...rest, lessonId, schemaVersion: SCHEMA_VERSION, createdAt: now() },
       },
       { upsert: true, ...this.opts },
@@ -704,7 +705,7 @@ export class MongoLedger implements AsyncLedger {
         lessonId,
         suiteVersion,
         path,
-      } ,
+      },
       this.opts,
     );
   }
@@ -734,10 +735,9 @@ export class MongoLedger implements AsyncLedger {
         lastEventSeq: await tx.lastEventSeq(),
         createdAt: now(),
       };
-      await tx.col(COLLECTIONS.checkpoints).insertOne(
-        { _id: row.checkpointId, schemaVersion: SCHEMA_VERSION, ...row } ,
-        tx.opts,
-      );
+      await tx
+        .col(COLLECTIONS.checkpoints)
+        .insertOne({ _id: row.checkpointId, schemaVersion: SCHEMA_VERSION, ...row }, tx.opts);
       return row;
     });
   }
@@ -791,7 +791,11 @@ export class MongoLedger implements AsyncLedger {
     );
   }
 
-  async closeSegment(missionId: string, ordinal: number, archiveHash: string | null): Promise<void> {
+  async closeSegment(
+    missionId: string,
+    ordinal: number,
+    archiveHash: string | null,
+  ): Promise<void> {
     await this.assertLease();
     await this.col(COLLECTIONS.segments).updateOne(
       { _id: segmentId(missionId, ordinal) },
@@ -880,13 +884,10 @@ export class MongoLedger implements AsyncLedger {
 
   async listOutbox(states?: OutboxState[]): Promise<OutboxRow[]> {
     const docs = await this.col(COLLECTIONS.outbox)
-      .find(
-        this.scoped(states ? { state: { $in: states } } : {}),
-        {
-          sort: states ? { nextAttemptAt: 1, createdOrdinal: 1 } : { createdOrdinal: 1 },
-          ...this.opts,
-        },
-      )
+      .find(this.scoped(states ? { state: { $in: states } } : {}), {
+        sort: states ? { nextAttemptAt: 1, createdOrdinal: 1 } : { createdOrdinal: 1 },
+        ...this.opts,
+      })
       .toArray();
     return docs.map((d) => {
       const { payload, missionId, createdAt, ...row } = strip<
