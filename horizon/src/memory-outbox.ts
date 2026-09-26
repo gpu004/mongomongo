@@ -265,7 +265,14 @@ export async function retrieveCrossMissionEpisodes(
         selection.filteredOut.push({ episodeId, reason: "cross-mission: not verifier-backed" });
         continue;
       }
-      if (typeof meta.seededFixture === "string" && meta.seededFixture !== "") {
+      if (typeof meta.seededFixture !== "string") {
+        selection.filteredOut.push({
+          episodeId,
+          reason: "cross-mission: seeded-fixture status unverifiable",
+        });
+        continue;
+      }
+      if (meta.seededFixture !== "") {
         selection.filteredOut.push({
           episodeId,
           reason: "cross-mission: seeded fault-injection fixture",

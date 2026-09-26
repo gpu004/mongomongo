@@ -49,6 +49,7 @@ import {
   decodePerformanceLesson,
   deltaFraction,
   encodePerformanceLesson,
+  isMeasuredP95Comparison,
   type PerformanceLesson,
   type PerformanceLessonKind,
   performanceLessonId,
@@ -1086,28 +1087,17 @@ export class MissionController {
     const [perf] = await this.runSuites(experiment.experimentId, hash, ["performance"]);
     if (!perf || perf.status !== "passed") {
       const kind = perf?.status === "failed" ? "rejected" : "inconclusive";
-      const reason = `performance ${perf?.status ?? "missing"}: ${
-        perf?.infraMessage ??
-        perf?.assertions
-          .filter((a) => !a.passed)
-          .map((a) => a.id)
-          .join(", ") ??
-        ""
-      }`;
-      if (kind === "rejected")
-        await this.observePerformanceLesson(
-          experiment,
-          "performance_negative",
-          story,
-          [...gate, perf!],
-          perf!.metrics.p95LatencyMs ?? null,
-          mission.bestP95Ms,
-          reason,
-        );
       return this.conclude(
         experiment,
         kind,
-        reason,
+        `performance ${perf?.status ?? "missing"}: ${
+          perf?.infraMessage ??
+          perf?.assertions
+            .filter((a) => !a.passed)
+            .map((a) => a.id)
+            .join(", ") ??
+          ""
+        }`,
         [...gate, ...(perf ? [perf] : [])],
         story,
         mission,
@@ -1547,7 +1537,7 @@ export class MissionController {
     reason: string,
   ): Promise<void> {
     const mechanism = normalizeHypothesis(story.hypothesis);
-    if (!mechanism) return;
+    if (!mechanism || !isMeasuredP95Comparison(candidateP95Ms, comparedP95Ms)) return;
     const lessonId = performanceLessonId(kind, mechanism);
     const existing = (await this.performanceLessons()).find((l) => l.lessonId === lessonId);
     const perfReports = reports.filter((r) => r.suite === "performance");

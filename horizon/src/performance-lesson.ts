@@ -91,6 +91,18 @@ export function deltaFraction(
   return (candidateP95Ms - comparedP95Ms) / comparedP95Ms;
 }
 
+/**
+ * A PERF-P95 lesson requires two comparable measurements. A failed performance
+ * suite (resource limit, correctness under load, missing p95) is not a p95 verdict
+ * and must not count toward the mechanism's rejection tally.
+ */
+export function isMeasuredP95Comparison(
+  candidateP95Ms: number | null | undefined,
+  comparedP95Ms: number | null | undefined,
+): boolean {
+  return deltaFraction(candidateP95Ms, comparedP95Ms) !== null;
+}
+
 /** Appends an observation to the lesson for `mechanism`, creating the lesson on first sight. */
 export function recordPerformanceObservation(
   existing: PerformanceLesson | undefined,

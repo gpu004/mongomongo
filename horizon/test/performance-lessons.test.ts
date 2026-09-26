@@ -10,6 +10,7 @@ import {
   decidePerformancePolicy,
   decodePerformanceLesson,
   encodePerformanceLesson,
+  isMeasuredP95Comparison,
   type PerformanceLesson,
   type PerformanceObservation,
   performanceLessonId,
@@ -27,14 +28,25 @@ const SLOW_ENGINE = SEED_ENGINE.replace(
   "const until = performance.now() + 4; while (performance.now() < until) {}\n    const ids: string[] = [];",
 );
 assert.notEqual(SLOW_ENGINE, SEED_ENGINE);
+/** Correct and no slower, but retains ~256MB once the corpus is large (only the performance workload is): fails `resource:peak-memory`, not p95. */
+const HUNGRY_ENGINE = SEED_ENGINE.replace(
+  "const ids: string[] = [];",
+  "if (this.ballast === null && this.store.all().length > 1000) this.ballast = new Uint8Array(256 * 1024 * 1024).fill(1);\n    const ids: string[] = [];",
+).replace(
+  "private readonly store: DocumentStore;",
+  "private readonly store: DocumentStore;\n  private ballast: Uint8Array | null = null;",
+);
+assert.notEqual(HUNGRY_ENGINE, SEED_ENGINE);
 
-/** Re-proposes one slow mechanism every cycle, reworded; profiles first only from `profileFromCycle`. */
+/** Re-proposes one mechanism every cycle, reworded; profiles first only from `profileFromCycle`. */
 class SlowWorker implements Worker {
   readonly mode = "scripted" as const;
   readonly packets: string[] = [];
   private readonly profileFromCycle: number;
-  constructor(profileFromCycle: number) {
+  private readonly engine: string;
+  constructor(profileFromCycle: number, engine = SLOW_ENGINE) {
     this.profileFromCycle = profileFromCycle;
+    this.engine = engine;
   }
   async openSegment() {
     return { sessionPath: null, sessionId: "slow" };
@@ -43,7 +55,7 @@ class SlowWorker implements Worker {
     this.packets.push(input.packet.text);
     if (input.cycle >= this.profileFromCycle)
       await input.broker.profileCandidate("search-read-heavy");
-    input.broker.workspaceEdit("src/search/search-engine.ts", { content: SLOW_ENGINE });
+    input.broker.workspaceEdit("src/search/search-engine.ts", { content: this.engine });
     return {
       hypothesis: input.cycle % 2 === 0 ? "Batch the scan!" : "batch   the scan",
       whatChanged: "scan in fixed batches",
@@ -419,6 +431,55 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
   await controller.close();
 });
 
+test("a performance suite failed on the memory limit is not a PERF-P95 lesson and never blocks the mechanism", async () => {
+  assert.equal(isMeasuredP95Comparison(null, 10), false, "no candidate p95");
+  assert.equal(isMeasuredP95Comparison(12, null), false, "no best p95 to compare against");
+  assert.equal(isMeasuredP95Comparison(12, 0), false);
+  assert.equal(isMeasuredP95Comparison(12, 10), true);
+
+  const runs = tempRunsRoot();
+  const worker = new SlowWorker(99, HUNGRY_ENGINE);
+  const controller = controllerFor(
+    "perf-memory",
+    runs,
+    { worker, maxCycles: 3 },
+    { stagnationLimit: 10, performanceRejectionLimit: 2, memoryLimitBytes: 200 * 1024 * 1024 },
+  );
+  await controller.initialize();
+  await controller.run();
+  const ledger = controller.ledger;
+  const experiments = (await ledger.listExperiments("perf-memory")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
+  assert.equal(experiments.length, 3);
+  for (const e of experiments) {
+    assert.equal(e.status, "rejected");
+    assert.match(e.verdict ?? "", /^performance failed: resource:peak-memory$/);
+  }
+  const verifications = await ledger.listVerifications("perf-memory");
+  assert.equal(
+    verifications.filter((v) => v.suite === "performance" && v.status === "failed").length,
+    3,
+    "every cycle was measured; the resource failure alone was the verdict",
+  );
+  assert.deepEqual(
+    (await ledger.listLessons("perf-memory")).filter((l) => l.invariantId === "PERF-P95"),
+    [],
+  );
+  assert.equal((await controller.performancePolicy()).blockedMechanisms.length, 0);
+  for (const e of experiments)
+    assert.equal(
+      await ledger.findEvent(`${e.experimentId}:performance-policy:enforced`),
+      undefined,
+      "a resource failure never turns into a blocked mechanism",
+    );
+  for (const p of worker.packets) {
+    assert.doesNotMatch(p, /Performance lessons/);
+    assert.doesNotMatch(p, /Performance policy:/);
+  }
+  await controller.close();
+});
+
 test("cross-mission retrieval is read-only, post-filtered and degrades to nothing when the tier is unavailable", async () => {
   const memory = new LocalMemoryAdapter();
   const tag = "horizon-codebase-abc";
@@ -447,6 +508,14 @@ test("cross-mission retrieval is read-only, post-filtered and degrades to nothin
   memory.injectForeign(tag, "ep-anon", "prenormalize documents anonymous", {
     episodeId: "ep-anon",
   });
+  const { seededFixture: _dropped, ...noSeedStatus } = meta("m-d", "ep-noseed");
+  memory.injectForeign(tag, "ep-noseed", "prenormalize documents legacy", noSeedStatus);
+  memory.injectForeign(
+    tag,
+    "ep-nullseed",
+    "prenormalize documents nullish",
+    meta("m-e", "ep-nullseed", { seededFixture: null }),
+  );
   const selection = await retrieveCrossMissionEpisodes(
     memory,
     { missionId: "me", readTags: [tag], contractVersion: 1 },
@@ -469,6 +538,7 @@ test("cross-mission retrieval is read-only, post-filtered and degrades to nothin
       "cross-mission: contract version 2 not applicable",
       "cross-mission: seeded fault-injection fixture",
       "cross-mission: no provenance",
+      "cross-mission: seeded-fixture status unverifiable",
     ]),
   );
   assert.equal(selection.degraded, false);
