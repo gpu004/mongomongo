@@ -75,7 +75,7 @@ Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artif
 
 ## Live Pi mission (plan.md §5 acceptance gate)
 
-`mission.live.example.json` is the example config with `"worker": "pi"` (mission `search-p95-live`, rotation every 2 cycles, bounded token budget). With the provider key in the environment:
+`mission.live.example.json` is the example config with `"worker": "pi"` and the low-cost `google/gemini-3.1-flash-lite` model (mission `search-p95-live`, rotation every 2 cycles, bounded token budget). With `GOOGLE_API_KEY` in the environment:
 
 ```sh
 node scripts/live-mission.ts --config mission.live.example.json [--runs-root DIR] [--crash-at snapshot_ready]

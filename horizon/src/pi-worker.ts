@@ -219,12 +219,18 @@ export class PiWorker implements Worker {
       const providerError =
         last?.role === "assistant" && isRetryableAssistantError(last)
           ? (last.errorMessage ?? retriesExhausted ?? "provider error")
-          : retriesExhausted;
+          : last?.role === "assistant" && isRateLimitedProviderError(last.errorMessage ?? "")
+            ? last.errorMessage
+            : retriesExhausted;
       if (providerError)
         throw new WorkerUnavailableError(
           "rate_limited",
           `provider ${this.options.provider} unavailable after in-session retries: ${providerError}`,
           parseRetryAfterMs(providerError) ?? DEFAULT_RATE_LIMIT_RETRY_MS,
+        );
+      if (last?.role === "assistant" && last.stopReason === "error")
+        throw new Error(
+          `Pi model request failed (${this.options.provider}/${this.options.modelId}); inspect the Pi session for details`,
         );
     }
     const after = this.session.getSessionStats().tokens;
@@ -452,6 +458,12 @@ export function parseRetryAfterMs(message: string): number | null {
   const scale =
     unit.startsWith("ms") || unit.startsWith("milli") ? 1 : unit.startsWith("m") ? 60_000 : 1000;
   return Math.round(value * scale);
+}
+
+export function isRateLimitedProviderError(message: string): boolean {
+  return /(?:"code"\s*:\s*429\b|\bHTTP\s*429\b|\bRESOURCE_EXHAUSTED\b|\brate[_ -]limit(?:ed|_error)?\b)/i.test(
+    message,
+  );
 }
 
 function pick(text: string, label: string): string | undefined {
