@@ -17,10 +17,11 @@ import { compareConfigurations, renderComparison } from "./compare.ts";
 import { BaselineError, MissionController, RESOURCES_DIR, SimulatedCrash } from "./controller.ts";
 import { loadFeatureMap, validateFeatureMap } from "./feature-map.ts";
 import { Ledger } from "./ledger.ts";
+import { evaluateLiveGate, exportLiveGate, renderLiveGate } from "./live-gate.ts";
 import { renderMemoryBench, runMemoryBench, type MemoryBenchResult } from "./memory-bench.ts";
 import { loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
 import { FileEvidenceStore, missionPaths, RUNS_ROOT } from "./mission-paths.ts";
-import { PiWorker } from "./pi-worker.ts";
+import { PiWorker, resolveProviderApiKey } from "./pi-worker.ts";
 import { exportMission, renderProgress, summarize } from "./progress.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
 import { renderSkillEval, runSkillEval } from "./skill-eval.ts";
@@ -37,6 +38,7 @@ const USAGE = `horizon <command> [options]
   features check --artifact A|--dir DIR    structural import-boundary check + feature-map reference check
   inspect --mission M                      progress view
   export --mission M                       write exports/summary.{json,md}
+  live-gate --mission M                    check the run against the plan.md live-mission criteria; write exports/live-gate.{json,md}
   compare --config mission.json [--repeats N] [--runs-root DIR]
                                            run the three memory configurations under one crash schedule
   skill-eval [--config mission.json] [--out DIR]
@@ -81,7 +83,7 @@ function loadMission(): { config: MissionConfig; paths: ReturnType<typeof missio
 
 function makeWorker(config: MissionConfig, paths: ReturnType<typeof missionPaths>): Worker {
   if (config.worker === "scripted") return new ScriptedWorker();
-  const apiKey = process.env[providerApiKeyEnv(config.model.provider)];
+  const { apiKey } = resolveProviderApiKey(config.model.provider, process.env);
   return new PiWorker({
     workspaceDir: paths.candidate,
     agentDir: join(paths.root, "pi-agent"),
@@ -357,6 +359,19 @@ async function main(): Promise<number> {
         ledger.close();
       }
       return 0;
+    }
+    case "live-gate": {
+      const { config, paths } = loadMission();
+      const ledger = new Ledger(paths.db);
+      try {
+        const result = evaluateLiveGate(ledger, config);
+        const out = exportLiveGate(result, paths);
+        log(renderLiveGate(result));
+        log(`${out.json}\n${out.markdown}`);
+        return result.passed ? 0 : 2;
+      } finally {
+        ledger.close();
+      }
     }
     default:
       log(USAGE);

@@ -156,6 +156,34 @@ export class MemoryOutbox {
   }
 }
 
+export interface RetrievalQueryState {
+  taskId: string;
+  hypothesis: string | null;
+  featureIds: string[];
+  invariantIds: string[];
+  lastVerdict: string | null;
+  lastFailureSignature: string | null;
+}
+
+/**
+ * Compose the cycle-start retrieval query from mission state (HACKATHON_PLAN §11):
+ * the active task and its hypothesis, the features and invariants touched by the
+ * last experiment (failing assertions first), and the last verdict/failure, so
+ * ranking tracks the current cycle instead of a constant.
+ */
+export function composeRetrievalQuery(state: RetrievalQueryState, maxTerms = 24): string {
+  const parts = [
+    state.taskId,
+    state.hypothesis ?? "",
+    ...state.featureIds,
+    ...state.invariantIds,
+    state.lastVerdict ?? "",
+    state.lastFailureSignature ?? "",
+  ];
+  const terms = queryTerms(parts.join(" ")).filter((t) => t.length > 1);
+  return terms.slice(0, maxTerms).join(" ");
+}
+
 export interface RetrievalSelection {
   injected: {
     episodeId: string;

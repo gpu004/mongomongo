@@ -4,6 +4,19 @@ import { randomUUID } from "node:crypto";
 
 export type IsolationMode = "container" | "subprocess";
 
+/**
+ * Durable record of container names. `register` runs before `docker run` and
+ * `release` after the container is stopped, so a controller that dies mid-run
+ * leaves a registered-but-unreleased name that resume can find and remove.
+ */
+export interface ContainerRegistry {
+  register(containerName: string): void;
+  release(containerName: string): void;
+}
+
+/** Generates the container name; exported so resume can recognise horizon containers. */
+export const CONTAINER_NAME_PREFIX = "horizon-cand-";
+
 export interface LaunchOptions {
   snapshotDir: string;
   isolation: IsolationMode;
@@ -11,6 +24,8 @@ export interface LaunchOptions {
   containerImage: string;
   startupTimeoutMs: number;
   memoryLimitBytes: number;
+  /** Container mode only; subprocess children die with the controller and need no record. */
+  containerRegistry?: ContainerRegistry | undefined;
 }
 
 export interface RunningCandidate {
@@ -60,11 +75,13 @@ function launchSubprocess(options: LaunchOptions, entry: string): Promise<Runnin
     options.startupTimeoutMs,
     (port) => `http://127.0.0.1:${port}`,
     undefined,
+    undefined,
   );
 }
 
 function launchInContainer(options: LaunchOptions): Promise<RunningCandidate> {
-  const name = `horizon-cand-${randomUUID().slice(0, 12)}`;
+  const name = `${CONTAINER_NAME_PREFIX}${randomUUID().slice(0, 12)}`;
+  options.containerRegistry?.register(name);
   const args = [
     "run",
     "--rm",
@@ -110,6 +127,7 @@ function launchInContainer(options: LaunchOptions): Promise<RunningCandidate> {
       return `http://127.0.0.1:${port}`;
     },
     name,
+    options.containerRegistry,
   );
 }
 
@@ -118,6 +136,7 @@ function waitForListening(
   timeoutMs: number,
   resolveBaseUrl: (port: number) => string,
   containerName: string | undefined,
+  registry: ContainerRegistry | undefined,
 ): Promise<RunningCandidate> {
   return new Promise((resolve, reject) => {
     let stdout = "";
@@ -159,6 +178,7 @@ function waitForListening(
       const killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
       const result = await exit;
       clearTimeout(killTimer);
+      if (containerName) registry?.release(containerName);
       return { ...result, peakMemoryBytes: peak, stderrTail: stderr.slice(-2000) };
     };
 
@@ -187,12 +207,14 @@ function waitForListening(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (containerName) registry?.release(containerName);
       reject(new CandidateStartupError(`spawn failed: ${error.message}`));
     });
     child.on("exit", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (containerName) registry?.release(containerName);
       reject(
         new CandidateStartupError(
           `candidate exited during startup with code ${code}; stderr: ${stderr.slice(-800)}`,

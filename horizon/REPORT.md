@@ -69,7 +69,7 @@ node src/cli.ts memory-bench --episodes 1000,10000,100000           # §5.7
 node scripts/supermemory-probe.ts --episodes 12|20                  # §5.8 (hosted, SUPERMEMORY_API_KEY)
 ```
 
-Not completed: live Pi mission target and holdout; any workload larger than 5000 documents or 3 repetitions.
+Not completed: the live Pi mission's 30% target, holdout, or plan.md §5 acceptance gate; any workload larger than 5000 documents or 3 repetitions. The gate is now mechanised: `mission.live.example.json` selects `"worker": "pi"`, `scripts/live-mission.ts` runs create → interrupted run → resume → export → `live-gate`, and `horizon live-gate` checks Pi-authored experiments, provider-reported usage, independently verified candidates, checkpoint recovery, cross-segment retrieval, holdout and `succeeded` status from the ledger. The bounded Flash-Lite run below verified one model candidate, but did not meet the target or pass the gate.
 
 ## 5. Results
 
