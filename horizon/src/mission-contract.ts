@@ -164,6 +164,8 @@ export function validateMissionConfig(value: unknown): MissionConfig {
   return c as MissionConfig;
 }
 
+/** Where the ledger lives is deployment, not contract: pinning the backend never changes the hash. */
 export function contractHash(config: MissionConfig): string {
-  return sha256(canonicalJson(config));
+  const { ledger: _ledger, ...contract } = config;
+  return sha256(canonicalJson(contract));
 }

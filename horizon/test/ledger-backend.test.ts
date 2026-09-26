@@ -8,6 +8,7 @@ import { LeaseError } from "../src/ledger-contract.ts";
 import { evaluateLiveGate } from "../src/live-gate.ts";
 import { LocalMemoryAdapter } from "../src/memory-adapter.ts";
 import {
+  contractHash,
   loadMissionConfig,
   type MissionConfig,
   validateMissionConfig,
@@ -101,6 +102,18 @@ test("mission create pins the resolved backend in the manifest so resume ignores
   };
   assert.equal(manifest.ledgerBackend, "sqlite");
   assert.deepEqual(manifest.config.ledger, { backend: "sqlite" });
+  assert.equal(
+    contractHash(manifest.config),
+    contractHash(config),
+    "pinning keeps the contract hash",
+  );
+  const resumed = new MissionController(manifest.config, paths, {
+    memory: new LocalMemoryAdapter(),
+    ledger: () => openLedger(manifest.config, paths, { MONGODB_URI: MONGO_URI }),
+  });
+  assert.equal((await resumed.initialize()).contractHash, contractHash(config));
+  assert.equal(resumed.ledger.backend, "sqlite");
+  await resumed.close();
   assert.deepEqual(selectLedgerBackend(manifest.config, { MONGODB_URI: MONGO_URI }), {
     backend: "sqlite",
     source: "config",
@@ -161,8 +174,10 @@ mongoTest(
         ...options,
       });
     const teardown = await MongoLedger.connect(env, "teardown");
+    const controllers: MissionController[] = [];
     try {
       const first = open({ crashAt: "snapshot_ready", maxCycles: 1 });
+      controllers.push(first);
       await first.initialize();
       assert.equal(first.ledger.backend, "mongodb");
       await assert.rejects(first.run(), SimulatedCrash);
@@ -174,6 +189,7 @@ mongoTest(
       await first.close();
 
       const second = open();
+      controllers.push(second);
       const row = await second.run();
       assert.equal(row.status, "succeeded");
       const after = (await second.ledger.getExperiment(interrupted.experimentId))!;
@@ -191,6 +207,7 @@ mongoTest(
       assert.ok(gate.checks.length > 0);
       await second.close();
     } finally {
+      for (const controller of controllers) await controller.close().catch(() => undefined);
       await teardown.db.dropDatabase();
       await teardown.close();
     }
