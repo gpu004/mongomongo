@@ -28,6 +28,26 @@ class FakePiWorker implements Worker {
   }
 }
 
+class NoopPiWorker implements Worker {
+  readonly mode = "pi" as const;
+  async openSegment(ordinal: number): Promise<SegmentHandle> {
+    return { sessionPath: null, sessionId: `noop-${ordinal}` };
+  }
+  async runCycle(_input: WorkerCycleInput): Promise<WorkerCycleResult> {
+    return {
+      hypothesis: "leave the seed unchanged",
+      whatChanged: "nothing",
+      claim: "no improvement",
+      usage: { inputTokens: 100, outputTokens: 10, uncertain: false },
+      seededFixture: null,
+      aborted: false,
+      compactions: 0,
+    };
+  }
+  async closeSegment(): Promise<void> {}
+  async abort(): Promise<void> {}
+}
+
 function byId(checks: GateCheck[]): Record<GateCheck["id"], GateCheck> {
   return Object.fromEntries(checks.map((c) => [c.id, c])) as Record<GateCheck["id"], GateCheck>;
 }
@@ -125,6 +145,24 @@ test("live gate: the manifest's worker setting is part of the verdict", async ()
   assert.equal(byId(asScripted.checks).worker_is_pi.passed, false);
   assert.equal(byId(asPi.checks).worker_is_pi.passed, true);
   assert.equal(byId(asPi.checks).interrupt_and_resume.passed, false, "single uninterrupted launch");
+});
+
+test("live gate: an unchanged model candidate cannot inherit the baseline's passing reports", async () => {
+  const runs = tempRunsRoot();
+  const controller = controllerFor("gate-noop", runs, {
+    worker: new NoopPiWorker(),
+    maxCycles: 1,
+  });
+  controller.initialize();
+  await controller.run();
+  const result = evaluateLiveGate(controller.ledger, { ...controller.config, worker: "pi" });
+  controller.close();
+
+  const checks = byId(result.checks);
+  assert.equal(checks.worker_is_pi.passed, true);
+  assert.equal(checks.usage_reported.passed, true);
+  assert.equal(checks.baseline_measured.passed, true);
+  assert.equal(checks.model_candidate_verified.passed, false);
 });
 
 test("provider API key resolution accepts the provider key or its known alias", () => {

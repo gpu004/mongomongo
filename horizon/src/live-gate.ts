@@ -93,10 +93,20 @@ export function evaluateLiveGate(ledger: Ledger, config: MissionConfig): LiveGat
       .map((e) => e.entityId),
   );
   const verifiedCandidates = modelExperiments.filter((e) => {
-    if (!e.candidateArtifactHash || seeded.has(e.experimentId)) return false;
+    if (
+      !e.candidateArtifactHash ||
+      e.candidateArtifactHash === e.parentArtifactHash ||
+      seeded.has(e.experimentId)
+    )
+      return false;
     const passedSuites = new Set(
       verifications
-        .filter((v) => v.artifactHash === e.candidateArtifactHash && v.status === "passed")
+        .filter(
+          (v) =>
+            v.experimentId === e.experimentId &&
+            v.artifactHash === e.candidateArtifactHash &&
+            v.status === "passed",
+        )
         .map((v) => v.suite),
     );
     return ["smoke", "correctness", "performance"].every((s) => passedSuites.has(s));
