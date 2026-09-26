@@ -79,6 +79,8 @@ export class ToolBroker {
   private readonly children = new Map<ReturnType<typeof spawn>, string | undefined>();
   /** Every verifier result the worker saw this cycle, in order; used to audit its claim. */
   readonly verifications: ObservedVerification[] = [];
+  /** Profiling scenarios the worker ran this cycle; a stagnated cycle must profile before repeating a mechanism. */
+  readonly profiles: string[] = [];
   private realWorkspaceRoot: string | undefined;
 
   constructor(
@@ -334,6 +336,7 @@ export class ToolBroker {
   async profileCandidate(scenario: string): Promise<{ evidenceId: string; summary: string }> {
     this.checkDeadline();
     const result = await this.hooks.profile(scenario);
+    this.profiles.push(scenario);
     this.hooks.onToolEvent("profile_candidate", { scenario }, result.evidenceId);
     return result;
   }

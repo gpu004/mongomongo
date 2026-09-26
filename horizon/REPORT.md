@@ -69,7 +69,7 @@ node src/cli.ts memory-bench --episodes 1000,10000,100000           # §5.7
 node scripts/supermemory-probe.ts --episodes 12|20                  # §5.8 (hosted, SUPERMEMORY_API_KEY)
 ```
 
-Not run: Pi worker against a live model (no `ANTHROPIC_API_KEY`); any workload larger than 5000 documents or 3 repetitions.
+Not run: Pi worker against a live model (no valid provider API key was available — the plan.md §5 live-mission gate is therefore still open). The gate itself is now mechanised: `mission.live.example.json` selects `"worker": "pi"`, `scripts/live-mission.ts` runs create → interrupted run → resume → export → `live-gate`, and `horizon live-gate` verifies the run from the ledger (Pi-authored experiments, provider-reported usage, measured baseline, independently verified model candidate, checkpoint recovery, cross-segment retrieval after rotation, holdout, `succeeded`). Every scripted run in this repo fails that gate by construction (`worker_is_pi`, `usage_reported`, `model_candidate_verified`), so no scripted artifact can be mistaken for live evidence. Also not run: any workload larger than 5000 documents or 3 repetitions.
 
 ## 5. Results
 
