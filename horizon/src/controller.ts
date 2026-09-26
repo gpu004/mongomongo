@@ -5,6 +5,7 @@ import { canonicalJson, sha256, type Suite, validateReport, type VerificationRep
 import { computeEnvironmentHash, computeEvaluatorHash, runSuite } from "../verification/runner.ts";
 import { loadScenarios, type Scenario } from "../verification/scenarios/index.ts";
 import { ArtifactStore } from "./artifact-store.ts";
+import { auditClaim } from "./claim-audit.ts";
 import { buildPacket, type ContextPacket, DEFAULT_PACKET_BUDGET } from "./context-packet.ts";
 import { type ExperimentRow, Ledger, type LessonRow, type LessonState, type MissionRow, type MissionStatus } from "./ledger.ts";
 import { type RegressionProposal, validateAgainstFixtures, validateProposalShape } from "./lesson-policy.ts";
@@ -15,7 +16,8 @@ import { ensureMissionDirs, FileEvidenceStore, type MissionPaths, writeJsonAtomi
 import { recover, type RecoveryOutcome } from "./recovery.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
 import { type BrokerHooks, ToolBroker } from "./tool-broker.ts";
-import type { Worker } from "./worker.ts";
+import { firstComparison, repetitionSpread, rerunComparison, type TimingDecision } from "./timing-policy.ts";
+import type { Worker, WorkerCycleResult } from "./worker.ts";
 
 export const RESOURCES_DIR = new URL("../resources/", import.meta.url).pathname;
 
@@ -30,6 +32,20 @@ export interface ControllerOptions {
 }
 
 export type Verdict = "accepted" | "rejected" | "inconclusive";
+
+interface Story {
+	hypothesis: string;
+	whatChanged: string;
+	claim: string;
+	seededFixture: string | null;
+	claimIssues?: string[];
+}
+
+/** Per-field character limits for worker prose kept in events, episodes and packets; full text goes to evidence. */
+const WORKER_TEXT_LIMITS = { hypothesis: 400, whatChanged: 800, claim: 800 } as const;
+
+/** Deterministic behavior suites whose failed report for an artifact can be reused across experiments. */
+const REUSABLE_FAILURE_SUITES = new Set<Suite>(["smoke", "correctness", "structural"]);
 
 const TASKS = [
 	{ taskId: "baseline", ordinal: 1, dependsOn: [] as string[], hypothesis: "measure the seed", completionCriteria: "seed passes correctness and has a valid performance report", nextAction: "run fixed suites on the seed artifact" },
@@ -59,7 +75,8 @@ export class MissionController {
 	private segmentOrdinal = 0;
 	private cyclesInSegment = 0;
 	private cycleDeadline = 0;
-	private readonly startedAt = Date.now();
+	/** Wall time since this mark has not yet been added to mission.spentWallMs. */
+	private wallMark = Date.now();
 
 	constructor(config: MissionConfig, paths: MissionPaths, options: ControllerOptions = {}) {
 		this.config = config;
@@ -175,7 +192,7 @@ export class MissionController {
 
 	private stopReason(mission: MissionRow): MissionStatus | undefined {
 		const b = this.config.budget;
-		const wall = mission.spentWallMs + (Date.now() - this.startedAt);
+		const wall = mission.spentWallMs + (Date.now() - this.wallMark);
 		if (mission.spentExperiments >= b.maxExperiments || wall >= b.maxWallMs || mission.spentInputTokens >= b.maxInputTokens || mission.spentOutputTokens >= b.maxOutputTokens) return "budget_exhausted";
 		return undefined;
 	}
@@ -187,9 +204,8 @@ export class MissionController {
 	}
 
 	private finish(status: MissionStatus, detail = ""): void {
-		const mission = this.mission();
 		this.ledger.transaction(() => {
-			this.ledger.updateMission(this.config.missionId, { status, spentWallMs: mission.spentWallMs + (Date.now() - this.startedAt) });
+			this.ledger.updateMission(this.config.missionId, { status });
 			this.ledger.appendEvent(`mission:${this.config.missionId}:finish:${Date.now()}`, "mission.finished", this.config.missionId, { status, detail });
 			this.checkpoint(status, null, null, `finished:${status}`);
 		});
@@ -217,17 +233,17 @@ export class MissionController {
 			this.finish("blocked", infra ? "baseline could not be measured (infrastructure)" : "seed does not satisfy the contract; fix the seed before optimizing");
 			throw new BaselineError("baseline not established");
 		}
-		const noiseFloor = relativeSpread(perf.metrics.repetitionP95Ms ?? []);
-		const targetWithinNoise = noiseFloor >= this.config.targetP95Reduction;
+		const noise = repetitionSpread(perf.metrics.repetitionP95Ms);
 		this.ledger.transaction(() => {
 			this.ledger.updateExperiment(experimentId, { status: "accepted", verdict: `baseline p95 ${perf.metrics.p95LatencyMs}ms`, finishedAt: new Date().toISOString() });
 			this.ledger.updateMission(this.config.missionId, { baselineP95Ms: perf.metrics.p95LatencyMs ?? null, bestP95Ms: perf.metrics.p95LatencyMs ?? null, bestArtifactHash: seed });
 			this.ledger.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "done" });
-			this.ledger.appendEvent(`baseline:${this.config.missionId}`, "mission.baseline", this.config.missionId, { p95: perf.metrics.p95LatencyMs, repetitionP95Ms: perf.metrics.repetitionP95Ms ?? [], noiseFloor, targetWithinNoise, reportId: perf.reportId });
+			this.ledger.appendEvent(`baseline:${this.config.missionId}`, "mission.baseline", this.config.missionId, { p95: perf.metrics.p95LatencyMs, reportId: perf.reportId });
+			this.ledger.appendEvent(`target:${this.config.missionId}:assessed`, "target.assessed", this.config.missionId, { repetitionSpread: noise, acceptanceMargin: this.config.acceptanceMargin, targetP95Reduction: this.config.targetP95Reduction, marginCoversNoise: this.config.acceptanceMargin >= noise });
 			this.checkpoint("running", "optimize-search", null, "baseline-complete");
 		});
-		this.log(`baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms; repetition spread ${(noiseFloor * 100).toFixed(1)}%)`);
-		if (targetWithinNoise) this.log(`warning: target reduction ${(this.config.targetP95Reduction * 100).toFixed(0)}% is within the measured baseline spread; increase repetitions/measuredRequests or lower the target`);
+		this.log(`baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms; repetition spread ${(noise * 100).toFixed(1)}%)`);
+		if (this.config.acceptanceMargin < noise) this.log(`  warning: acceptance margin ${this.config.acceptanceMargin} is below the measured repetition spread ${noise.toFixed(3)}; expect ambiguous timing verdicts`);
 	}
 
 	private async runHoldout(): Promise<void> {
@@ -277,6 +293,10 @@ export class MissionController {
 		const result = await this.worker.runCycle({ cycle, packet, broker, deadlineAt: this.cycleDeadline, ...(cycle === 1 && recoveryNote ? { recoveryNote } : {}) });
 		broker.terminateChildren();
 		this.spendTokens(result.usage);
+		const audit = auditClaim(result.claim, broker.verifications);
+		const text = this.boundWorkerText(result);
+		this.ledger.appendEvent(`${experimentId}:claim-audit`, "claim.audited", experimentId, { claim: text.claim, observed: broker.verifications, ...audit });
+		if (!audit.supported) this.log(`  unsupported worker claim: ${audit.issues.join("; ")}`);
 		if (result.hypothesis === "none" && result.whatChanged === "nothing") {
 			this.ledger.updateExperiment(experimentId, { status: "inconclusive", verdict: "worker exhausted", finishedAt: new Date().toISOString() });
 			return "exhausted";
@@ -286,17 +306,17 @@ export class MissionController {
 		this.ledger.transaction(() => {
 			if (!this.ledger.getArtifact(snapshot.hash)) this.ledger.insertArtifact({ hash: snapshot.hash, path: snapshot.path, parentHash: parent, manifestHash: sha256(canonicalJson(snapshot.manifest)), createdAt: new Date().toISOString() });
 			this.ledger.updateExperiment(experimentId, { status: "snapshot_ready", candidateArtifactHash: snapshot.hash });
-			this.ledger.appendEvent(`${experimentId}:snapshot`, "experiment.snapshot", experimentId, { hash: snapshot.hash, hypothesis: result.hypothesis, whatChanged: result.whatChanged, claim: result.claim, seededFixture: result.seededFixture, aborted: result.aborted });
+			this.ledger.appendEvent(`${experimentId}:snapshot`, "experiment.snapshot", experimentId, { hash: snapshot.hash, hypothesis: text.hypothesis, whatChanged: text.whatChanged, claim: text.claim, seededFixture: result.seededFixture, aborted: result.aborted, claimIssues: audit.issues });
 			this.checkpoint("running", "optimize-search", experimentId, "snapshot_ready");
 		});
 		this.crash("snapshot_ready");
 		const experiment = this.ledger.getExperiment(experimentId)!;
-		await this.evaluateExperiment(experiment, recovery, { hypothesis: result.hypothesis, whatChanged: result.whatChanged, claim: result.claim, seededFixture: result.seededFixture });
+		await this.evaluateExperiment(experiment, recovery, { hypothesis: text.hypothesis, whatChanged: text.whatChanged, claim: text.claim, seededFixture: result.seededFixture, claimIssues: audit.issues });
 		this.cyclesInSegment += 1;
 		return "continue";
 	}
 
-	private async evaluateExperiment(experiment: ExperimentRow, _recovery: RecoveryOutcome, narrative?: { hypothesis: string; whatChanged: string; claim: string; seededFixture: string | null }): Promise<Verdict> {
+	private async evaluateExperiment(experiment: ExperimentRow, _recovery: RecoveryOutcome, narrative?: Story): Promise<Verdict> {
 		const hash = experiment.candidateArtifactHash!;
 		const mission = this.mission();
 		if (!this.artifacts.verify(hash)) throw new Error(`artifact ${hash} failed integrity check`);
@@ -304,7 +324,7 @@ export class MissionController {
 		this.ledger.appendEvent(`${experiment.experimentId}:evaluating:${experiment.attempt}`, "experiment.evaluating", experiment.experimentId, { attempt: experiment.attempt });
 
 		const snapshotEvent = this.ledger.findEvent(`${experiment.experimentId}:snapshot`);
-		const story = narrative ?? (snapshotEvent ? (snapshotEvent.payload as { hypothesis: string; whatChanged: string; claim: string; seededFixture: string | null }) : { hypothesis: experiment.hypothesis, whatChanged: "(recovered)", claim: "(recovered)", seededFixture: null });
+		const story = narrative ?? (snapshotEvent ? (snapshotEvent.payload as Story) : { hypothesis: experiment.hypothesis, whatChanged: "(recovered)", claim: "(recovered)", seededFixture: null });
 
 		if (hash === experiment.parentArtifactHash) {
 			return this.conclude(experiment, "inconclusive", "candidate identical to parent", [], story, mission);
@@ -325,34 +345,43 @@ export class MissionController {
 			const kind = perf?.status === "failed" ? "rejected" : "inconclusive";
 			return this.conclude(experiment, kind, `performance ${perf?.status ?? "missing"}: ${perf?.infraMessage ?? perf?.assertions.filter((a) => !a.passed).map((a) => a.id).join(", ") ?? ""}`, [...gate, ...(perf ? [perf] : [])], story, mission);
 		}
-		const decision = this.compareToBest(perf, mission);
-		if (decision.verdict !== "accepted") return this.conclude(experiment, decision.verdict, decision.reason, [...gate, perf], story, mission);
+		const reports = [...gate, perf];
+		const bestReps = this.bestPerformanceReport(mission)?.metrics.repetitionP95Ms ?? [];
+		let decision: TimingDecision = firstComparison(perf.metrics, mission.bestP95Ms, bestReps, this.config);
+		let accepted = perf;
+		if (decision.kind === "ambiguous") {
+			this.log(`  timing ambiguous (${decision.reason}); re-measuring best and candidate back-to-back`);
+			const rerun = await this.retime(experiment.experimentId, hash, mission, perf, bestReps);
+			reports.push(...rerun.reports);
+			decision = rerun.decision;
+			if (rerun.candidate) accepted = rerun.candidate;
+		}
+		if (decision.kind !== "accept") return this.conclude(experiment, decision.kind === "reject" ? "rejected" : "inconclusive", decision.reason, reports, story, mission);
+		const p95 = accepted.metrics.p95LatencyMs ?? null;
 		this.ledger.transaction(() => {
-			this.ledger.updateMission(this.config.missionId, { bestArtifactHash: hash, bestP95Ms: perf.metrics.p95LatencyMs ?? null });
-			this.ledger.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, { p95: perf.metrics.p95LatencyMs, previous: mission.bestP95Ms });
+			this.ledger.updateMission(this.config.missionId, { bestArtifactHash: hash, bestP95Ms: p95 });
+			this.ledger.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, { p95, previous: mission.bestP95Ms, reportId: accepted.reportId });
 		});
-		const verdict = await this.conclude(experiment, "accepted", decision.reason, [...gate, perf], story, this.mission());
+		const verdict = await this.conclude(experiment, "accepted", decision.reason, reports, story, this.mission());
 		const target = (mission.baselineP95Ms ?? Number.POSITIVE_INFINITY) * (1 - this.config.targetP95Reduction);
-		if ((perf.metrics.p95LatencyMs ?? Number.POSITIVE_INFINITY) <= target) {
+		if ((p95 ?? Number.POSITIVE_INFINITY) <= target) {
 			this.ledger.upsertTask({ ...TASKS[1]!, missionId: this.config.missionId, status: "done" });
-			this.log(`target reached: p95 ${perf.metrics.p95LatencyMs}ms <= ${target.toFixed(2)}ms`);
+			this.log(`target reached: p95 ${p95}ms <= ${target.toFixed(2)}ms`);
 		}
 		return verdict;
 	}
 
-	/**
-	 * Acceptance policy. A candidate is accepted only when it beats the best by the
-	 * margin on the median p95 and on enough paired repetitions. A candidate whose
-	 * p95 lands inside the +/- margin band around the best is "ambiguous timing":
-	 * neither a demonstrated improvement nor a demonstrated regression, so it is
-	 * inconclusive rather than rejected and must not count as a failed hypothesis.
-	 */
-	private compareToBest(perf: VerificationReport, mission: MissionRow): AcceptanceDecision {
-		return decideAcceptance(
-			{ p95: perf.metrics.p95LatencyMs, repetitionP95Ms: perf.metrics.repetitionP95Ms ?? [] },
-			{ p95: mission.bestP95Ms, repetitionP95Ms: this.bestPerformanceReport(mission)?.metrics.repetitionP95Ms ?? [] },
-			this.config,
-		);
+	/** One bounded re-measurement: best then candidate, back-to-back, under their own report identities. */
+	private async retime(experimentId: string, hash: string, mission: MissionRow, first: VerificationReport, firstBestReps: number[]): Promise<{ reports: VerificationReport[]; decision: TimingDecision; candidate?: VerificationReport }> {
+		const best = mission.bestArtifactHash;
+		if (!best) return { reports: [], decision: { kind: "inconclusive", reason: "timing ambiguous and no best artifact to re-measure" } };
+		const bestReport = await this.verifyArtifact(`${experimentId}-retime-best`, best, "performance");
+		const candidate = await this.verifyArtifact(`${experimentId}-retime`, hash, "performance");
+		const reports = [bestReport, candidate];
+		if (bestReport.status !== "passed" || candidate.status !== "passed") {
+			return { reports, decision: { kind: "inconclusive", reason: `timing rerun could not be measured (best ${bestReport.status}, candidate ${candidate.status})` } };
+		}
+		return { reports, decision: rerunComparison(first.metrics, firstBestReps, candidate.metrics, bestReport.metrics, this.config), candidate };
 	}
 
 	private bestPerformanceReport(mission: MissionRow): VerificationReport | undefined {
@@ -364,7 +393,7 @@ export class MissionController {
 		return JSON.parse(readFileSync(row.path, "utf8")) as VerificationReport;
 	}
 
-	private async conclude(experiment: ExperimentRow, verdict: Verdict, reason: string, reports: VerificationReport[], story: { hypothesis: string; whatChanged: string; claim: string; seededFixture: string | null }, mission: MissionRow, failureSignature: string | null = null): Promise<Verdict> {
+	private async conclude(experiment: ExperimentRow, verdict: Verdict, reason: string, reports: VerificationReport[], story: Story, mission: MissionRow, failureSignature: string | null = null): Promise<Verdict> {
 		const perf = reports.find((r) => r.suite === "performance");
 		const episodeId = `ep-${experiment.experimentId}-v1`;
 		const payload: EpisodePayload = {
@@ -384,7 +413,7 @@ export class MissionController {
 			correctness: reports.filter((r) => r.suite !== "performance").map((r) => `${r.suite}=${r.status}`).join(", ") || "not run",
 			performance: perf ? `p95 ${perf.metrics.p95LatencyMs ?? "n/a"}ms (${perf.status}); best before ${mission.bestP95Ms ?? "n/a"}ms; baseline ${mission.baselineP95Ms ?? "n/a"}ms` : "not run",
 			outcome: `${verdict}: ${reason}`,
-			uncertainty: story.seededFixture ? `seeded fault-injection fixture: ${story.seededFixture}; worker claim "${story.claim}" is not evidence` : `worker claim "${story.claim}" is model interpretation; verifier reports are the evidence`,
+			uncertainty: `${story.seededFixture ? `seeded fault-injection fixture: ${story.seededFixture}; worker claim "${story.claim}" is not evidence` : `worker claim "${story.claim}" is model interpretation; verifier reports are the evidence`}${story.claimIssues && story.claimIssues.length > 0 ? `; claim disagrees with verifier: ${story.claimIssues.join("; ")}` : ""}`,
 			reportIds: reports.map((r) => r.reportId),
 			evidenceIds: reports.flatMap((r) => r.evidenceIds).slice(0, 24),
 			nextAction: this.nextActionAfter(verdict, reason, mission),
@@ -407,7 +436,7 @@ export class MissionController {
 
 	private nextActionAfter(verdict: Verdict, reason: string, mission: MissionRow): string {
 		if (verdict === "accepted") return "profile the new best artifact and look for the next bottleneck";
-		if (verdict === "inconclusive" && reason.startsWith("ambiguous timing")) return "re-measure with more repetitions or a larger workload before deciding; the difference is inside the noise band";
+		if (verdict === "inconclusive" && reason.includes("timing")) return "the timing difference was within measurement noise; look for a mechanism with a larger effect or profile to confirm the bottleneck";
 		if (verdict === "inconclusive") return "retry the same change; the failure was infrastructure, not product";
 		if (reason.startsWith("correctness")) return "read the failing assertion evidence, then restore invalidation before optimizing again";
 		if (mission.bestP95Ms !== null) return "the change did not beat the current best by the margin; try a different mechanism";
@@ -437,6 +466,12 @@ export class MissionController {
 		if (existing && existsSync(existing.path)) {
 			const parsed = JSON.parse(readFileSync(existing.path, "utf8")) as VerificationReport;
 			if (parsed.status === "passed" || parsed.status === "failed") return parsed;
+		}
+		const prior = REUSABLE_FAILURE_SUITES.has(suite) ? this.priorFailure(hash, suite) : undefined;
+		if (prior) {
+			this.ledger.appendEvent(`reuse:${experimentId}:${suite}:${prior.reportId}`, "verification.reused", experimentId, { suite, hash, reportId: prior.reportId, fromExperiment: prior.experimentId });
+			this.log(`  ${suite}: ${prior.status} (identical artifact ${hash.slice(0, 12)} already failed in ${prior.experimentId}; report ${prior.reportId} reused)`);
+			return prior;
 		}
 		const artifact = this.artifacts.pathFor(hash);
 		if (!this.artifacts.verify(hash)) throw new Error(`artifact ${hash} does not verify`);
@@ -475,6 +510,15 @@ export class MissionController {
 		});
 		this.log(`  ${suite}: ${report.status}${report.metrics.p95LatencyMs !== undefined ? ` p95=${report.metrics.p95LatencyMs}ms` : ""}${report.infraMessage ? ` (${report.infraMessage})` : ""}`);
 		return report;
+	}
+
+	/** A committed failed report for the same content, suite, evaluator and environment from any experiment of this mission. */
+	private priorFailure(hash: string, suite: Suite): VerificationReport | undefined {
+		const row = this.ledger
+			.listVerifications(this.config.missionId)
+			.find((v) => v.artifactHash === hash && v.suite === suite && v.status === "failed" && v.evaluatorHash === this.evaluatorHash && v.environmentHash === this.environmentHash);
+		if (!row || !existsSync(row.path)) return undefined;
+		return JSON.parse(readFileSync(row.path, "utf8")) as VerificationReport;
 	}
 
 	// ---- lessons ------------------------------------------------------------------
@@ -681,8 +725,26 @@ export class MissionController {
 	}
 
 	private checkpoint(status: MissionStatus, taskId: string | null, experimentId: string | null, operation: string) {
+		this.accrueWall();
 		const mission = this.mission();
 		return this.ledger.writeCheckpoint({ missionId: this.config.missionId, missionStatus: status, activeTaskId: taskId, activeExperimentId: experimentId, activeOperation: operation, segmentOrdinal: this.segmentOrdinal, bestArtifactHash: mission.bestArtifactHash });
+	}
+
+	private boundWorkerText(result: WorkerCycleResult): { hypothesis: string; whatChanged: string; claim: string } {
+		const fields = { hypothesis: result.hypothesis, whatChanged: result.whatChanged, claim: result.claim };
+		const oversized = (Object.keys(fields) as (keyof typeof fields)[]).filter((k) => fields[k].length > WORKER_TEXT_LIMITS[k]);
+		if (oversized.length === 0) return fields;
+		const evidenceId = this.evidence.write("worker-output", fields);
+		this.log(`  worker output oversized (${oversized.join(", ")}); full text kept as ${evidenceId}`);
+		for (const k of oversized) fields[k] = `${fields[k].slice(0, WORKER_TEXT_LIMITS[k])} [truncated; full text in ${evidenceId}]`;
+		return fields;
+	}
+
+	private accrueWall(): void {
+		const now = Date.now();
+		const mission = this.mission();
+		this.ledger.updateMission(this.config.missionId, { spentWallMs: mission.spentWallMs + (now - this.wallMark) });
+		this.wallMark = now;
 	}
 
 	private spendTokens(usage: { inputTokens: number; outputTokens: number; uncertain: boolean }): void {
@@ -697,9 +759,7 @@ export class MissionController {
 	}
 
 	private episodePayload(episodeId: string): EpisodePayload | undefined {
-		const row = this.ledger.listOutbox().find((o) => o.episodeId === episodeId);
-		if (!row) return undefined;
-		return this.ledger.outboxPayload(row.idempotencyKey) as EpisodePayload | undefined;
+		return this.ledger.outboxPayloadForEpisode(episodeId) as EpisodePayload | undefined;
 	}
 
 	async drainOutbox(): Promise<void> {
@@ -715,37 +775,6 @@ export class MissionController {
 	private crash(point: string): void {
 		if (this.crashAt === point) throw new SimulatedCrash(point);
 	}
-}
-
-export interface AcceptanceDecision {
-	verdict: Verdict;
-	reason: string;
-}
-
-export function decideAcceptance(
-	candidate: { p95: number | undefined; repetitionP95Ms: number[] },
-	best: { p95: number | null; repetitionP95Ms: number[] },
-	policy: Pick<MissionConfig, "acceptanceMargin" | "requiredImprovedRepetitions">,
-): AcceptanceDecision {
-	const { p95 } = candidate;
-	if (p95 === undefined || best.p95 === null) return { verdict: "inconclusive", reason: "no comparable p95" };
-	const required = best.p95 * (1 - policy.acceptanceMargin);
-	const upper = best.p95 * (1 + policy.acceptanceMargin);
-	if (p95 > upper) return { verdict: "rejected", reason: `p95 ${p95}ms not below ${required.toFixed(2)}ms (best ${best.p95}ms minus margin)` };
-	if (p95 > required) return { verdict: "inconclusive", reason: `ambiguous timing: p95 ${p95}ms within +/-${(policy.acceptanceMargin * 100).toFixed(0)}% of best ${best.p95}ms` };
-	const improved = candidate.repetitionP95Ms.filter((value, index) => best.repetitionP95Ms[index] !== undefined && value < best.repetitionP95Ms[index]!).length;
-	if (best.repetitionP95Ms.length > 0 && improved < policy.requiredImprovedRepetitions) {
-		return { verdict: "inconclusive", reason: `ambiguous timing: only ${improved}/${candidate.repetitionP95Ms.length} paired repetitions improved; ${policy.requiredImprovedRepetitions} required` };
-	}
-	return { verdict: "accepted", reason: `p95 ${p95}ms vs best ${best.p95}ms; ${improved}/${candidate.repetitionP95Ms.length} paired repetitions improved` };
-}
-
-/** (max - min) / median of the per-repetition p95s: the run-to-run spread the target must clear to be measurable. */
-export function relativeSpread(values: number[]): number {
-	if (values.length < 2) return 0;
-	const sorted = [...values].sort((a, b) => a - b);
-	const median = sorted[Math.floor(sorted.length / 2)]!;
-	return median > 0 ? (sorted[sorted.length - 1]! - sorted[0]!) / median : 0;
 }
 
 export class SimulatedCrash extends Error {

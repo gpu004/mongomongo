@@ -112,7 +112,7 @@ export class SupermemoryAdapter implements MemoryAdapter {
 	}
 
 	async search(containerTag: string, query: string, limit: number): Promise<MemoryHit[]> {
-		const response = await this.client.search.documents({ q: query, containerTag, limit, includeFullDocs: true });
+		const response = await this.client.search.documents({ q: query, containerTags: [containerTag], limit, includeFullDocs: true });
 		return response.results.map((r) => ({
 			documentId: r.documentId,
 			customId: typeof r.metadata?.episodeId === "string" ? r.metadata.episodeId : null,
@@ -125,12 +125,16 @@ export class SupermemoryAdapter implements MemoryAdapter {
 
 /**
  * Deterministic in-process adapter for tests and for running without
- * credentials. Retrieval is a token-overlap ranking: good enough to exercise
- * scope filtering, supersession, and budget logic without a network.
+ * credentials. Retrieval is a token-overlap ranking over an inverted index:
+ * good enough to exercise scope filtering, supersession, and budget logic
+ * without a network, and cheap enough for large synthetic histories.
  */
 export class LocalMemoryAdapter implements MemoryAdapter {
 	readonly kind = "local" as const;
 	private readonly docs = new Map<string, { containerTag: string; customId: string; content: string; metadata: Record<string, unknown>; status: RemoteStatus }>();
+	private readonly byCustomId = new Map<string, string>();
+	private readonly postings = new Map<string, Set<string>>();
+	private readonly pending = new Set<string>();
 	private counter = 0;
 	/** Test hook: when true, every call fails like an outage. */
 	unavailable = false;
@@ -139,19 +143,32 @@ export class LocalMemoryAdapter implements MemoryAdapter {
 
 	async add(containerTag: string, customId: string, content: string, metadata: Record<string, string | number | boolean>): Promise<{ remoteId: string }> {
 		if (this.unavailable) throw new Error("memory service unavailable");
-		for (const [id, doc] of this.docs) {
-			if (doc.customId === customId && doc.containerTag === containerTag) {
-				this.docs.set(id, { ...doc, content, metadata });
-				return { remoteId: id };
-			}
+		const key = `${containerTag}\u0000${customId}`;
+		const existing = this.byCustomId.get(key);
+		if (existing) {
+			const doc = this.docs.get(existing)!;
+			this.unindex(existing, doc.content);
+			this.docs.set(existing, { ...doc, content, metadata });
+			this.index(existing, content);
+			return { remoteId: existing };
 		}
 		const remoteId = `local-doc-${++this.counter}`;
-		this.docs.set(remoteId, { containerTag, customId, content, metadata, status: this.deferReadiness ? "queued" : "done" });
+		this.put(remoteId, { containerTag, customId, content, metadata, status: this.deferReadiness ? "queued" : "done" });
+		this.byCustomId.set(key, remoteId);
 		return { remoteId };
 	}
 
-	settle(): void {
-		for (const [id, doc] of this.docs) this.docs.set(id, { ...doc, status: "done" });
+	/** Test hook: mark queued documents done; with `count`, only the oldest `count` of them. */
+	settle(count = Number.POSITIVE_INFINITY): number {
+		let settled = 0;
+		for (const id of this.pending) {
+			if (settled >= count) break;
+			const doc = this.docs.get(id);
+			if (doc) this.docs.set(id, { ...doc, status: "done" });
+			this.pending.delete(id);
+			settled += 1;
+		}
+		return settled;
 	}
 
 	async status(remoteId: string): Promise<RemoteStatus> {
@@ -161,19 +178,48 @@ export class LocalMemoryAdapter implements MemoryAdapter {
 
 	async search(containerTag: string, query: string, limit: number): Promise<MemoryHit[]> {
 		if (this.unavailable) throw new Error("memory service unavailable");
-		const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+		const all = [...new Set(tokens(query))];
+		const rare = all.filter((t) => (this.postings.get(t)?.size ?? 0) <= Math.max(50, this.docs.size / 5));
+		const terms = rare.length > 0 && all.length > 1 ? rare : all;
+		const matched = new Map<string, number>();
+		for (const term of terms) for (const id of this.postings.get(term) ?? []) matched.set(id, (matched.get(id) ?? 0) + 1);
 		const hits: MemoryHit[] = [];
-		for (const [documentId, doc] of this.docs) {
+		for (const [documentId, count] of matched) {
+			const doc = this.docs.get(documentId)!;
 			if (doc.containerTag !== containerTag || doc.status !== "done") continue;
-			const text = doc.content.toLowerCase();
-			const score = terms.filter((t) => text.includes(t)).length / Math.max(1, terms.length);
-			if (score > 0) hits.push({ documentId, customId: doc.customId, score, content: doc.content, metadata: doc.metadata });
+			hits.push({ documentId, customId: doc.customId, score: count / Math.max(1, terms.length), content: doc.content, metadata: doc.metadata });
 		}
 		return hits.sort((a, b) => b.score - a.score).slice(0, limit);
 	}
 
 	/** Test hook: inject a document from another mission scope, as a misconfigured remote could return. */
 	injectForeign(containerTag: string, customId: string, content: string, metadata: Record<string, unknown>): void {
-		this.docs.set(`foreign-${++this.counter}`, { containerTag, customId, content, metadata, status: "done" });
+		this.put(`foreign-${++this.counter}`, { containerTag, customId, content, metadata, status: "done" });
 	}
+
+	get size(): number {
+		return this.docs.size;
+	}
+
+	private put(id: string, doc: { containerTag: string; customId: string; content: string; metadata: Record<string, unknown>; status: RemoteStatus }): void {
+		this.docs.set(id, doc);
+		if (doc.status !== "done") this.pending.add(id);
+		this.index(id, doc.content);
+	}
+
+	private index(id: string, content: string): void {
+		for (const token of new Set(tokens(content))) {
+			let set = this.postings.get(token);
+			if (!set) this.postings.set(token, (set = new Set()));
+			set.add(id);
+		}
+	}
+
+	private unindex(id: string, content: string): void {
+		for (const token of new Set(tokens(content))) this.postings.get(token)?.delete(id);
+	}
+}
+
+function tokens(text: string): string[] {
+	return text.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
 }

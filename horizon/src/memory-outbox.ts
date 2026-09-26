@@ -100,7 +100,7 @@ export class MemoryOutbox {
 }
 
 export interface RetrievalSelection {
-	injected: { episodeId: string; text: string; source: "remote" | "local_cache" }[];
+	injected: { episodeId: string; text: string; source: "remote" | "local_cache" | "local_pending" }[];
 	filteredOut: { episodeId: string | null; reason: string }[];
 	degraded: boolean;
 }
@@ -108,8 +108,10 @@ export interface RetrievalSelection {
 /**
  * Retrieval policy: ask for a small candidate set, then post-filter by mission
  * scope, evidence availability, artifact applicability and supersession before
- * anything enters a packet. Falls back to the local recent-results cache when
- * the remote is unavailable and records the degradation.
+ * anything enters a packet. Episodes whose delivery is not yet ready remotely
+ * are searched locally and merged, so indexing lag never hides recent results.
+ * Falls back to the local index when the remote is unavailable and records the
+ * degradation. Cost is proportional to the candidate set, not mission history.
  */
 export async function retrieveEpisodes(
 	adapter: MemoryAdapter,
@@ -122,22 +124,43 @@ export async function retrieveEpisodes(
 	onOperation: () => void = () => {},
 ): Promise<RetrievalSelection> {
 	const selection: RetrievalSelection = { injected: [], filteredOut: [], degraded: false };
-	const local = new Map(ledger.listEpisodes(scope.missionId).map((e) => [e.episodeId, e]));
-	const superseded = new Set([...local.values()].map((e) => e.supersedes).filter((s): s is string => s !== null));
-
-	let hits: MemoryHit[] = [];
+	const interpretations = new Map<string, EpisodeRow["interpretation"]>();
+	let hits: (MemoryHit & { pending?: boolean; localOnly?: boolean })[] = [];
 	try {
 		onOperation();
 		hits = await adapter.search(scope.containerTag, query, candidateLimit);
 	} catch {
 		selection.degraded = true;
-		hits = localFallback(local, query, candidateLimit);
+		hits = ledger.searchEpisodes(scope.missionId, query, candidateLimit).map((row) => localHit(row, query));
+	}
+	if (!selection.degraded) {
+		const seen = new Set(hits.filter((h) => h.metadata.missionId === scope.missionId).map((h) => episodeIdOf(h)));
+		// The ledger is canonical: local matches the remote search missed (still indexing, or low remote recall) are merged in.
+		const unindexed = new Set(ledger.searchEpisodes(scope.missionId, query, candidateLimit, { unindexedOnly: true }).map((row) => row.episodeId));
+		const local = ledger
+			.searchEpisodes(scope.missionId, query, candidateLimit)
+			.concat(ledger.searchEpisodes(scope.missionId, query, candidateLimit, { unindexedOnly: true }))
+			.filter((row, i, rows) => !seen.has(row.episodeId) && rows.findIndex((r) => r.episodeId === row.episodeId) === i)
+			.map((row) => ({ ...localHit(row, query), pending: unindexed.has(row.episodeId), localOnly: true }));
+		if (local.length > 0) {
+			// Remote and local scores are not comparable; rank the merged set with one IDF-weighted scorer.
+			const terms = queryTerms(query);
+			const weights = ledger.termWeights(terms);
+			const total = terms.reduce((n, t) => n + weights.get(t)!, 0) || 1;
+			const rescore = (h: MemoryHit) => {
+				const present = new Set(queryTerms(h.content));
+				return terms.reduce((n, t) => n + (present.has(t) ? weights.get(t)! : 0), 0) / total;
+			};
+			hits = [...hits, ...local].map((h) => ({ ...h, score: rescore(h) })).sort((a, b) => b.score - a.score);
+		}
 	}
 
-	for (const hit of hits) {
+	const considered = new Set<string>();
+	for (const candidate of hits) {
 		if (selection.injected.length >= select) break;
+		let hit = candidate;
 		const meta = hit.metadata;
-		const episodeId = typeof meta.episodeId === "string" ? meta.episodeId : hit.customId;
+		let episodeId = episodeIdOf(hit);
 		if (meta.missionId !== scope.missionId) {
 			selection.filteredOut.push({ episodeId, reason: "wrong mission scope" });
 			continue;
@@ -146,47 +169,55 @@ export async function retrieveEpisodes(
 			selection.filteredOut.push({ episodeId, reason: `contract version ${meta.contractVersion} not applicable` });
 			continue;
 		}
-		if (!episodeId || !local.has(episodeId)) {
+		let row = episodeId ? ledger.getEpisode(episodeId) : undefined;
+		if (!episodeId || !row || row.missionId !== scope.missionId) {
 			selection.filteredOut.push({ episodeId, reason: "no local episode record (evidence unavailable)" });
 			continue;
 		}
-		if (superseded.has(episodeId)) {
-			selection.filteredOut.push({ episodeId, reason: "superseded by a newer version" });
-			continue;
+		if (ledger.isSuperseded(episodeId)) {
+			const current = ledger.currentVersionOf(episodeId);
+			selection.filteredOut.push({ episodeId, reason: `superseded by ${current?.episodeId ?? "a newer version"}` });
+			if (!current || current.missionId !== scope.missionId) continue;
+			row = current;
+			episodeId = current.episodeId;
+			hit = { ...localHit(current, query), localOnly: true, pending: !ledger.isIndexed(current.episodeId) };
 		}
-		const row = local.get(episodeId)!;
+		if (considered.has(episodeId)) continue;
+		considered.add(episodeId);
 		const missingEvidence = row.evidenceIds.filter((id) => !evidence.has(id));
 		if (row.evidenceIds.length > 0 && missingEvidence.length === row.evidenceIds.length) {
 			selection.filteredOut.push({ episodeId, reason: "all cited evidence missing locally" });
 			continue;
 		}
-		selection.injected.push({ episodeId, text: hit.content, source: selection.degraded ? "local_cache" : "remote" });
+		selection.injected.push({ episodeId, text: hit.content, source: selection.degraded || (hit.localOnly && !hit.pending) ? "local_cache" : hit.pending ? "local_pending" : "remote" });
+		interpretations.set(episodeId, row.interpretation);
 	}
 	// Verified failures/measurements before broad model interpretations.
-	selection.injected.sort((a, b) => rank(local.get(a.episodeId)) - rank(local.get(b.episodeId)));
+	selection.injected.sort((a, b) => rank(interpretations.get(a.episodeId)) - rank(interpretations.get(b.episodeId)));
 	return selection;
 }
 
-function rank(row: EpisodeRow | undefined): number {
-	return row?.interpretation === "verified" ? 0 : 1;
+function episodeIdOf(hit: MemoryHit): string | null {
+	return typeof hit.metadata.episodeId === "string" ? hit.metadata.episodeId : hit.customId;
 }
 
-function localFallback(local: Map<string, EpisodeRow>, query: string, limit: number): MemoryHit[] {
-	const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-	return [...local.values()]
-		.map((row) => {
-			const text = row.summary.toLowerCase();
-			const score = terms.filter((t) => text.includes(t)).length / Math.max(1, terms.length);
-			return { row, score };
-		})
-		.filter((x) => x.score > 0)
-		.sort((a, b) => b.score - a.score)
-		.slice(0, limit)
-		.map(({ row, score }) => ({
-			documentId: `local:${row.episodeId}`,
-			customId: row.episodeId,
-			score,
-			content: row.summary,
-			metadata: { missionId: row.missionId, episodeId: row.episodeId, artifactHash: row.artifactHash },
-		}));
+function rank(interpretation: EpisodeRow["interpretation"] | undefined): number {
+	return interpretation === "verified" ? 0 : 1;
+}
+
+function queryTerms(text: string): string[] {
+	return [...new Set(text.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(Boolean))];
+}
+
+function localHit(row: EpisodeRow, query: string): MemoryHit {
+	const terms = queryTerms(query);
+	const present = new Set(queryTerms(row.summary));
+	const score = terms.filter((t) => present.has(t)).length / Math.max(1, terms.length);
+	return {
+		documentId: `local:${row.episodeId}`,
+		customId: row.episodeId,
+		score,
+		content: row.summary,
+		metadata: { missionId: row.missionId, episodeId: row.episodeId, artifactHash: row.artifactHash },
+	};
 }

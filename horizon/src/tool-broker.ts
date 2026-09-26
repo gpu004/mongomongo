@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Operation } from "../verification/reference-model.ts";
 import type { Suite, VerificationReport } from "../verification/reports.ts";
+import type { ObservedVerification } from "./claim-audit.ts";
 import type { FileEvidenceStore } from "./mission-paths.ts";
 
 export interface RecallResult {
@@ -47,6 +48,8 @@ export class ToolBroker {
 	readonly hooks: BrokerHooks;
 	private readonly deadline: () => number;
 	private readonly children = new Set<ReturnType<typeof spawn>>();
+	/** Every verifier result the worker saw this cycle, in order; used to audit its claim. */
+	readonly verifications: ObservedVerification[] = [];
 
 	constructor(workspaceDir: string, evidence: FileEvidenceStore, hooks: BrokerHooks, deadline: () => number) {
 		this.workspaceDir = resolve(workspaceDir);
@@ -171,6 +174,7 @@ export class ToolBroker {
 	async verifyCandidate(suite: Suite): Promise<{ reportId: string; status: string; failed: string[]; metrics: VerificationReport["metrics"]; infraMessage?: string }> {
 		this.checkDeadline();
 		const { report } = await this.hooks.verify(suite);
+		this.verifications.push({ suite, status: report.status, reportId: report.reportId });
 		const failed = report.assertions.filter((a) => !a.passed).map((a) => `${a.id}: ${a.detail ?? ""} [${a.evidenceId}]`);
 		this.hooks.onToolEvent("verify_candidate", { suite }, `${report.status} ${report.reportId}`);
 		const result: { reportId: string; status: string; failed: string[]; metrics: VerificationReport["metrics"]; infraMessage?: string } = { reportId: report.reportId, status: report.status, failed, metrics: report.metrics };

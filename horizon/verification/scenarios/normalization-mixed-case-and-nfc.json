@@ -4,7 +4,7 @@
   "suite": "correctness",
   "description": "Queries match regardless of case and Unicode composition (NFC).",
   "invariantIds": [
-    "INV-NORMALIZE"
+    "INV-NORMALIZATION"
   ],
   "sequence": [
     {

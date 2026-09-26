@@ -17,7 +17,7 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ```sh
 npm install
 npm run check          # tsc --noEmit
-npm test               # recovery, report validation, memory scope, lesson policy, context budget, acceptance policy
+npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
 
@@ -34,6 +34,9 @@ npm run horizon -- export --mission search-p95-demo       # runs/<mission>/expor
 npm run horizon -- verify --mission search-p95-demo --artifact <hash> --suite smoke|correctness|performance
 npm run horizon -- profile --mission search-p95-demo --scenario search-read-heavy
 npm run horizon -- features check --artifact <hash>
+npm run horizon -- skill-eval                               # grade the worker on fixed verification-skill fixtures
+npm run horizon -- memory-bench --episodes 1000,10000      # synthetic history benchmark of retrieval
+node scripts/supermemory-probe.ts --episodes 12            # hosted memory: indexing lag, latency, scoped correctness
 ```
 
 Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artifacts/<hash>/`

@@ -4,8 +4,8 @@
   "suite": "correctness",
   "description": "Every term must be a substring of title+' '+body; token boundaries are not required.",
   "invariantIds": [
-    "INV-SUBSTRING",
-    "INV-ALL-TERMS"
+    "INV-SUBSTRING-MATCH",
+    "INV-MULTI-TERM"
   ],
   "sequence": [
     {
