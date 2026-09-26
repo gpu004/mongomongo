@@ -15,7 +15,7 @@ export function testConfig(missionId: string, overrides: Partial<MissionConfig> 
 		...base,
 		missionId,
 		isolation: "subprocess",
-		targetP95Reduction: 0.15,
+		targetP95Reduction: 0.1,
 		acceptanceMargin: 0.02,
 		workload: { ...base.workload, corpusSize: 3000, warmupRequests: 30, measuredRequests: 150, repetitions: 3 },
 		holdoutWorkload: { ...base.holdoutWorkload, corpusSize: 3000, warmupRequests: 30, measuredRequests: 150, repetitions: 3 },

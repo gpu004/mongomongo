@@ -155,6 +155,7 @@ export class MissionController {
 				cycles += 1;
 				if (active) {
 					await this.evaluateExperiment(active, recovery);
+					this.cyclesInSegment += 1;
 					active = undefined;
 				} else {
 					const done = await this.runCycle(cycles, recovery);
@@ -582,7 +583,9 @@ export class MissionController {
 
 	private async buildPacket(mission: MissionRow, experimentId: string): Promise<ContextPacket> {
 		const experiments = this.ledger.listExperiments(this.config.missionId).filter((e) => e.taskId === "optimize-search");
+		// Bounded recent history: only this segment's experiments are replayed verbatim; older segments are reachable through retrieval.
 		const recent = experiments
+			.filter((e) => e.segmentOrdinal === this.segmentOrdinal)
 			.slice(-3)
 			.map((e) => {
 				const episode = this.ledger.getEpisode(`ep-${e.experimentId}-v1`);

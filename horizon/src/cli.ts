@@ -7,6 +7,7 @@ import type { Suite } from "../verification/reports.ts";
 import { computeEnvironmentHash, computeEvaluatorHash, hashDirectory, runSuite } from "../verification/runner.ts";
 import { checkImportBoundaries } from "../verification/structural.ts";
 import { ArtifactStore, SEED_DIR } from "./artifact-store.ts";
+import { compareConfigurations, renderComparison } from "./compare.ts";
 import { BaselineError, MissionController, RESOURCES_DIR, SimulatedCrash } from "./controller.ts";
 import { Ledger } from "./ledger.ts";
 import { loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
@@ -27,6 +28,8 @@ const USAGE = `horizon <command> [options]
   features check --artifact A|--dir DIR    structural import-boundary check
   inspect --mission M                      progress view
   export --mission M                       write exports/summary.{json,md}
+  compare --config mission.json [--repeats N] [--runs-root DIR]
+                                           run the three memory configurations under one crash schedule
 `;
 
 const { values, positionals } = parseArgs({
@@ -42,6 +45,7 @@ const { values, positionals } = parseArgs({
 		cycles: { type: "string" },
 		"runs-root": { type: "string" },
 		"crash-at": { type: "string" },
+		repeats: { type: "string" },
 	},
 });
 
@@ -170,6 +174,23 @@ async function main(): Promise<number> {
 			const violations = checkImportBoundaries(join(dir, "src"));
 			log(JSON.stringify({ dir, hash: hashDirectory(dir).hash, violations }, null, 2));
 			return violations.length === 0 ? 0 : 2;
+		}
+		case "compare": {
+			if (!values.config) throw new Error("--config is required");
+			const base = loadMissionConfig(resolve(values.config));
+			const root = values["runs-root"] ? resolve(values["runs-root"]) : mkdtempSync(join(tmpdir(), "horizon-compare-"));
+			const result = await compareConfigurations({
+				runsRoot: root,
+				base: { ...base, segmentRotationCycles: 1 },
+				// Same schedule for every configuration: crash right after the first candidate snapshot, then resume to completion.
+				interruptions: [{ crashAt: "snapshot_ready" }, { crashAt: null }],
+				repeats: values.repeats ? Number(values.repeats) : 1,
+				log,
+			});
+			log("");
+			log(renderComparison(result));
+			log(`written to ${join(root, "comparison.md")}`);
+			return 0;
 		}
 		case "inspect": {
 			const { config, paths } = loadMission();

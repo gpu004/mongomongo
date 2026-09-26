@@ -46,3 +46,7 @@ Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artif
 - `src/` ledger, artifact store, recovery, controller, tool broker, Pi/scripted workers, memory, lesson policy, CLI
 - `resources/` versioned feature map and verification skill
 - `test/` deterministic tests
+
+## Configuration comparison and report
+
+`node src/cli.ts compare --config mission.example.json [--repeats N]` runs the three memory configurations (durable only, +retrieval, +validated correction) from the same seed under one crash schedule and writes `comparison.{json,md}`. Findings and limitations against `LONG_HORIZON_AGENT_PROMPT.md` are in `REPORT.md`.
