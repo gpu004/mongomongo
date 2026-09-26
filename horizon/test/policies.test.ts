@@ -9,6 +9,7 @@ import { auditClaim } from "../src/claim-audit.ts";
 import { RESOURCES_DIR } from "../src/controller.ts";
 import { loadFeatureMap, validateFeatureMap } from "../src/feature-map.ts";
 import { Ledger } from "../src/ledger.ts";
+import { SqliteLedger } from "../src/sqlite-ledger.ts";
 import { type EpisodePayload, LocalMemoryAdapter, renderEpisode } from "../src/memory-adapter.ts";
 import { runMemoryBench } from "../src/memory-bench.ts";
 import { MemoryOutbox, retrieveEpisodes } from "../src/memory-outbox.ts";
@@ -177,17 +178,18 @@ test("feature map: shipped map resolves; drifted references are reported", () =>
 function memoryFixture() {
   const dir = mkdtempSync(join(tmpdir(), "horizon-lag-"));
   const ledger = new Ledger(join(dir, "state.sqlite"));
+  const asyncLedger = new SqliteLedger(ledger);
   const evidence = new FileEvidenceStore(join(dir, "evidence"));
   const adapter = new LocalMemoryAdapter();
   const payloads = new Map<string, EpisodePayload>();
   const outbox = new MemoryOutbox(
-    ledger,
+    asyncLedger,
     adapter,
     "horizon-lag",
     (id) => payloads.get(id),
     () => {},
   );
-  const add = (p: EpisodePayload) => {
+  const add = async (p: EpisodePayload) => {
     payloads.set(p.episodeId, p);
     ledger.insertEpisode({
       episodeId: p.episodeId,
@@ -204,9 +206,9 @@ function memoryFixture() {
       summary: renderEpisode(p),
       createdAt: new Date().toISOString(),
     });
-    outbox.enqueue(p);
+    await outbox.enqueue(p);
   };
-  return { ledger, evidence, adapter, outbox, add };
+  return { ledger, asyncLedger, evidence, adapter, outbox, add };
 }
 
 function episode(
@@ -242,10 +244,10 @@ function episode(
 }
 
 test("indexing lag: accepted-but-unindexed episodes are merged from the local index; a foreign hit with the same id does not hide them", async () => {
-  const { ledger, evidence, adapter, outbox, add } = memoryFixture();
+  const { ledger, asyncLedger, evidence, adapter, outbox, add } = memoryFixture();
   const scope = { missionId: "lag", containerTag: "horizon-lag", contractVersion: 1 };
   adapter.deferReadiness = true;
-  add(episode("ep-lagged", "rejected: posting index loses updates"));
+  await add(episode("ep-lagged", "rejected: posting index loses updates"));
   await outbox.drain(Date.now() + 60_000);
   assert.equal(ledger.listOutbox(["submitted"]).length, 1, "accepted remotely, not ready");
   adapter.injectForeign("horizon-lag", "ep-lagged", "Mission other; posting index loses updates", {
@@ -254,7 +256,7 @@ test("indexing lag: accepted-but-unindexed episodes are merged from the local in
   });
   const selection = await retrieveEpisodes(
     adapter,
-    ledger,
+    asyncLedger,
     evidence,
     scope,
     "posting index loses updates",
@@ -269,7 +271,7 @@ test("indexing lag: accepted-but-unindexed episodes are merged from the local in
   await outbox.drain(Date.now() + 60_000);
   const after = await retrieveEpisodes(
     adapter,
-    ledger,
+    asyncLedger,
     evidence,
     scope,
     "posting index loses updates",
@@ -281,13 +283,13 @@ test("indexing lag: accepted-but-unindexed episodes are merged from the local in
 });
 
 test("supersession: a remote hit on an old version is replaced by the current version, even before it is indexed", async () => {
-  const { ledger, evidence, adapter, outbox, add } = memoryFixture();
+  const { asyncLedger, evidence, adapter, outbox, add } = memoryFixture();
   const scope = { missionId: "lag", containerTag: "horizon-lag", contractVersion: 1 };
-  add(episode("ep-x-v1", "verdict rsk1 before re-measurement"));
+  await add(episode("ep-x-v1", "verdict rsk1 before re-measurement"));
   await outbox.drain(Date.now() + 60_000);
   await outbox.drain(Date.now() + 60_000);
   adapter.deferReadiness = true;
-  add(
+  await add(
     episode("ep-x-v2", "verdict rsk2 after re-measurement", {
       version: 2,
       supersedes: "ep-x-v1",
@@ -296,7 +298,7 @@ test("supersession: a remote hit on an old version is replaced by the current ve
   );
   const selection = await retrieveEpisodes(
     adapter,
-    ledger,
+    asyncLedger,
     evidence,
     scope,
     "verdict before re-measurement",

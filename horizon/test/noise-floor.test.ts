@@ -20,19 +20,19 @@ test("baseline freezes an acceptance margin that covers the measured spread and 
       maxRepetitionSpread: 1,
     },
   );
-  controller.initialize();
-  assert.equal(controller.mission().frozenAcceptanceMargin, null);
+  await controller.initialize();
+  assert.equal((await controller.mission()).frozenAcceptanceMargin, null);
   await controller.run();
-  const mission = controller.mission();
-  const perf = controller.ledger
-    .listVerifications("noise-freeze")
-    .find((v) => v.experimentId === "exp-baseline-noise-freeze" && v.suite === "performance")!;
+  const mission = await controller.mission();
+  const perf = (await controller.ledger.listVerifications("noise-freeze")).find(
+    (v) => v.experimentId === "exp-baseline-noise-freeze" && v.suite === "performance",
+  )!;
   const report = JSON.parse(readFileSync(perf.path, "utf8")) as {
     metrics: { repetitionP95Ms?: number[] };
   };
   const spread = repetitionSpread(report.metrics.repetitionP95Ms);
-  const events = controller.ledger.eventsSince(0, 10000);
-  controller.close();
+  const events = await controller.ledger.eventsSince(0, 10000);
+  await controller.close();
 
   assert.ok(mission.frozenAcceptanceMargin !== null, "margin frozen after baseline");
   assert.ok(mission.frozenAcceptanceMargin! >= 0.05, "never below the configured margin");
@@ -69,13 +69,13 @@ test("baseline noise above the ceiling blocks the mission before optimization in
       maxRepetitionSpread: 1e-9,
     },
   );
-  controller.initialize();
+  await controller.initialize();
   await assert.rejects(controller.run(), BaselineError);
-  const mission = controller.mission();
-  const experiments = controller.ledger.listExperiments("noise-repair");
-  const tasks = controller.ledger.listTasks("noise-repair");
-  const events = controller.ledger.eventsSince(0, 10000);
-  controller.close();
+  const mission = await controller.mission();
+  const experiments = await controller.ledger.listExperiments("noise-repair");
+  const tasks = await controller.ledger.listTasks("noise-repair");
+  const events = await controller.ledger.eventsSince(0, 10000);
+  await controller.close();
 
   assert.equal(mission.status, "blocked");
   assert.equal(mission.frozenAcceptanceMargin, null);

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { VerificationReport } from "../verification/reports.ts";
-import { LeaseError, type AsyncLedger } from "../src/ledger-contract.ts";
+import { LeaseError, type AsyncLedger, type LeaseRow } from "../src/ledger-contract.ts";
 import type { EpisodeRow } from "../src/ledger.ts";
 import { readMongoEnv } from "../src/mongo-env.ts";
 import { MongoLedger, RECENT_EPISODE_WINDOW } from "../src/mongo-ledger.ts";
@@ -487,6 +487,98 @@ for (const makeBackend of backends) {
       assert.equal(leaseA2.fencingToken, 3, "tokens never reuse a value");
       const sameOwner = await a.claimLease(MISSION, "controller-a", 60_000);
       assert.equal(sameOwner.fencingToken, 4);
+    } finally {
+      await a.close();
+      await b.close();
+      await backend.teardown();
+    }
+  });
+
+  test(`[${label}] an expired lease nobody has taken still fences its owner's writes in`, async () => {
+    const backend = makeBackend();
+    const a = await backend.open();
+    const b = await backend.open();
+    try {
+      await mission(a);
+      const past = new Date(Date.now() - 3_600_000);
+      const lease = await a.claimLease(MISSION, "controller-a", 1_000, past);
+      assert.ok(new Date(lease.expiresAt).getTime() < Date.now(), "lease already expired");
+      assert.equal(
+        (await b.getLease(MISSION))?.owner,
+        "controller-a",
+        "expiry alone frees nothing",
+      );
+
+      await a.updateMission(MISSION, { status: "running" });
+      const renewed = await a.renewLease(lease, 60_000);
+      assert.equal(renewed.fencingToken, lease.fencingToken);
+      assert.equal((await b.getMission(MISSION))?.status, "running");
+
+      await assert.rejects(b.claimLease(MISSION, "controller-b", 60_000), LeaseError);
+      await a.releaseLease(renewed);
+    } finally {
+      await a.close();
+      await b.close();
+      await backend.teardown();
+    }
+  });
+
+  test(`[${label}] a takeover racing a fenced transaction is serialized after it; the stale owner then writes nothing`, async () => {
+    const backend = makeBackend();
+    const a = await backend.open();
+    const b = await backend.open();
+    try {
+      await mission(a);
+      const t0 = new Date("2026-01-01T00:00:00.000Z");
+      const leaseA = await a.claimLease(MISSION, "controller-a", 60_000, t0);
+      const later = new Date(t0.getTime() + 61_000);
+      let takeover: Promise<LeaseRow | Error> | undefined;
+      await a.transaction(async (tx) => {
+        await tx.upsertTask({
+          taskId: "interleaved",
+          missionId: MISSION,
+          ordinal: 99,
+          dependsOn: [],
+          status: "pending",
+          hypothesis: "h",
+          completionCriteria: "c",
+          nextAction: "n",
+        });
+        // Another controller tries to take the lease while this transaction has already fenced on it.
+        takeover ??= b.claimLease(MISSION, "controller-b", 60_000, later).then(
+          (lease) => lease,
+          (error: Error) => error,
+        );
+        await tx.updateMission(MISSION, { status: "failed" });
+      });
+      let leaseB = await takeover!;
+      if (leaseB instanceof Error) {
+        assert.ok(
+          !(leaseB instanceof LeaseError),
+          "the open transaction blocks the claim, it is not a fencing loss",
+        );
+        leaseB = await b.claimLease(MISSION, "controller-b", 60_000, later);
+      }
+      assert.equal(leaseB.fencingToken, leaseA.fencingToken + 1);
+      assert.equal(
+        (await b.getMission(MISSION))?.status,
+        "failed",
+        "the fenced transaction committed whole",
+      );
+      assert.equal(
+        (await b.listTasks(MISSION)).some((t) => t.taskId === "interleaved"),
+        true,
+      );
+
+      await assert.rejects(a.appendEvent("after-takeover", "x", MISSION, {}), LeaseError);
+      await assert.rejects(
+        a.transaction(async (tx) => {
+          await tx.updateMission(MISSION, { status: "succeeded" });
+        }),
+        LeaseError,
+      );
+      assert.equal((await b.getMission(MISSION))?.status, "failed", "stale owner changed nothing");
+      assert.equal(await b.findEvent("after-takeover"), undefined);
     } finally {
       await a.close();
       await b.close();

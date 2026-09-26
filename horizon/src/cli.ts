@@ -17,6 +17,7 @@ import { compareConfigurations, renderComparison } from "./compare.ts";
 import { BaselineError, MissionController, RESOURCES_DIR, SimulatedCrash } from "./controller.ts";
 import { loadFeatureMap, validateFeatureMap } from "./feature-map.ts";
 import { Ledger } from "./ledger.ts";
+import { describeLedgerSelection, openLedger, selectLedgerBackend } from "./ledger-backend.ts";
 import { readMongoEnv } from "./mongo-env.ts";
 import { probeMongo, renderMongoProbe } from "./mongo-probe.ts";
 import { evaluateLiveGate, exportLiveGate, renderLiveGate } from "./live-gate.ts";
@@ -183,12 +184,13 @@ async function main(): Promise<number> {
         log,
       });
       try {
-        const row = controller.initialize();
+        log(`ledger: ${describeLedgerSelection(selectLedgerBackend(config))}`);
+        const row = await controller.initialize();
         log(
           `mission ${row.missionId} ready: contract ${row.contractHash.slice(0, 12)} evaluator ${row.evaluatorHash.slice(0, 12)} env ${row.environmentHash.slice(0, 12)} seed ${row.seedArtifactHash?.slice(0, 12)}`,
         );
       } finally {
-        controller.close();
+        await controller.close();
       }
       return 0;
     }
@@ -204,7 +206,7 @@ async function main(): Promise<number> {
       try {
         const row = await controller.run();
         log("");
-        log(renderProgress(summarize(controller.ledger, config)));
+        log(renderProgress(await summarize(controller.ledger, config)));
         return row.status === "succeeded" ? 0 : 2;
       } catch (error) {
         if (error instanceof SimulatedCrash) {
@@ -214,7 +216,7 @@ async function main(): Promise<number> {
         if (error instanceof BaselineError) return 2;
         throw error;
       } finally {
-        controller.close();
+        await controller.close();
       }
     }
     case "verify":
@@ -222,9 +224,9 @@ async function main(): Promise<number> {
       const { config, paths } = loadMission();
       const suite: Suite = command === "profile" ? "performance" : (values.suite as Suite);
       if (!suite) throw new Error("--suite is required");
-      const ledger = new Ledger(paths.db);
+      const ledger = await openLedger(config, paths);
       try {
-        const mission = ledger.getMission(config.missionId);
+        const mission = await ledger.getMission(config.missionId);
         const artifacts = new ArtifactStore(paths.artifacts);
         const hash = values.artifact ?? mission?.bestArtifactHash;
         if (!hash || !artifacts.verify(hash))
@@ -267,7 +269,7 @@ async function main(): Promise<number> {
         );
         return report.status === "passed" ? 0 : 2;
       } finally {
-        ledger.close();
+        await ledger.close();
       }
     }
     case "features": {
@@ -363,36 +365,36 @@ async function main(): Promise<number> {
     }
     case "inspect": {
       const { config, paths } = loadMission();
-      const ledger = new Ledger(paths.db);
+      const ledger = await openLedger(config, paths);
       try {
-        log(renderProgress(summarize(ledger, config)));
+        log(renderProgress(await summarize(ledger, config)));
       } finally {
-        ledger.close();
+        await ledger.close();
       }
       return 0;
     }
     case "export": {
       const { config, paths } = loadMission();
-      const ledger = new Ledger(paths.db);
+      const ledger = await openLedger(config, paths);
       try {
-        const out = exportMission(ledger, config, paths);
+        const out = await exportMission(ledger, config, paths);
         log(`${out.json}\n${out.markdown}`);
       } finally {
-        ledger.close();
+        await ledger.close();
       }
       return 0;
     }
     case "live-gate": {
       const { config, paths } = loadMission();
-      const ledger = new Ledger(paths.db);
+      const ledger = await openLedger(config, paths);
       try {
-        const result = evaluateLiveGate(ledger, config);
+        const result = await evaluateLiveGate(ledger, config);
         const out = exportLiveGate(result, paths);
         log(renderLiveGate(result));
         log(`${out.json}\n${out.markdown}`);
         return result.passed ? 0 : 2;
       } finally {
-        ledger.close();
+        await ledger.close();
       }
     }
     default:

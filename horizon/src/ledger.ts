@@ -1,13 +1,5 @@
-import {
-  closeSync,
-  existsSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
   canonicalJson,
@@ -324,8 +316,6 @@ type Row = Record<string, Cell>;
 export class Ledger {
   readonly db: DatabaseSync;
   readonly path: string;
-  private lockFd: number | null = null;
-  private lockPath: string;
 
   constructor(path: string) {
     this.path = path;
@@ -337,32 +327,9 @@ export class Ledger {
     this.db.exec(SCHEMA);
     this.migrate();
     this.backfillEpisodeIndex();
-    this.lockPath = join(dirname(path), "controller.lock");
-  }
-
-  /** Single-controller lock: fails if another live controller holds it. Stale locks from dead pids are reclaimed. */
-  acquireLock(): void {
-    if (existsSync(this.lockPath)) {
-      const pid = Number(readFileSync(this.lockPath, "utf8").trim());
-      if (Number.isInteger(pid) && pid !== process.pid && isAlive(pid)) {
-        throw new Error(`another controller (pid ${pid}) holds ${this.lockPath}`);
-      }
-      unlinkSync(this.lockPath);
-    }
-    this.lockFd = openSync(this.lockPath, "wx");
-    writeFileSync(this.lockFd, String(process.pid));
-  }
-
-  releaseLock(): void {
-    if (this.lockFd !== null) {
-      closeSync(this.lockFd);
-      this.lockFd = null;
-      if (existsSync(this.lockPath)) unlinkSync(this.lockPath);
-    }
   }
 
   close(): void {
-    this.releaseLock();
     this.db.close();
   }
 
@@ -1263,15 +1230,6 @@ export class Ledger {
       lastError: nullableString(r.last_error),
       updatedAt: String(r.updated_at),
     }));
-  }
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
   }
 }
 

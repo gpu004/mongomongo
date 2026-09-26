@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import {
   canonicalJson,
@@ -16,12 +17,14 @@ import { auditClaim } from "./claim-audit.ts";
 import { buildPacket, type ContextPacket, DEFAULT_PACKET_BUDGET } from "./context-packet.ts";
 import {
   type ExperimentRow,
-  Ledger,
+  type LeaseRow,
   type LessonRow,
   type LessonState,
   type MissionRow,
   type MissionStatus,
 } from "./ledger.ts";
+import { openLedger } from "./ledger-backend.ts";
+import { type AsyncLedger, LeaseError } from "./ledger-contract.ts";
 import {
   type RegressionProposal,
   validateAgainstFixtures,
@@ -70,7 +73,15 @@ export interface ControllerOptions {
   containerRuntime?: ContainerRuntime;
   /** Test hook: how `run()` waits for a persisted `nextWakeAt` (default: real sleep). */
   sleep?: (ms: number) => Promise<void>;
+  /** Test hook: opens the ledger instead of `openLedger(config, paths)` (backend selection). */
+  ledger?: () => Promise<AsyncLedger>;
+  /** Lease time-to-live; the heartbeat renews at a third of it. */
+  leaseTtlMs?: number;
+  /** Lease owner identity recorded in the ledger (default: host, pid and a random suffix). */
+  leaseOwner?: string;
 }
+
+export const DEFAULT_LEASE_TTL_MS = 30_000;
 
 export type Verdict = "accepted" | "rejected" | "inconclusive";
 
@@ -138,17 +149,26 @@ const TASKS = [
 export class MissionController {
   readonly config: MissionConfig;
   readonly paths: MissionPaths;
-  readonly ledger: Ledger;
   readonly artifacts: ArtifactStore;
   readonly evidence: FileEvidenceStore;
   readonly memory: MemoryAdapter;
   readonly worker: Worker;
-  private readonly outbox: MemoryOutbox;
+  private ledgerHandle: AsyncLedger | undefined;
+  private opening: Promise<AsyncLedger> | undefined;
+  private outboxHandle: MemoryOutbox | undefined;
+  private readonly openLedger: () => Promise<AsyncLedger>;
   private readonly log: (line: string) => void;
   private readonly crashAt: string | undefined;
   private readonly maxCycles: number;
   private readonly containerRuntime: ContainerRuntime | undefined;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly leaseTtlMs: number;
+  private readonly leaseOwner: string;
+  private leaseRow: LeaseRow | undefined;
+  private heartbeat: NodeJS.Timeout | undefined;
+  private heartbeatError: unknown;
+  /** Tool-call audit events are appended in order without blocking the broker; flushed before every transaction. */
+  private toolEvents: Promise<void> = Promise.resolve();
   readonly evaluatorHash: string;
   readonly environmentHash: string;
   readonly contractHash: string;
@@ -162,7 +182,10 @@ export class MissionController {
     this.config = config;
     this.paths = paths;
     ensureMissionDirs(paths);
-    this.ledger = new Ledger(paths.db);
+    this.openLedger = options.ledger ?? (() => openLedger(config, paths));
+    this.leaseTtlMs = options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
+    this.leaseOwner =
+      options.leaseOwner ?? `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
     this.artifacts = new ArtifactStore(paths.artifacts);
     this.evidence = new FileEvidenceStore(paths.evidence);
     this.log = options.log ?? (() => {});
@@ -179,26 +202,72 @@ export class MissionController {
         ? new SupermemoryAdapter(process.env.SUPERMEMORY_API_KEY)
         : new LocalMemoryAdapter());
     this.worker = options.worker ?? new ScriptedWorker();
-    this.outbox = new MemoryOutbox(
-      this.ledger,
-      this.memory,
-      config.memory.containerTag,
-      (id) => this.episodePayload(id),
-      () => this.spendMemoryOperation(),
-    );
   }
 
-  close(): void {
-    this.ledger.close();
+  /** The mission ledger; opened on first use by `initialize()`, `run()` or `mission()`. */
+  get ledger(): AsyncLedger {
+    if (!this.ledgerHandle)
+      throw new Error(`mission ${this.config.missionId} ledger not open; call open() first`);
+    return this.ledgerHandle;
+  }
+
+  /** Selects and connects the ledger backend (SQLite file or MongoDB). Idempotent. */
+  async open(): Promise<AsyncLedger> {
+    if (this.ledgerHandle) return this.ledgerHandle;
+    this.opening ??= this.openLedger().then((ledger) => {
+      this.ledgerHandle = ledger;
+      this.outboxHandle = new MemoryOutbox(
+        ledger,
+        this.memory,
+        this.config.memory.containerTag,
+        (id) => this.episodePayload(id),
+        () => this.spendMemoryOperation(),
+      );
+      return ledger;
+    });
+    try {
+      return await this.opening;
+    } finally {
+      this.opening = undefined;
+    }
+  }
+
+  private get outbox(): MemoryOutbox {
+    if (!this.outboxHandle) throw new Error("ledger not open");
+    return this.outboxHandle;
+  }
+
+  /** Lease currently held by this controller's run, if any. */
+  get lease(): LeaseRow | undefined {
+    return this.leaseRow;
+  }
+
+  async close(): Promise<void> {
+    this.stopHeartbeat();
+    const ledger = this.ledgerHandle;
+    this.ledgerHandle = undefined;
+    this.outboxHandle = undefined;
+    if (ledger) await ledger.close();
+  }
+
+  /** Runs `fn` in one ledger transaction after pending tool-call events are durable. */
+  private async transaction<T>(fn: (tx: AsyncLedger) => Promise<T>): Promise<T> {
+    await this.flushToolEvents();
+    return this.ledger.transaction(fn);
+  }
+
+  private async flushToolEvents(): Promise<void> {
+    await this.toolEvents;
   }
 
   /** `horizon mission create`: freeze identities, import the seed, write the manifest. Idempotent. */
-  initialize(): MissionRow {
-    const existing = this.ledger.getMission(this.config.missionId);
+  async initialize(): Promise<MissionRow> {
+    const ledger = await this.open();
+    const existing = await ledger.getMission(this.config.missionId);
     if (existing) return existing;
     const seed = this.artifacts.importSeed();
-    this.ledger.transaction(() => {
-      this.ledger.createMission({
+    await ledger.transaction(async (tx) => {
+      await tx.createMission({
         missionId: this.config.missionId,
         contractVersion: this.config.contractVersion,
         contractHash: this.contractHash,
@@ -207,12 +276,13 @@ export class MissionController {
         status: "ready",
         seedArtifactHash: seed.hash,
         baselineP95Ms: null,
+        frozenAcceptanceMargin: null,
         bestArtifactHash: seed.hash,
         bestP95Ms: null,
         activeTaskId: null,
         nextWakeAt: null,
       });
-      this.ledger.insertArtifact({
+      await tx.insertArtifact({
         hash: seed.hash,
         path: seed.path,
         parentHash: null,
@@ -220,8 +290,8 @@ export class MissionController {
         createdAt: new Date().toISOString(),
       });
       for (const task of TASKS)
-        this.ledger.upsertTask({ ...task, missionId: this.config.missionId, status: "pending" });
-      this.ledger.appendEvent(
+        await tx.upsertTask({ ...task, missionId: this.config.missionId, status: "pending" });
+      await tx.appendEvent(
         `mission:${this.config.missionId}:created`,
         "mission.created",
         this.config.missionId,
@@ -230,6 +300,7 @@ export class MissionController {
           evaluatorHash: this.evaluatorHash,
           environmentHash: this.environmentHash,
           seed: seed.hash,
+          ledgerBackend: ledger.backend,
         },
       );
     });
@@ -239,7 +310,8 @@ export class MissionController {
       evaluatorHash: this.evaluatorHash,
       environmentHash: this.environmentHash,
       seedArtifactHash: seed.hash,
-      config: this.config,
+      ledgerBackend: ledger.backend,
+      config: { ...this.config, ledger: { backend: ledger.backend } },
     });
     this.artifacts.restoreWorkspace(seed.hash, this.paths.candidate);
     return this.mission();
@@ -249,30 +321,82 @@ export class MissionController {
   containerRegistry(experimentId: string): ContainerRegistry {
     const missionId = this.config.missionId;
     return {
-      register: (name) => {
-        this.ledger.transaction(() => {
-          this.ledger.registerContainer(name, missionId, experimentId);
-          this.ledger.appendEvent(
-            `container:${name}:launched`,
-            "container.launched",
-            experimentId,
-            {
-              containerName: name,
-            },
-          );
+      register: async (name) => {
+        await this.transaction(async (tx) => {
+          await tx.registerContainer(name, missionId, experimentId);
+          await tx.appendEvent(`container:${name}:launched`, "container.launched", experimentId, {
+            containerName: name,
+          });
         });
       },
       release: (name) => this.ledger.releaseContainer(name),
     };
   }
 
-  mission(): MissionRow {
-    const row = this.ledger.getMission(this.config.missionId);
+  async mission(): Promise<MissionRow> {
+    return this.missionOn(await this.open());
+  }
+
+  private async missionOn(ledger: AsyncLedger): Promise<MissionRow> {
+    const row = await ledger.getMission(this.config.missionId);
     if (!row)
       throw new Error(
         `mission ${this.config.missionId} not initialized; run 'horizon mission create'`,
       );
     return row;
+  }
+
+  /**
+   * Exactly one live writer per mission: claims the fenced lease (refusing while
+   * another owner's lease is unexpired) and renews it on a heartbeat. Once a
+   * newer fencing token exists every write from this controller is rejected by
+   * the ledger, so a paused or partitioned controller cannot corrupt state.
+   */
+  private async claimLease(): Promise<void> {
+    const ledger = this.ledger;
+    this.leaseRow = await ledger.claimLease(
+      this.config.missionId,
+      this.leaseOwner,
+      this.leaseTtlMs,
+    );
+    this.heartbeatError = undefined;
+    this.log(
+      `lease: ${this.leaseOwner} token ${this.leaseRow.fencingToken} (${ledger.backend} ledger)`,
+    );
+    const interval = Math.max(50, Math.floor(this.leaseTtlMs / 3));
+    let renewing = false;
+    this.heartbeat = setInterval(() => {
+      if (renewing || !this.leaseRow) return;
+      renewing = true;
+      ledger
+        .renewLease(this.leaseRow, this.leaseTtlMs)
+        .then((renewed) => {
+          if (this.leaseRow) this.leaseRow = renewed;
+        })
+        .catch((error: unknown) => {
+          this.heartbeatError = error;
+          this.log(
+            `lease: renewal failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          if (error instanceof LeaseError) this.stopHeartbeat();
+        })
+        .finally(() => {
+          renewing = false;
+        });
+    }, interval);
+    this.heartbeat.unref();
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+  }
+
+  private async releaseLease(): Promise<void> {
+    this.stopHeartbeat();
+    const lease = this.leaseRow;
+    this.leaseRow = undefined;
+    if (lease) await this.ledger.releaseLease(lease).catch(() => {});
   }
 
   /** Under container isolation every worker command runs in the sandbox, labelled with its experiment. */
@@ -287,7 +411,8 @@ export class MissionController {
 
   /** `horizon run` / `horizon resume`: recover, then loop until done or out of budget. */
   async run(): Promise<MissionRow> {
-    this.ledger.acquireLock();
+    await this.open();
+    await this.claimLease();
     try {
       if (this.config.isolation === "container") {
         // Fail before any work is scheduled; the sandbox is never silently replaced by the host.
@@ -297,7 +422,7 @@ export class MissionController {
         if (orphans.length > 0)
           this.log(`recovery: removed ${orphans.length} orphaned container(s) from a previous run`);
       }
-      const recovery = recover(
+      const recovery = await recover(
         this.ledger,
         this.artifacts,
         this.config.missionId,
@@ -312,21 +437,25 @@ export class MissionController {
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
       await this.honourWakeTime();
-      this.ledger.updateMission(this.config.missionId, { status: "running", nextWakeAt: null });
+      await this.ledger.updateMission(this.config.missionId, {
+        status: "running",
+        nextWakeAt: null,
+      });
       await this.drainOutbox();
 
       let cycles = 0;
       let active = recovery.activeExperiment;
       while (cycles < this.maxCycles) {
-        const mission = this.mission();
+        this.assertLeaseLive();
+        const mission = await this.mission();
         const stop = this.stopReason(mission);
         if (stop) {
-          this.finish(stop);
+          await this.finish(stop);
           break;
         }
-        const task = this.nextTask();
+        const task = await this.nextTask();
         if (!task) {
-          this.finish("succeeded");
+          await this.finish("succeeded");
           break;
         }
         if (task.taskId === "baseline") {
@@ -345,18 +474,25 @@ export class MissionController {
         } else {
           const done = await this.runCycle(cycles, recovery);
           if (done === "exhausted") {
-            this.finish("blocked", "worker has no further hypotheses");
+            await this.finish("blocked", "worker has no further hypotheses");
             break;
           }
           if (done === "blocked" || done === "waiting") break;
         }
       }
       await this.drainOutbox();
-      return this.mission();
+      await this.flushToolEvents();
+      return await this.mission();
     } finally {
       await this.worker.closeSegment().catch(() => {});
-      this.ledger.releaseLock();
+      await this.flushToolEvents().catch(() => {});
+      await this.releaseLease();
     }
+  }
+
+  /** A heartbeat that lost the lease means another controller owns the mission; stop before the next write. */
+  private assertLeaseLive(): void {
+    if (this.heartbeatError instanceof LeaseError) throw this.heartbeatError;
   }
 
   private stopReason(mission: MissionRow): MissionStatus | undefined {
@@ -372,8 +508,8 @@ export class MissionController {
     return undefined;
   }
 
-  private nextTask() {
-    const tasks = this.ledger.listTasks(this.config.missionId);
+  private async nextTask() {
+    const tasks = await this.ledger.listTasks(this.config.missionId);
     const done = new Set(tasks.filter((t) => t.status === "done").map((t) => t.taskId));
     return tasks.find(
       (t) => t.status !== "done" && t.status !== "skipped" && t.dependsOn.every((d) => done.has(d)),
@@ -382,7 +518,7 @@ export class MissionController {
 
   /** A `waiting` mission persisted its retry time; sleep it off (unbilled) before touching the worker again. */
   private async honourWakeTime(): Promise<void> {
-    const mission = this.mission();
+    const mission = await this.mission();
     if (mission.status !== "waiting" || !mission.nextWakeAt) return;
     const delay = Date.parse(mission.nextWakeAt) - Date.now();
     if (delay <= 0) return;
@@ -397,18 +533,18 @@ export class MissionController {
    * `resume` can honour the retry time. Any experiment opened for this cycle is
    * interrupted, exactly as after a crash.
    */
-  private parkOnWorkerFault(
+  private async parkOnWorkerFault(
     error: WorkerUnavailableError,
     experimentId: string | null,
-  ): "blocked" | "waiting" {
+  ): Promise<"blocked" | "waiting"> {
     if (experimentId)
-      this.ledger.transaction(() => {
-        this.ledger.updateExperiment(experimentId, {
+      await this.transaction(async (tx) => {
+        await tx.updateExperiment(experimentId, {
           status: "interrupted",
           verdict: `worker unavailable: ${error.message}`,
           finishedAt: new Date().toISOString(),
         });
-        this.ledger.appendEvent(
+        await tx.appendEvent(
           `${experimentId}:interrupted:worker`,
           "experiment.interrupted",
           experimentId,
@@ -416,49 +552,49 @@ export class MissionController {
         );
       });
     if (error.kind !== "rate_limited") {
-      this.finish("blocked", error.message);
+      await this.finish("blocked", error.message);
       return "blocked";
     }
     const nextWakeAt = new Date(Date.now() + (error.retryAfterMs ?? 0)).toISOString();
-    this.ledger.transaction(() => {
-      this.ledger.updateMission(this.config.missionId, {
+    await this.transaction(async (tx) => {
+      await tx.updateMission(this.config.missionId, {
         status: "waiting",
         activeTaskId: null,
         nextWakeAt,
       });
-      this.ledger.appendEvent(
+      await tx.appendEvent(
         `mission:${this.config.missionId}:waiting:${Date.now()}`,
         "mission.waiting",
         this.config.missionId,
         { reason: error.message, nextWakeAt },
       );
-      this.checkpoint("waiting", "optimize-search", null, "waiting:provider");
+      await this.checkpoint(tx, "waiting", "optimize-search", null, "waiting:provider");
     });
     this.log(`mission waiting: ${error.message}; resume at or after ${nextWakeAt}`);
     return "waiting";
   }
 
-  private finish(status: MissionStatus, detail = ""): void {
-    this.ledger.transaction(() => {
-      this.ledger.updateMission(this.config.missionId, { status, nextWakeAt: null });
-      this.ledger.appendEvent(
+  private async finish(status: MissionStatus, detail = ""): Promise<void> {
+    await this.transaction(async (tx) => {
+      await tx.updateMission(this.config.missionId, { status, nextWakeAt: null });
+      await tx.appendEvent(
         `mission:${this.config.missionId}:finish:${Date.now()}`,
         "mission.finished",
         this.config.missionId,
         { status, detail },
       );
-      this.checkpoint(status, null, null, `finished:${status}`);
+      await this.checkpoint(tx, status, null, null, `finished:${status}`);
     });
     this.log(`mission ${status}${detail ? `: ${detail}` : ""}`);
   }
 
   private async runBaseline(): Promise<void> {
-    const mission = this.mission();
+    const mission = await this.mission();
     const seed = mission.seedArtifactHash;
     if (!seed) throw new Error("mission has no seed artifact");
     const experimentId = `exp-baseline-${this.config.missionId}`;
-    if (!this.ledger.getExperiment(experimentId)) {
-      this.ledger.insertExperiment({
+    if (!(await this.ledger.getExperiment(experimentId))) {
+      await this.ledger.insertExperiment({
         experimentId,
         missionId: this.config.missionId,
         taskId: "baseline",
@@ -469,9 +605,9 @@ export class MissionController {
         attempt: 1,
         segmentOrdinal: this.segmentOrdinal,
       });
-      this.ledger.updateExperiment(experimentId, { candidateArtifactHash: seed });
+      await this.ledger.updateExperiment(experimentId, { candidateArtifactHash: seed });
     }
-    this.ledger.updateExperiment(experimentId, { status: "evaluating" });
+    await this.ledger.updateExperiment(experimentId, { status: "evaluating" });
     const reports = await this.runSuites(experimentId, seed, [
       "smoke",
       "correctness",
@@ -482,14 +618,14 @@ export class MissionController {
     const allPassed = reports.every((r) => r.status === "passed");
     if (!allPassed || !perf || perf.metrics.p95LatencyMs === undefined) {
       const infra = reports.find((r) => r.status === "infra_error" || r.status === "timeout");
-      this.ledger.updateExperiment(experimentId, {
+      await this.ledger.updateExperiment(experimentId, {
         status: infra ? "inconclusive" : "rejected",
         verdict: infra
           ? `infra: ${infra.infraMessage ?? infra.status}`
           : "seed failed fixed suites",
         finishedAt: new Date().toISOString(),
       });
-      this.finish(
+      await this.finish(
         "blocked",
         infra
           ? "baseline could not be measured (infrastructure)"
@@ -504,13 +640,13 @@ export class MissionController {
       this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
     );
     if (floor.kind === "repair") {
-      this.ledger.transaction(() => {
-        this.ledger.updateExperiment(experimentId, {
+      await this.transaction(async (tx) => {
+        await tx.updateExperiment(experimentId, {
           status: "inconclusive",
           verdict: `baseline p95 ${perf.metrics.p95LatencyMs}ms; ${floor.reason}`,
           finishedAt: new Date().toISOString(),
         });
-        this.ledger.appendEvent(
+        await tx.appendEvent(
           `target:${this.config.missionId}:noise-floor:${perf.reportId}`,
           "target.noise_floor_exceeded",
           this.config.missionId,
@@ -525,29 +661,29 @@ export class MissionController {
       this.log(
         `baseline p95 ${perf.metrics.p95LatencyMs}ms; repetition spread ${(noise * 100).toFixed(1)}% too large to distinguish useful changes`,
       );
-      this.finish("blocked", floor.reason);
+      await this.finish("blocked", floor.reason);
       throw new BaselineError("baseline noise exceeds the measurable range");
     }
-    this.ledger.transaction(() => {
-      this.ledger.updateExperiment(experimentId, {
+    await this.transaction(async (tx) => {
+      await tx.updateExperiment(experimentId, {
         status: "accepted",
         verdict: `baseline p95 ${perf.metrics.p95LatencyMs}ms`,
         finishedAt: new Date().toISOString(),
       });
-      this.ledger.updateMission(this.config.missionId, {
+      await tx.updateMission(this.config.missionId, {
         baselineP95Ms: perf.metrics.p95LatencyMs ?? null,
         frozenAcceptanceMargin: floor.acceptanceMargin,
         bestP95Ms: perf.metrics.p95LatencyMs ?? null,
         bestArtifactHash: seed,
       });
-      this.ledger.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "done" });
-      this.ledger.appendEvent(
+      await tx.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "done" });
+      await tx.appendEvent(
         `baseline:${this.config.missionId}`,
         "mission.baseline",
         this.config.missionId,
         { p95: perf.metrics.p95LatencyMs, reportId: perf.reportId },
       );
-      this.ledger.appendEvent(
+      await tx.appendEvent(
         `target:${this.config.missionId}:assessed`,
         "target.assessed",
         this.config.missionId,
@@ -560,7 +696,7 @@ export class MissionController {
           marginCoversNoise: floor.acceptanceMargin >= noise,
         },
       );
-      this.checkpoint("running", "optimize-search", null, "baseline-complete");
+      await this.checkpoint(tx, "running", "optimize-search", null, "baseline-complete");
     });
     this.log(
       `baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms; repetition spread ${(noise * 100).toFixed(1)}%)`,
@@ -581,12 +717,12 @@ export class MissionController {
   }
 
   private async runHoldout(): Promise<void> {
-    const mission = this.mission();
+    const mission = await this.mission();
     const best = mission.bestArtifactHash;
     if (!best) throw new Error("no best artifact");
     const experimentId = `exp-holdout-${this.config.missionId}-${best.slice(0, 12)}`;
-    if (!this.ledger.getExperiment(experimentId)) {
-      this.ledger.insertExperiment({
+    if (!(await this.ledger.getExperiment(experimentId))) {
+      await this.ledger.insertExperiment({
         experimentId,
         missionId: this.config.missionId,
         taskId: "holdout",
@@ -597,31 +733,32 @@ export class MissionController {
         attempt: 1,
         segmentOrdinal: this.segmentOrdinal,
       });
-      this.ledger.updateExperiment(experimentId, { candidateArtifactHash: best });
+      await this.ledger.updateExperiment(experimentId, { candidateArtifactHash: best });
     }
-    this.ledger.updateExperiment(experimentId, { status: "evaluating" });
+    await this.ledger.updateExperiment(experimentId, { status: "evaluating" });
     const [report] = await this.runSuites(experimentId, best, ["holdout"]);
     const passed = report?.status === "passed";
-    this.ledger.transaction(() => {
-      this.ledger.updateExperiment(experimentId, {
+    await this.transaction(async (tx) => {
+      await tx.updateExperiment(experimentId, {
         status: passed ? "accepted" : report?.status === "failed" ? "rejected" : "inconclusive",
         verdict: `holdout ${report?.status ?? "missing"}`,
         finishedAt: new Date().toISOString(),
       });
-      this.ledger.upsertTask({
+      await tx.upsertTask({
         ...TASKS[2]!,
         missionId: this.config.missionId,
         status: passed ? "done" : "pending",
       });
     });
-    if (!passed) this.finish("blocked", `holdout ${report?.status ?? "missing"} on best artifact`);
+    if (!passed)
+      await this.finish("blocked", `holdout ${report?.status ?? "missing"} on best artifact`);
   }
 
   private async runCycle(
     cycle: number,
     recovery: RecoveryOutcome,
   ): Promise<"continue" | "exhausted" | "blocked" | "waiting"> {
-    const mission = this.mission();
+    const mission = await this.mission();
     const parent = mission.bestArtifactHash ?? mission.seedArtifactHash!;
     try {
       await this.ensureSegment();
@@ -631,8 +768,8 @@ export class MissionController {
     }
 
     const experimentId = `exp-${String(mission.spentExperiments + 1).padStart(4, "0")}-${randomUUID().slice(0, 8)}`;
-    this.ledger.transaction(() => {
-      this.ledger.insertExperiment({
+    await this.transaction(async (tx) => {
+      await tx.insertExperiment({
         experimentId,
         missionId: this.config.missionId,
         taskId: "optimize-search",
@@ -643,29 +780,39 @@ export class MissionController {
         attempt: 1,
         segmentOrdinal: this.segmentOrdinal,
       });
-      this.ledger.updateMission(this.config.missionId, {
+      await tx.updateMission(this.config.missionId, {
         activeTaskId: "optimize-search",
         spentExperiments: mission.spentExperiments + 1,
       });
-      this.ledger.appendEvent(`${experimentId}:planned`, "experiment.planned", experimentId, {
+      await tx.appendEvent(`${experimentId}:planned`, "experiment.planned", experimentId, {
         parent,
       });
-      this.checkpoint("running", "optimize-search", experimentId, "planned");
+      await this.checkpoint(tx, "running", "optimize-search", experimentId, "planned");
     });
 
     // Restore the workspace from the immutable parent so a crashed edit never leaks in.
     this.artifacts.restoreWorkspace(parent, this.paths.candidate);
-    this.ledger.updateExperiment(experimentId, { status: "editing" });
-    this.ledger.appendEvent(`${experimentId}:editing`, "experiment.editing", experimentId, {});
+    await this.ledger.updateExperiment(experimentId, { status: "editing" });
+    await this.ledger.appendEvent(
+      `${experimentId}:editing`,
+      "experiment.editing",
+      experimentId,
+      {},
+    );
     this.crash("editing");
 
-    const stagnation = this.stagnation();
+    const stagnation = await this.stagnation();
     if (stagnation.stagnated) {
-      this.ledger.appendEvent(`${experimentId}:stagnation`, "stagnation.detected", experimentId, {
-        count: stagnation.count,
-        limit: this.config.stagnationLimit,
-        triedHypotheses: stagnation.triedHypotheses,
-      });
+      await this.ledger.appendEvent(
+        `${experimentId}:stagnation`,
+        "stagnation.detected",
+        experimentId,
+        {
+          count: stagnation.count,
+          limit: this.config.stagnationLimit,
+          triedHypotheses: stagnation.triedHypotheses,
+        },
+      );
       this.log(
         `  stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}); requiring a new mechanism or a profiling step`,
       );
@@ -696,17 +843,18 @@ export class MissionController {
       throw error;
     }
     broker.terminateChildren();
-    this.spendTokens(result.usage);
+    await this.flushToolEvents();
+    await this.spendTokens(result.usage);
     const audit = auditClaim(result.claim, broker.verifications);
     const text = this.boundWorkerText(result);
-    this.ledger.appendEvent(`${experimentId}:claim-audit`, "claim.audited", experimentId, {
+    await this.ledger.appendEvent(`${experimentId}:claim-audit`, "claim.audited", experimentId, {
       claim: text.claim,
       observed: broker.verifications,
       ...audit,
     });
     if (!audit.supported) this.log(`  unsupported worker claim: ${audit.issues.join("; ")}`);
     if (result.hypothesis === "none" && result.whatChanged === "nothing") {
-      this.ledger.updateExperiment(experimentId, {
+      await this.ledger.updateExperiment(experimentId, {
         status: "inconclusive",
         verdict: "worker exhausted",
         finishedAt: new Date().toISOString(),
@@ -719,7 +867,7 @@ export class MissionController {
       stagnation.triedHypotheses.includes(normalizeHypothesis(result.hypothesis))
     ) {
       await this.conclude(
-        this.ledger.getExperiment(experimentId)!,
+        (await this.ledger.getExperiment(experimentId))!,
         "rejected",
         `stagnation: repeated an already-tried mechanism after ${stagnation.count} experiments without improvement and no profiling step`,
         [],
@@ -736,20 +884,20 @@ export class MissionController {
     }
 
     const snapshot = this.artifacts.snapshot(this.paths.candidate, parent);
-    this.ledger.transaction(() => {
-      if (!this.ledger.getArtifact(snapshot.hash))
-        this.ledger.insertArtifact({
+    await this.transaction(async (tx) => {
+      if (!(await tx.getArtifact(snapshot.hash)))
+        await tx.insertArtifact({
           hash: snapshot.hash,
           path: snapshot.path,
           parentHash: parent,
           manifestHash: sha256(canonicalJson(snapshot.manifest)),
           createdAt: new Date().toISOString(),
         });
-      this.ledger.updateExperiment(experimentId, {
+      await tx.updateExperiment(experimentId, {
         status: "snapshot_ready",
         candidateArtifactHash: snapshot.hash,
       });
-      this.ledger.appendEvent(`${experimentId}:snapshot`, "experiment.snapshot", experimentId, {
+      await tx.appendEvent(`${experimentId}:snapshot`, "experiment.snapshot", experimentId, {
         hash: snapshot.hash,
         hypothesis: text.hypothesis,
         whatChanged: text.whatChanged,
@@ -758,10 +906,10 @@ export class MissionController {
         aborted: result.aborted,
         claimIssues: audit.issues,
       });
-      this.checkpoint("running", "optimize-search", experimentId, "snapshot_ready");
+      await this.checkpoint(tx, "running", "optimize-search", experimentId, "snapshot_ready");
     });
     this.crash("snapshot_ready");
-    const experiment = this.ledger.getExperiment(experimentId)!;
+    const experiment = (await this.ledger.getExperiment(experimentId))!;
     await this.evaluateExperiment(experiment, recovery, {
       hypothesis: text.hypothesis,
       whatChanged: text.whatChanged,
@@ -779,17 +927,17 @@ export class MissionController {
     narrative?: Story,
   ): Promise<Verdict> {
     const hash = experiment.candidateArtifactHash!;
-    const mission = this.mission();
+    const mission = await this.mission();
     if (!this.artifacts.verify(hash)) throw new Error(`artifact ${hash} failed integrity check`);
-    this.ledger.updateExperiment(experiment.experimentId, { status: "evaluating" });
-    this.ledger.appendEvent(
+    await this.ledger.updateExperiment(experiment.experimentId, { status: "evaluating" });
+    await this.ledger.appendEvent(
       `${experiment.experimentId}:evaluating:${experiment.attempt}`,
       "experiment.evaluating",
       experiment.experimentId,
       { attempt: experiment.attempt },
     );
 
-    const snapshotEvent = this.ledger.findEvent(`${experiment.experimentId}:snapshot`);
+    const snapshotEvent = await this.ledger.findEvent(`${experiment.experimentId}:snapshot`);
     const story =
       narrative ??
       (snapshotEvent
@@ -835,7 +983,7 @@ export class MissionController {
           failing.flatMap((r) => r.assertions.filter((a) => !a.passed).map((a) => a.id)),
         ),
       ).slice(0, 16);
-      this.observeLesson(experiment, failing);
+      await this.observeLesson(experiment, failing);
       return this.conclude(
         experiment,
         "rejected",
@@ -866,7 +1014,7 @@ export class MissionController {
       );
     }
     const reports = [...gate, perf];
-    const bestReps = this.bestPerformanceReport(mission)?.metrics.repetitionP95Ms ?? [];
+    const bestReps = (await this.bestPerformanceReport(mission))?.metrics.repetitionP95Ms ?? [];
     let decision: TimingDecision = firstComparison(
       perf.metrics,
       mission.bestP95Ms,
@@ -893,9 +1041,9 @@ export class MissionController {
         mission,
       );
     const p95 = accepted.metrics.p95LatencyMs ?? null;
-    this.ledger.transaction(() => {
-      this.ledger.updateMission(this.config.missionId, { bestArtifactHash: hash, bestP95Ms: p95 });
-      this.ledger.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, {
+    await this.transaction(async (tx) => {
+      await tx.updateMission(this.config.missionId, { bestArtifactHash: hash, bestP95Ms: p95 });
+      await tx.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, {
         p95,
         previous: mission.bestP95Ms,
         reportId: accepted.reportId,
@@ -907,12 +1055,16 @@ export class MissionController {
       decision.reason,
       reports,
       story,
-      this.mission(),
+      await this.mission(),
     );
     const target =
       (mission.baselineP95Ms ?? Number.POSITIVE_INFINITY) * (1 - this.config.targetP95Reduction);
     if ((p95 ?? Number.POSITIVE_INFINITY) <= target) {
-      this.ledger.upsertTask({ ...TASKS[1]!, missionId: this.config.missionId, status: "done" });
+      await this.ledger.upsertTask({
+        ...TASKS[1]!,
+        missionId: this.config.missionId,
+        status: "done",
+      });
       this.log(`target reached: p95 ${p95}ms <= ${target.toFixed(2)}ms`);
     }
     return verdict;
@@ -968,9 +1120,10 @@ export class MissionController {
     };
   }
 
-  private bestPerformanceReport(mission: MissionRow): VerificationReport | undefined {
-    const row = this.ledger
-      .listVerifications(this.config.missionId)
+  private async bestPerformanceReport(
+    mission: MissionRow,
+  ): Promise<VerificationReport | undefined> {
+    const row = (await this.ledger.listVerifications(this.config.missionId))
       .filter(
         (v) =>
           v.suite === "performance" &&
@@ -1029,8 +1182,8 @@ export class MissionController {
       interpretation: "verified",
       seededFixture: story.seededFixture,
     };
-    this.ledger.transaction(() => {
-      this.ledger.updateExperiment(experiment.experimentId, {
+    await this.transaction(async (tx) => {
+      await tx.updateExperiment(experiment.experimentId, {
         status: verdict,
         verdict: reason,
         reportIds: reports.map((r) => r.reportId),
@@ -1038,7 +1191,7 @@ export class MissionController {
         finishedAt: new Date().toISOString(),
         hypothesis: story.hypothesis,
       });
-      this.ledger.insertEpisode({
+      await tx.insertEpisode({
         episodeId,
         missionId: this.config.missionId,
         experimentId: experiment.experimentId,
@@ -1053,15 +1206,15 @@ export class MissionController {
         summary: renderEpisode(payload),
         createdAt: new Date().toISOString(),
       });
-      this.outbox.enqueue(payload);
-      this.ledger.appendEvent(
+      await this.outbox.enqueue(payload, tx);
+      await tx.appendEvent(
         `${experiment.experimentId}:concluded`,
         "experiment.concluded",
         experiment.experimentId,
         { verdict, reason },
       );
-      this.ledger.updateMission(this.config.missionId, { activeTaskId: null });
-      this.checkpoint("running", "optimize-search", null, "concluded");
+      await tx.updateMission(this.config.missionId, { activeTaskId: null });
+      await this.checkpoint(tx, "running", "optimize-search", null, "concluded");
     });
     this.crash("concluded");
     this.log(
@@ -1118,14 +1271,16 @@ export class MissionController {
     hash: string,
     suite: Suite,
   ): Promise<VerificationReport> {
-    const existing = this.ledger.findVerification(experimentId, hash, suite);
+    const existing = await this.ledger.findVerification(experimentId, hash, suite);
     if (existing && existsSync(existing.path)) {
       const parsed = JSON.parse(readFileSync(existing.path, "utf8")) as VerificationReport;
       if (parsed.status === "passed" || parsed.status === "failed") return parsed;
     }
-    const prior = REUSABLE_FAILURE_SUITES.has(suite) ? this.priorFailure(hash, suite) : undefined;
+    const prior = REUSABLE_FAILURE_SUITES.has(suite)
+      ? await this.priorFailure(hash, suite)
+      : undefined;
     if (prior) {
-      this.ledger.appendEvent(
+      await this.ledger.appendEvent(
         `reuse:${experimentId}:${suite}:${prior.reportId}`,
         "verification.reused",
         experimentId,
@@ -1138,7 +1293,7 @@ export class MissionController {
     }
     const artifact = this.artifacts.pathFor(hash);
     if (!this.artifacts.verify(hash)) throw new Error(`artifact ${hash} does not verify`);
-    const mission = this.mission();
+    const mission = await this.mission();
     const report = await runSuite(
       {
         missionId: this.config.missionId,
@@ -1175,13 +1330,13 @@ export class MissionController {
     mkdirSync(dir, { recursive: true });
     const path = join(dir, `${suite}-${report.reportId}.json`);
     writeJsonAtomic(path, report);
-    if (this.ledger.getExperiment(experimentId)?.status === "evaluating")
+    if ((await this.ledger.getExperiment(experimentId))?.status === "evaluating")
       this.crash(
         `report-written:${experimentId.startsWith("exp-0") ? "optimize" : "fixed"}:${suite}`,
       );
-    this.ledger.transaction(() => {
-      this.ledger.insertVerification(report, path);
-      this.ledger.appendEvent(`report:${report.reportId}`, "verification.recorded", experimentId, {
+    await this.transaction(async (tx) => {
+      await tx.insertVerification(report, path);
+      await tx.appendEvent(`report:${report.reportId}`, "verification.recorded", experimentId, {
         suite,
         status: report.status,
         hash,
@@ -1196,33 +1351,34 @@ export class MissionController {
   }
 
   /** A committed failed report for the same content, suite, evaluator and environment from any experiment of this mission. */
-  private priorFailure(hash: string, suite: Suite): VerificationReport | undefined {
-    const row = this.ledger
-      .listVerifications(this.config.missionId)
-      .find(
-        (v) =>
-          v.artifactHash === hash &&
-          v.suite === suite &&
-          v.status === "failed" &&
-          v.evaluatorHash === this.evaluatorHash &&
-          v.environmentHash === this.environmentHash,
-      );
+  private async priorFailure(hash: string, suite: Suite): Promise<VerificationReport | undefined> {
+    const row = (await this.ledger.listVerifications(this.config.missionId)).find(
+      (v) =>
+        v.artifactHash === hash &&
+        v.suite === suite &&
+        v.status === "failed" &&
+        v.evaluatorHash === this.evaluatorHash &&
+        v.environmentHash === this.environmentHash,
+    );
     if (!row || !existsSync(row.path)) return undefined;
     return JSON.parse(readFileSync(row.path, "utf8")) as VerificationReport;
   }
 
-  private observeLesson(experiment: ExperimentRow, failing: VerificationReport[]): void {
+  private async observeLesson(
+    experiment: ExperimentRow,
+    failing: VerificationReport[],
+  ): Promise<void> {
     for (const report of failing) {
       for (const assertion of report.assertions.filter((a) => !a.passed)) {
         for (const invariantId of assertion.invariantIds ?? []) {
           const lessonId = `lesson-${invariantId.toLowerCase()}`;
-          const current = this.ledger
-            .listLessons(this.config.missionId)
-            .find((l) => l.lessonId === lessonId);
+          const current = (await this.ledger.listLessons(this.config.missionId)).find(
+            (l) => l.lessonId === lessonId,
+          );
           if (current && current.state !== "observed") continue;
           const episodeId = `ep-${experiment.experimentId}-v1`;
           const state: LessonState = current ? "reproduced" : "observed";
-          this.ledger.upsertLesson({
+          await this.ledger.upsertLesson({
             lessonId,
             missionId: this.config.missionId,
             sourceEpisodeIds: [...new Set([...(current?.sourceEpisodeIds ?? []), episodeId])],
@@ -1246,25 +1402,26 @@ export class MissionController {
     experimentId: string,
     proposal: RegressionProposal,
   ): Promise<{ accepted: boolean; reason: string; lessonId?: string }> {
-    const mission = this.mission();
+    const mission = await this.mission();
     const existingIds = new Set([
       ...loadScenarios().map((s) => s.scenarioId),
-      ...this.ledger.listLearnedScenarios(this.config.missionId).map((s) => s.scenarioId),
+      ...(await this.ledger.listLearnedScenarios(this.config.missionId)).map((s) => s.scenarioId),
     ]);
     const shape = validateProposalShape(proposal, existingIds);
     const lessonId = `lesson-${proposal.invariantId.toLowerCase()}`;
-    const current = this.ledger
-      .listLessons(this.config.missionId)
-      .find((l) => l.lessonId === lessonId);
-    const transition = (
+    const current = (await this.ledger.listLessons(this.config.missionId)).find(
+      (l) => l.lessonId === lessonId,
+    );
+    const transition = async (
       state: LessonState,
       evidenceId: string | null,
       patch: Partial<LessonRow> = {},
+      ledger: AsyncLedger = this.ledger,
     ) => {
-      const base = this.ledger
-        .listLessons(this.config.missionId)
-        .find((l) => l.lessonId === lessonId);
-      this.ledger.upsertLesson({
+      const base = (await ledger.listLessons(this.config.missionId)).find(
+        (l) => l.lessonId === lessonId,
+      );
+      await ledger.upsertLesson({
         lessonId,
         missionId: this.config.missionId,
         sourceEpisodeIds: base?.sourceEpisodeIds ?? [],
@@ -1282,7 +1439,7 @@ export class MissionController {
       });
     };
     if (!shape.ok) {
-      transition("rejected", null);
+      await transition("rejected", null);
       return { accepted: false, reason: shape.reason, lessonId };
     }
     if (current?.state === "materialized")
@@ -1291,7 +1448,7 @@ export class MissionController {
         reason: "invariant already has a materialized regression",
         lessonId,
       };
-    transition("proposed", null);
+    await transition("proposed", null);
 
     const seed = mission.seedArtifactHash!;
     const { artifact: negative } = this.artifacts.importFixture("stale-cache", seed);
@@ -1326,13 +1483,13 @@ export class MissionController {
     const negativeEvidence = this.evidence.write("lesson-negative", validation.negativeReport);
     const positiveEvidence = this.evidence.write("lesson-positive", validation.positiveReport);
     if (!validation.accepted) {
-      transition("rejected", negativeEvidence, {
+      await transition("rejected", negativeEvidence, {
         negativeEvidenceId: negativeEvidence,
         positiveEvidenceId: positiveEvidence,
       });
       return { accepted: false, reason: validation.reason, lessonId };
     }
-    transition("validated", positiveEvidence, {
+    await transition("validated", positiveEvidence, {
       negativeEvidenceId: negativeEvidence,
       positiveEvidenceId: positiveEvidence,
     });
@@ -1351,18 +1508,23 @@ export class MissionController {
     mkdirSync(this.paths.learnedScenarios, { recursive: true });
     const path = join(this.paths.learnedScenarios, `${scenario.scenarioId}.json`);
     writeJsonAtomic(path, scenario);
-    this.ledger.transaction(() => {
-      const version = this.mission().learnedSuiteVersion + 1;
-      this.ledger.insertLearnedScenario(
+    await this.transaction(async (tx) => {
+      const version = (await this.missionOn(tx)).learnedSuiteVersion + 1;
+      await tx.insertLearnedScenario(
         scenario.scenarioId,
         this.config.missionId,
         lessonId,
         version,
         path,
       );
-      this.ledger.updateMission(this.config.missionId, { learnedSuiteVersion: version });
-      transition("materialized", positiveEvidence, { materializedScenarioId: scenario.scenarioId });
-      this.ledger.appendEvent(`lesson:${lessonId}:materialized`, "lesson.materialized", lessonId, {
+      await tx.updateMission(this.config.missionId, { learnedSuiteVersion: version });
+      await transition(
+        "materialized",
+        positiveEvidence,
+        { materializedScenarioId: scenario.scenarioId },
+        tx,
+      );
+      await tx.appendEvent(`lesson:${lessonId}:materialized`, "lesson.materialized", lessonId, {
         scenarioId: scenario.scenarioId,
         version,
       });
@@ -1372,14 +1534,12 @@ export class MissionController {
   }
 
   /** Consecutive concluded optimize-search experiments since the last accepted one; none of them improved the best. */
-  stagnation(): StagnationState {
-    const concluded = this.ledger
-      .listExperiments(this.config.missionId)
-      .filter(
-        (e) =>
-          e.taskId === "optimize-search" &&
-          (e.status === "accepted" || e.status === "rejected" || e.status === "inconclusive"),
-      );
+  async stagnation(): Promise<StagnationState> {
+    const concluded = (await this.ledger.listExperiments(this.config.missionId)).filter(
+      (e) =>
+        e.taskId === "optimize-search" &&
+        (e.status === "accepted" || e.status === "rejected" || e.status === "inconclusive"),
+    );
     const run: ExperimentRow[] = [];
     for (let i = concluded.length - 1; i >= 0; i -= 1) {
       const e = concluded[i]!;
@@ -1394,14 +1554,17 @@ export class MissionController {
   }
 
   /** Cycle-start retrieval query composed from the active task, its hypothesis, and the last finished experiment's features, invariants and verdict. */
-  private retrievalQuery(experiments: ExperimentRow[], experimentId: string): string {
-    const task = this.ledger
-      .listTasks(this.config.missionId)
-      .find((t) => t.taskId === "optimize-search");
+  private async retrievalQuery(
+    experiments: ExperimentRow[],
+    experimentId: string,
+  ): Promise<string> {
+    const task = (await this.ledger.listTasks(this.config.missionId)).find(
+      (t) => t.taskId === "optimize-search",
+    );
     const last = experiments
       .filter((e) => e.experimentId !== experimentId && e.verdict !== null)
       .at(-1);
-    const episode = last ? this.ledger.getEpisode(`ep-${last.experimentId}-v1`) : undefined;
+    const episode = last ? await this.ledger.getEpisode(`ep-${last.experimentId}-v1`) : undefined;
     return composeRetrievalQuery({
       taskId: "optimize-search",
       hypothesis: last?.hypothesis ?? task?.hypothesis ?? null,
@@ -1417,21 +1580,28 @@ export class MissionController {
     experimentId: string,
     stagnation: StagnationState,
   ): Promise<ContextPacket> {
-    const experiments = this.ledger
-      .listExperiments(this.config.missionId)
-      .filter((e) => e.taskId === "optimize-search");
+    const experiments = (await this.ledger.listExperiments(this.config.missionId)).filter(
+      (e) => e.taskId === "optimize-search",
+    );
     // Bounded recent history: only this segment's experiments are replayed verbatim; older segments are reachable through retrieval.
-    const recent = experiments
+    const recentRows = experiments
       .filter((e) => e.segmentOrdinal === this.segmentOrdinal)
-      .slice(-3)
-      .map((e) => {
-        const episode = this.ledger.getEpisode(`ep-${e.experimentId}-v1`);
-        return episode ? episode.summary : `${e.experimentId}: ${e.status} ${e.verdict ?? ""}`;
-      })
-      .join("\n\n");
+      .slice(-3);
+    const recentLines: string[] = [];
+    for (const e of recentRows) {
+      const episode = await this.ledger.getEpisode(`ep-${e.experimentId}-v1`);
+      recentLines.push(
+        episode ? episode.summary : `${e.experimentId}: ${e.status} ${e.verdict ?? ""}`,
+      );
+    }
+    const recent = recentLines.join("\n\n");
     const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
     const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
-    const query = this.retrievalQuery(experiments, experimentId);
+    const query = await this.retrievalQuery(experiments, experimentId);
+    const nextAction =
+      (await this.ledger.listTasks(this.config.missionId)).find(
+        (t) => t.taskId === "optimize-search",
+      )?.nextAction ?? "";
     const retrieval = this.config.memory.enabled
       ? await retrieveEpisodes(
           this.memory,
@@ -1466,7 +1636,7 @@ export class MissionController {
         featureMap: `${features}\n\n${skill}`,
         recent: recent || "No experiments yet.",
         retrieved: retrieval.injected.map((r) => ({ episodeId: r.episodeId, text: r.text })),
-        next: `Last verdict: ${lastVerdict}\nNext action: ${this.ledger.listTasks(this.config.missionId).find((t) => t.taskId === "optimize-search")?.nextAction ?? ""}\n${
+        next: `Last verdict: ${lastVerdict}\nNext action: ${nextAction}\n${
           stagnation.stagnated
             ? `Stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}). This cycle must call profile_candidate before editing or try a mechanism other than: ${stagnation.triedHypotheses.join(" | ")}. Repeating one of those without profiling is rejected without verification.\n`
             : ""
@@ -1474,7 +1644,7 @@ export class MissionController {
       },
       DEFAULT_PACKET_BUDGET,
     );
-    this.ledger.appendEvent(`${experimentId}:packet`, "packet.built", experimentId, {
+    await this.ledger.appendEvent(`${experimentId}:packet`, "packet.built", experimentId, {
       query,
       tokens: packet.tokens,
       sections: packet.sections,
@@ -1489,18 +1659,7 @@ export class MissionController {
   private hooks(experimentId: string): BrokerHooks {
     return {
       verify: async (suite) => {
-        const snapshot = this.artifacts.snapshot(
-          this.paths.candidate,
-          this.mission().bestArtifactHash,
-        );
-        if (!this.ledger.getArtifact(snapshot.hash))
-          this.ledger.insertArtifact({
-            hash: snapshot.hash,
-            path: snapshot.path,
-            parentHash: this.mission().bestArtifactHash,
-            manifestHash: sha256(canonicalJson(snapshot.manifest)),
-            createdAt: new Date().toISOString(),
-          });
+        const snapshot = await this.snapshotCandidate();
         const report = await this.verifyArtifact(experimentId, snapshot.hash, suite);
         return {
           report,
@@ -1508,18 +1667,7 @@ export class MissionController {
         };
       },
       profile: async (scenario) => {
-        const snapshot = this.artifacts.snapshot(
-          this.paths.candidate,
-          this.mission().bestArtifactHash,
-        );
-        if (!this.ledger.getArtifact(snapshot.hash))
-          this.ledger.insertArtifact({
-            hash: snapshot.hash,
-            path: snapshot.path,
-            parentHash: this.mission().bestArtifactHash,
-            manifestHash: sha256(canonicalJson(snapshot.manifest)),
-            createdAt: new Date().toISOString(),
-          });
+        const snapshot = await this.snapshotCandidate();
         const report = await this.verifyArtifact(experimentId, snapshot.hash, "performance");
         const evidenceId = this.evidence.write("profile", {
           scenario,
@@ -1547,29 +1695,49 @@ export class MissionController {
           limit,
           () => this.spendMemoryOperation(),
         );
-        return selection.injected.map((r) => {
-          const row = this.ledger.getEpisode(r.episodeId);
-          return {
+        const out = [];
+        for (const r of selection.injected) {
+          const row = await this.ledger.getEpisode(r.episodeId);
+          out.push({
             episodeId: r.episodeId,
             summary: r.text,
             evidenceIds: row?.evidenceIds ?? [],
             artifactHash: row?.artifactHash ?? "",
-          };
-        });
+          });
+        }
+        return out;
       },
       proposeRegression: (proposal) => this.handleProposal(experimentId, proposal),
       onToolEvent: (name, params, summary) => {
-        this.ledger.appendEvent(`${experimentId}:tool:${randomUUID()}`, "tool.call", experimentId, {
-          name,
-          params,
-          summary,
+        const eventId = `${experimentId}:tool:${randomUUID()}`;
+        this.toolEvents = this.toolEvents.then(async () => {
+          await this.ledger.appendEvent(eventId, "tool.call", experimentId, {
+            name,
+            params,
+            summary,
+          });
         });
       },
     };
   }
 
+  /** Snapshots the workspace as a child of the current best and records the artifact. */
+  private async snapshotCandidate() {
+    const best = (await this.mission()).bestArtifactHash;
+    const snapshot = this.artifacts.snapshot(this.paths.candidate, best);
+    if (!(await this.ledger.getArtifact(snapshot.hash)))
+      await this.ledger.insertArtifact({
+        hash: snapshot.hash,
+        path: snapshot.path,
+        parentHash: best,
+        manifestHash: sha256(canonicalJson(snapshot.manifest)),
+        createdAt: new Date().toISOString(),
+      });
+    return snapshot;
+  }
+
   private async ensureSegment(): Promise<void> {
-    const active = this.ledger.activeSegment(this.config.missionId);
+    const active = await this.ledger.activeSegment(this.config.missionId);
     const needsRotation =
       active !== undefined && this.cyclesInSegment >= this.config.segmentRotationCycles;
     if (
@@ -1591,17 +1759,18 @@ export class MissionController {
     const ordinal = (active?.ordinal ?? this.segmentOrdinal) + 1;
     // A new segment is a fresh bounded context; `previous` is only for resuming a committed segment.
     const handle = await this.worker.openSegment(ordinal, null);
-    this.ledger.transaction(() => {
-      if (active) this.ledger.closeSegment(this.config.missionId, active.ordinal, null);
-      this.ledger.openSegment(this.config.missionId, ordinal, handle.sessionPath, handle.sessionId);
-      const checkpoint = this.checkpoint(
+    await this.transaction(async (tx) => {
+      if (active) await tx.closeSegment(this.config.missionId, active.ordinal, null);
+      await tx.openSegment(this.config.missionId, ordinal, handle.sessionPath, handle.sessionId);
+      const checkpoint = await this.checkpoint(
+        tx,
         "running",
         "optimize-search",
         null,
         `segment-open:${ordinal}`,
       );
-      this.ledger.commitSegment(this.config.missionId, ordinal, checkpoint.checkpointId);
-      this.ledger.appendEvent(`segment:${ordinal}:open`, "segment.opened", this.config.missionId, {
+      await tx.commitSegment(this.config.missionId, ordinal, checkpoint.checkpointId);
+      await tx.appendEvent(`segment:${ordinal}:open`, "segment.opened", this.config.missionId, {
         ordinal,
         rotatedFrom: active?.ordinal ?? null,
       });
@@ -1611,15 +1780,16 @@ export class MissionController {
     this.log(`segment ${ordinal} open${active ? ` (rotated from ${active.ordinal})` : ""}`);
   }
 
-  private checkpoint(
+  private async checkpoint(
+    tx: AsyncLedger,
     status: MissionStatus,
     taskId: string | null,
     experimentId: string | null,
     operation: string,
   ) {
-    this.accrueWall();
-    const mission = this.mission();
-    return this.ledger.writeCheckpoint({
+    await this.accrueWall(tx);
+    const mission = await this.missionOn(tx);
+    return tx.writeCheckpoint({
       missionId: this.config.missionId,
       missionStatus: status,
       activeTaskId: taskId,
@@ -1654,39 +1824,39 @@ export class MissionController {
     return fields;
   }
 
-  private accrueWall(): void {
+  private async accrueWall(tx: AsyncLedger): Promise<void> {
     const now = Date.now();
-    const mission = this.mission();
-    this.ledger.updateMission(this.config.missionId, {
+    const mission = await this.missionOn(tx);
+    await tx.updateMission(this.config.missionId, {
       spentWallMs: mission.spentWallMs + (now - this.wallMark),
     });
     this.wallMark = now;
   }
 
-  private spendTokens(usage: {
+  private async spendTokens(usage: {
     inputTokens: number;
     outputTokens: number;
     uncertain: boolean;
-  }): void {
-    const mission = this.mission();
-    this.ledger.updateMission(this.config.missionId, {
+  }): Promise<void> {
+    const mission = await this.mission();
+    await this.ledger.updateMission(this.config.missionId, {
       spentInputTokens: mission.spentInputTokens + usage.inputTokens,
       spentOutputTokens: mission.spentOutputTokens + usage.outputTokens,
       usageUncertain: usage.uncertain ? 1 : mission.usageUncertain,
     });
   }
 
-  private spendMemoryOperation(): void {
-    const mission = this.mission();
+  private async spendMemoryOperation(): Promise<void> {
+    const mission = await this.mission();
     if (mission.spentMemoryOperations >= this.config.budget.maxMemoryOperations)
       throw new Error("memory operation budget exhausted");
-    this.ledger.updateMission(this.config.missionId, {
+    await this.ledger.updateMission(this.config.missionId, {
       spentMemoryOperations: mission.spentMemoryOperations + 1,
     });
   }
 
-  private episodePayload(episodeId: string): EpisodePayload | undefined {
-    return this.ledger.outboxPayloadForEpisode(episodeId) as EpisodePayload | undefined;
+  private async episodePayload(episodeId: string): Promise<EpisodePayload | undefined> {
+    return (await this.ledger.outboxPayloadForEpisode(episodeId)) as EpisodePayload | undefined;
   }
 
   async drainOutbox(): Promise<void> {
