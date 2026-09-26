@@ -1432,6 +1432,7 @@ export class MissionController {
     const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
     const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
     const query = this.retrievalQuery(experiments, experimentId);
+    const retrievalStartedAt = performance.now();
     const retrieval = this.config.memory.enabled
       ? await retrieveEpisodes(
           this.memory,
@@ -1448,6 +1449,7 @@ export class MissionController {
           () => this.spendMemoryOperation(),
         )
       : { injected: [], filteredOut: [], degraded: false };
+    const retrievalMs = performance.now() - retrievalStartedAt;
     const lastVerdict = experiments.at(-1)?.verdict ?? "no experiments yet";
     const pinned = [
       `Mission ${mission.missionId} (contract v${mission.contractVersion}, hash ${mission.contractHash.slice(0, 12)}). Objective: ${this.config.objective}`,
@@ -1477,6 +1479,7 @@ export class MissionController {
     this.ledger.appendEvent(`${experimentId}:packet`, "packet.built", experimentId, {
       query,
       tokens: packet.tokens,
+      retrievalMs,
       sections: packet.sections,
       injected: packet.injectedEpisodeIds,
       dropped: packet.droppedEpisodeIds,
