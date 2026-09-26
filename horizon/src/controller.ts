@@ -33,7 +33,7 @@ import {
   renderEpisode,
   SupermemoryAdapter,
 } from "./memory-adapter.ts";
-import { MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
+import { composeRetrievalQuery, MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
 import { contractHash, type MissionConfig } from "./mission-contract.ts";
 import {
   ensureMissionDirs,
@@ -1163,6 +1163,25 @@ export class MissionController {
 
   // ---- packet, hooks, segments, budget, memory ---------------------------------------
 
+  /** Cycle-start retrieval query composed from the active task, its hypothesis, and the last finished experiment's features, invariants and verdict. */
+  private retrievalQuery(experiments: ExperimentRow[], experimentId: string): string {
+    const task = this.ledger
+      .listTasks(this.config.missionId)
+      .find((t) => t.taskId === "optimize-search");
+    const last = experiments
+      .filter((e) => e.experimentId !== experimentId && e.verdict !== null)
+      .at(-1);
+    const episode = last ? this.ledger.getEpisode(`ep-${last.experimentId}-v1`) : undefined;
+    return composeRetrievalQuery({
+      taskId: "optimize-search",
+      hypothesis: last?.hypothesis ?? task?.hypothesis ?? null,
+      featureIds: episode?.featureIds ?? [],
+      invariantIds: episode?.invariantIds ?? [],
+      lastVerdict: last?.verdict ?? null,
+      lastFailureSignature: last?.failureSignature ?? null,
+    });
+  }
+
   private async buildPacket(mission: MissionRow, experimentId: string): Promise<ContextPacket> {
     const experiments = this.ledger
       .listExperiments(this.config.missionId)
@@ -1178,10 +1197,7 @@ export class MissionController {
       .join("\n\n");
     const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
     const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
-    const query =
-      experiments.length > 0
-        ? "search engine cache invalidation normalization p95"
-        : "baseline read path";
+    const query = this.retrievalQuery(experiments, experimentId);
     const retrieval = this.config.memory.enabled
       ? await retrieveEpisodes(
           this.memory,
@@ -1221,6 +1237,7 @@ export class MissionController {
       DEFAULT_PACKET_BUDGET,
     );
     this.ledger.appendEvent(`${experimentId}:packet`, "packet.built", experimentId, {
+      query,
       tokens: packet.tokens,
       sections: packet.sections,
       injected: packet.injectedEpisodeIds,
