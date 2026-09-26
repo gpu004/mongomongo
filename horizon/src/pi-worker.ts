@@ -204,7 +204,7 @@ export class PiWorker implements Worker {
         .join("\n");
       await this.session.prompt(prompt, { expandPromptTemplates: false });
     } catch (error) {
-      if (error instanceof Error && /^No API key found/.test(error.message))
+      if (error instanceof Error && error.message.startsWith("No API key found"))
         throw new WorkerUnavailableError(
           "missing_credential",
           `no API key for provider ${this.options.provider}; set ${providerApiKeyEnv(this.options.provider)}`,
