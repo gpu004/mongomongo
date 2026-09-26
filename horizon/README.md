@@ -15,6 +15,9 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
   before `docker run` and every container is labelled with its mission, so `resume` removes any
   candidate or worker container orphaned by a controller crash
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
+- `MONGODB_URI` / `MONGODB_DB` (optional) for the Atlas ledger adapter; see `.env.example`.
+  `doctor` probes connectivity, a disposable write/read, a transaction, and the required
+  indexes, then removes its probe data without printing credentials
 - An LLM API key for the Pi worker (`"worker": "pi"`): `<PROVIDER>_API_KEY` for the configured `model.provider` (`ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`/`GEMINI_API_KEY` for `google`); the `scripted` worker needs none
 
 ## Setup and checks
@@ -24,6 +27,8 @@ npm install
 npm run check          # tsc --noEmit
 npm run lint           # oxlint .
 npm run format:check   # oxfmt --check . (npm run format rewrites in place)
+npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, ledger contract
+MONGODB_URI=... npm test   # additionally runs the ledger contract tests against MongoDB in a throwaway database
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, sandbox
                        # test/sandbox-escape.test.ts runs the adversarial escape-probe fixture against Docker when the
                        # pinned image is present (skipped otherwise; HORIZON_REQUIRE_DOCKER=1 makes the skip a failure)

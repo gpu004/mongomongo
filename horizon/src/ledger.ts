@@ -210,6 +210,27 @@ export interface EventRow {
   payload: unknown;
 }
 
+export interface LeaseRow {
+  missionId: string;
+  owner: string;
+  fencingToken: number;
+  expiresAt: string;
+}
+
+/** `expiresAt` of a released lease: already expired, so any owner may claim it. */
+export const RELEASED_AT = "1970-01-01T00:00:00.000Z";
+
+/** Thrown when a lease claim, renewal, or fenced write finds another live owner. */
+export class LeaseError extends Error {
+  readonly holder: LeaseRow | undefined;
+
+  constructor(message: string, holder: LeaseRow | undefined) {
+    super(message);
+    this.name = "LeaseError";
+    this.holder = holder;
+  }
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS mission (
   mission_id TEXT PRIMARY KEY, contract_version INTEGER NOT NULL, contract_hash TEXT NOT NULL,
@@ -278,6 +299,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS episode_fts_vocab USING fts5vocab(episode_fts
 CREATE TABLE IF NOT EXISTS learned_scenario (
   scenario_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, lesson_id TEXT NOT NULL, suite_version INTEGER NOT NULL, path TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lease (
+  mission_id TEXT PRIMARY KEY, owner TEXT NOT NULL, fencing_token INTEGER NOT NULL, expires_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS container (
   container_name TEXT PRIMARY KEY, mission_id TEXT NOT NULL, experiment_id TEXT NOT NULL, state TEXT NOT NULL,
   created_at TEXT NOT NULL, released_at TEXT
@@ -342,7 +366,81 @@ export class Ledger {
     this.db.close();
   }
 
+  // ---- lease --------------------------------------------------------------
+
+  /**
+   * Atomically claim the mission lease. Succeeds when nobody holds it, the
+   * holder's lease has expired, or `owner` already holds it; every successful
+   * claim increments the fencing token so a stale owner can be rejected.
+   */
+  claimLease(missionId: string, owner: string, ttlMs: number, at = new Date()): LeaseRow {
+    return this.transaction(() => {
+      const current = this.getLease(missionId);
+      if (current && current.owner !== owner && Date.parse(current.expiresAt) > at.getTime())
+        throw new LeaseError(`mission ${missionId} lease held by ${current.owner}`, current);
+      const lastToken = this.db
+        .prepare("SELECT fencing_token FROM lease WHERE mission_id = ?")
+        .get(missionId) as Row | undefined;
+      const row: LeaseRow = {
+        missionId,
+        owner,
+        fencingToken: Number(lastToken?.fencing_token ?? 0) + 1,
+        expiresAt: new Date(at.getTime() + ttlMs).toISOString(),
+      };
+      this.db
+        .prepare(
+          `INSERT INTO lease (mission_id, owner, fencing_token, expires_at) VALUES (?, ?, ?, ?)
+					 ON CONFLICT(mission_id) DO UPDATE SET owner = excluded.owner, fencing_token = excluded.fencing_token, expires_at = excluded.expires_at`,
+        )
+        .run(row.missionId, row.owner, row.fencingToken, row.expiresAt);
+      return row;
+    });
+  }
+
+  /** Extend the lease; fails when the holder or fencing token changed underneath the caller. */
+  renewLease(lease: LeaseRow, ttlMs: number, at = new Date()): LeaseRow {
+    const expiresAt = new Date(at.getTime() + ttlMs).toISOString();
+    const result = this.db
+      .prepare(
+        "UPDATE lease SET expires_at = ? WHERE mission_id = ? AND owner = ? AND fencing_token = ?",
+      )
+      .run(expiresAt, lease.missionId, lease.owner, lease.fencingToken);
+    if (Number(result.changes) === 0)
+      throw new LeaseError(
+        `mission ${lease.missionId} lease lost by ${lease.owner}`,
+        this.getLease(lease.missionId),
+      );
+    return { ...lease, expiresAt };
+  }
+
+  /**
+   * Release the lease if still owned; a lease already taken over is left alone.
+   * The row is kept (expired, unowned) so fencing tokens keep increasing.
+   */
+  releaseLease(lease: LeaseRow): void {
+    this.db
+      .prepare(
+        "UPDATE lease SET owner = '', expires_at = ? WHERE mission_id = ? AND owner = ? AND fencing_token = ?",
+      )
+      .run(RELEASED_AT, lease.missionId, lease.owner, lease.fencingToken);
+  }
+
+  getLease(missionId: string): LeaseRow | undefined {
+    const r = this.db
+      .prepare("SELECT * FROM lease WHERE mission_id = ? AND owner <> ''")
+      .get(missionId) as Row | undefined;
+    return r
+      ? {
+          missionId: String(r.mission_id),
+          owner: String(r.owner),
+          fencingToken: Number(r.fencing_token),
+          expiresAt: String(r.expires_at),
+        }
+      : undefined;
+  }
+
   transaction<T>(fn: () => T): T {
+    if (this.db.isTransaction) return fn();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = fn();
