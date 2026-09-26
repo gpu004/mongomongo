@@ -17,6 +17,8 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ```sh
 npm install
 npm run check          # tsc --noEmit
+npm run lint           # oxlint .
+npm run format:check   # oxfmt --check . (npm run format rewrites in place)
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
