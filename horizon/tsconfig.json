@@ -15,6 +15,12 @@
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "include": ["src/**/*.ts", "verification/**/*.ts", "demo/**/*.ts", "resources/**/*.ts", "test/**/*.ts"],
+  "include": [
+    "src/**/*.ts",
+    "verification/**/*.ts",
+    "demo/**/*.ts",
+    "resources/**/*.ts",
+    "test/**/*.ts"
+  ],
   "exclude": ["node_modules", "runs", "verification/fixtures/**/overlay/**"]
 }

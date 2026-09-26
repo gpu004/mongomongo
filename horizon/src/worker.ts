@@ -34,6 +34,30 @@ export interface SegmentHandle {
   sessionId: string;
 }
 
+export type WorkerFaultKind = "missing_credential" | "rate_limited";
+
+/**
+ * The worker cannot run through no fault of the candidate: a missing provider
+ * credential blocks the mission; a rate limit parks it in `waiting` until
+ * `retryAfterMs` has elapsed.
+ */
+export class WorkerUnavailableError extends Error {
+  readonly kind: WorkerFaultKind;
+  readonly retryAfterMs: number | null;
+
+  constructor(kind: WorkerFaultKind, message: string, retryAfterMs: number | null = null) {
+    super(message);
+    this.name = "WorkerUnavailableError";
+    this.kind = kind;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+/** Environment variable the Pi worker reads the provider credential from, e.g. `ANTHROPIC_API_KEY`. */
+export function providerApiKeyEnv(provider: string): string {
+  return `${provider.toUpperCase().replace(/-/g, "_")}_API_KEY`;
+}
+
 /**
  * One controlled worker. The controller owns the loop, the ledger and all
  * verification; the worker is only asked to run one bounded cycle at a time.
