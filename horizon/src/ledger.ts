@@ -187,6 +187,18 @@ export interface SegmentRow {
   committed: number;
 }
 
+export type ContainerState = "launching" | "released" | "orphan_removed";
+
+/** Execution environment (Docker container) launched for an experiment; live rows are reconciled on resume. */
+export interface ContainerRow {
+  containerName: string;
+  missionId: string;
+  experimentId: string;
+  state: ContainerState;
+  createdAt: string;
+  releasedAt: string | null;
+}
+
 export interface EventRow {
   seq: number;
   eventKey: string;
@@ -263,6 +275,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS episode_fts_vocab USING fts5vocab(episode_fts
 CREATE TABLE IF NOT EXISTS learned_scenario (
   scenario_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, lesson_id TEXT NOT NULL, suite_version INTEGER NOT NULL, path TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS container (
+  container_name TEXT PRIMARY KEY, mission_id TEXT NOT NULL, experiment_id TEXT NOT NULL, state TEXT NOT NULL,
+  created_at TEXT NOT NULL, released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS container_mission_state ON container(mission_id, state);
 `;
 
 function now(): string {
@@ -1030,6 +1047,44 @@ export class Ledger {
     );
   }
 
+  // ---- execution environments -------------------------------------------
+
+  /** Durable record written before `docker run`, so a crashed controller's container can be found on resume. */
+  registerContainer(containerName: string, missionId: string, experimentId: string): void {
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO container (container_name, mission_id, experiment_id, state, created_at) VALUES (?, ?, ?, 'launching', ?)",
+      )
+      .run(containerName, missionId, experimentId, now());
+  }
+
+  releaseContainer(containerName: string, state: ContainerState = "released"): void {
+    this.db
+      .prepare(
+        "UPDATE container SET state = ?, released_at = ? WHERE container_name = ? AND state = 'launching'",
+      )
+      .run(state, now(), containerName);
+  }
+
+  /** Containers whose stop was never recorded: candidates for orphan cleanup. */
+  listLiveContainers(missionId: string): ContainerRow[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT * FROM container WHERE mission_id = ? AND state = 'launching' ORDER BY created_at, container_name",
+        )
+        .all(missionId) as Row[]
+    ).map(toContainer);
+  }
+
+  listContainers(missionId: string): ContainerRow[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM container WHERE mission_id = ? ORDER BY created_at, container_name")
+        .all(missionId) as Row[]
+    ).map(toContainer);
+  }
+
   enqueueOutbox(episodeId: string, payload: unknown): string {
     const payloadHash = sha256(canonicalJson(payload));
     const idempotencyKey = `${episodeId}:${payloadHash.slice(0, 16)}`;
@@ -1128,6 +1183,17 @@ function nullableString(v: Cell): string | null {
 
 function nullableNumber(v: Cell): number | null {
   return v === null || v === undefined ? null : Number(v);
+}
+
+function toContainer(r: Row): ContainerRow {
+  return {
+    containerName: String(r.container_name),
+    missionId: String(r.mission_id),
+    experimentId: String(r.experiment_id),
+    state: String(r.state) as ContainerState,
+    createdAt: String(r.created_at),
+    releasedAt: r.released_at == null ? null : String(r.released_at),
+  };
 }
 
 function toExperiment(r: Row): ExperimentRow {

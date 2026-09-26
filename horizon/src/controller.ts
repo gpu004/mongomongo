@@ -8,6 +8,7 @@ import {
   validateReport,
   type VerificationReport,
 } from "../verification/reports.ts";
+import type { ContainerRegistry } from "../verification/candidate-process.ts";
 import { computeEnvironmentHash, computeEvaluatorHash, runSuite } from "../verification/runner.ts";
 import { loadScenarios, type Scenario } from "../verification/scenarios/index.ts";
 import { ArtifactStore } from "./artifact-store.ts";
@@ -41,7 +42,7 @@ import {
   type MissionPaths,
   writeJsonAtomic,
 } from "./mission-paths.ts";
-import { recover, type RecoveryOutcome } from "./recovery.ts";
+import { type ContainerRuntime, recover, type RecoveryOutcome } from "./recovery.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
 import { type BrokerHooks, ToolBroker } from "./tool-broker.ts";
 import {
@@ -62,6 +63,8 @@ export interface ControllerOptions {
   crashAt?: string;
   /** Stop after this many cycles regardless of budget (CLI --cycles). */
   maxCycles?: number;
+  /** Test hook: container runtime used by resume to remove orphaned candidate containers. */
+  containerRuntime?: ContainerRuntime;
 }
 
 export type Verdict = "accepted" | "rejected" | "inconclusive";
@@ -123,6 +126,7 @@ export class MissionController {
   private readonly log: (line: string) => void;
   private readonly crashAt: string | undefined;
   private readonly maxCycles: number;
+  private readonly containerRuntime: ContainerRuntime | undefined;
   readonly evaluatorHash: string;
   readonly environmentHash: string;
   readonly contractHash: string;
@@ -142,6 +146,7 @@ export class MissionController {
     this.log = options.log ?? (() => {});
     this.crashAt = options.crashAt;
     this.maxCycles = options.maxCycles ?? Number.POSITIVE_INFINITY;
+    this.containerRuntime = options.containerRuntime;
     this.evaluatorHash = computeEvaluatorHash();
     this.environmentHash = computeEnvironmentHash(config.isolation, config.containerImage);
     this.contractHash = contractHash(config);
@@ -219,6 +224,27 @@ export class MissionController {
     return this.mission();
   }
 
+  /** Ledger-backed registry: container names are durable before `docker run` and closed after stop. */
+  containerRegistry(experimentId: string): ContainerRegistry {
+    const missionId = this.config.missionId;
+    return {
+      register: (name) => {
+        this.ledger.transaction(() => {
+          this.ledger.registerContainer(name, missionId, experimentId);
+          this.ledger.appendEvent(
+            `container:${name}:launched`,
+            "container.launched",
+            experimentId,
+            {
+              containerName: name,
+            },
+          );
+        });
+      },
+      release: (name) => this.ledger.releaseContainer(name),
+    };
+  }
+
   mission(): MissionRow {
     const row = this.ledger.getMission(this.config.missionId);
     if (!row)
@@ -242,6 +268,7 @@ export class MissionController {
           environmentHash: this.environmentHash,
           contractHash: this.contractHash,
         },
+        this.containerRuntime,
       );
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
@@ -947,6 +974,7 @@ export class MissionController {
         learnedScenariosDir: this.paths.learnedScenarios,
         learnedSuiteVersion: mission.learnedSuiteVersion,
         evidence: this.evidence,
+        containerRegistry: this.containerRegistry(experimentId),
       },
       suite,
     );
@@ -1104,6 +1132,7 @@ export class MissionController {
           holdoutWorkload: this.config.holdoutWorkload,
           learnedScenariosDir: scenarioDir,
           evidence: this.evidence,
+          containerRegistry: this.containerRegistry(`lesson-${lessonId}-${experimentId}`),
         },
         "learned",
       );
