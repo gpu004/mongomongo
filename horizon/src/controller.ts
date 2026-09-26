@@ -43,8 +43,9 @@ import {
   writeJsonAtomic,
 } from "./mission-paths.ts";
 import { type ContainerRuntime, recover, type RecoveryOutcome } from "./recovery.ts";
+import { assertSandboxAvailable, cleanupOrphanContainers } from "./sandbox.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
-import { type BrokerHooks, ToolBroker } from "./tool-broker.ts";
+import { type BrokerHooks, type ExecSandbox, ToolBroker } from "./tool-broker.ts";
 import {
   firstComparison,
   freezeAcceptanceMargin,
@@ -83,6 +84,22 @@ interface Story {
 
 /** Per-field character limits for worker prose kept in events, episodes and packets; full text goes to evidence. */
 const WORKER_TEXT_LIMITS = { hypothesis: 400, whatChanged: 800, claim: 800 } as const;
+
+/** Collapses case, whitespace and punctuation so reworded repeats of one mechanism compare equal. */
+export function normalizeHypothesis(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+export interface StagnationState {
+  /** Concluded optimize-search experiments since the last accepted one. */
+  count: number;
+  /** Normalized hypotheses tried during that run. */
+  triedHypotheses: string[];
+  stagnated: boolean;
+}
 
 /** Deterministic behavior suites whose failed report for an artifact can be reused across experiments. */
 const REUSABLE_FAILURE_SUITES = new Set<Suite>(["smoke", "correctness", "structural"]);
@@ -260,10 +277,28 @@ export class MissionController {
     return row;
   }
 
+  /** Under container isolation every worker command runs in the sandbox, labelled with its experiment. */
+  private execSandbox(experimentId: string): ExecSandbox | undefined {
+    if (this.config.isolation !== "container") return undefined;
+    return {
+      image: this.config.containerImage,
+      missionId: this.config.missionId,
+      operationId: experimentId,
+    };
+  }
+
   /** `horizon run` / `horizon resume`: recover, then loop until done or out of budget. */
   async run(): Promise<MissionRow> {
     this.ledger.acquireLock();
     try {
+      if (this.config.isolation === "container") {
+        // Fail before any work is scheduled; the sandbox is never silently replaced by the host.
+        const sandbox = assertSandboxAvailable(this.config.containerImage);
+        this.log(`sandbox: docker ${sandbox.serverVersion}, image ${sandbox.imageId.slice(0, 19)}`);
+        const orphans = cleanupOrphanContainers(this.config.missionId);
+        if (orphans.length > 0)
+          this.log(`recovery: removed ${orphans.length} orphaned container(s) from a previous run`);
+      }
       const recovery = recover(
         this.ledger,
         this.artifacts,
@@ -630,13 +665,25 @@ export class MissionController {
     this.ledger.appendEvent(`${experimentId}:editing`, "experiment.editing", experimentId, {});
     this.crash("editing");
 
-    const packet = await this.buildPacket(mission, experimentId);
+    const stagnation = this.stagnation();
+    if (stagnation.stagnated) {
+      this.ledger.appendEvent(`${experimentId}:stagnation`, "stagnation.detected", experimentId, {
+        count: stagnation.count,
+        limit: this.config.stagnationLimit,
+        triedHypotheses: stagnation.triedHypotheses,
+      });
+      this.log(
+        `  stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}); requiring a new mechanism or a profiling step`,
+      );
+    }
+    const packet = await this.buildPacket(mission, experimentId, stagnation);
     this.cycleDeadline = Date.now() + this.config.budget.cycleTimeoutMs;
     const broker = new ToolBroker(
       this.paths.candidate,
       this.evidence,
       this.hooks(experimentId),
       () => this.cycleDeadline,
+      this.execSandbox(experimentId),
     );
     const recoveryNote = recovery.actions.find((a) => a.kind === "interrupted_edit")?.detail;
     let result: WorkerCycleResult;
@@ -671,6 +718,27 @@ export class MissionController {
         finishedAt: new Date().toISOString(),
       });
       return "exhausted";
+    }
+    if (
+      stagnation.stagnated &&
+      broker.profiles.length === 0 &&
+      stagnation.triedHypotheses.includes(normalizeHypothesis(result.hypothesis))
+    ) {
+      await this.conclude(
+        this.ledger.getExperiment(experimentId)!,
+        "rejected",
+        `stagnation: repeated an already-tried mechanism after ${stagnation.count} experiments without improvement and no profiling step`,
+        [],
+        {
+          hypothesis: text.hypothesis,
+          whatChanged: text.whatChanged,
+          claim: text.claim,
+          seededFixture: result.seededFixture,
+          claimIssues: audit.issues,
+        },
+        mission,
+      );
+      return "continue";
     }
 
     const snapshot = this.artifacts.snapshot(this.paths.candidate, parent);
@@ -1012,6 +1080,8 @@ export class MissionController {
   private nextActionAfter(verdict: Verdict, reason: string, mission: MissionRow): string {
     if (verdict === "accepted")
       return "profile the new best artifact and look for the next bottleneck";
+    if (reason.startsWith("stagnation"))
+      return "profile the current best artifact before editing, or try a mechanism not yet attempted";
     if (verdict === "inconclusive" && reason.includes("timing"))
       return "the timing difference was within measurement noise; look for a mechanism with a larger effect or profile to confirm the bottleneck";
     if (verdict === "inconclusive")
@@ -1313,6 +1383,28 @@ export class MissionController {
 
   // ---- packet, hooks, segments, budget, memory ---------------------------------------
 
+  /** Consecutive concluded optimize-search experiments since the last accepted one; none of them improved the best. */
+  stagnation(): StagnationState {
+    const concluded = this.ledger
+      .listExperiments(this.config.missionId)
+      .filter(
+        (e) =>
+          e.taskId === "optimize-search" &&
+          (e.status === "accepted" || e.status === "rejected" || e.status === "inconclusive"),
+      );
+    const run: ExperimentRow[] = [];
+    for (let i = concluded.length - 1; i >= 0; i -= 1) {
+      const e = concluded[i]!;
+      if (e.status === "accepted") break;
+      run.unshift(e);
+    }
+    return {
+      count: run.length,
+      triedHypotheses: [...new Set(run.map((e) => normalizeHypothesis(e.hypothesis)))],
+      stagnated: run.length >= this.config.stagnationLimit,
+    };
+  }
+
   /** Cycle-start retrieval query composed from the active task, its hypothesis, and the last finished experiment's features, invariants and verdict. */
   private retrievalQuery(experiments: ExperimentRow[], experimentId: string): string {
     const task = this.ledger
@@ -1332,7 +1424,11 @@ export class MissionController {
     });
   }
 
-  private async buildPacket(mission: MissionRow, experimentId: string): Promise<ContextPacket> {
+  private async buildPacket(
+    mission: MissionRow,
+    experimentId: string,
+    stagnation: StagnationState,
+  ): Promise<ContextPacket> {
     const experiments = this.ledger
       .listExperiments(this.config.missionId)
       .filter((e) => e.taskId === "optimize-search");
@@ -1382,7 +1478,11 @@ export class MissionController {
         featureMap: `${features}\n\n${skill}`,
         recent: recent || "No experiments yet.",
         retrieved: retrieval.injected.map((r) => ({ episodeId: r.episodeId, text: r.text })),
-        next: `Last verdict: ${lastVerdict}\nNext action: ${this.ledger.listTasks(this.config.missionId).find((t) => t.taskId === "optimize-search")?.nextAction ?? ""}\nFiltered from retrieval: ${retrieval.filteredOut.map((f) => `${f.episodeId ?? "?"} (${f.reason})`).join("; ") || "none"}`,
+        next: `Last verdict: ${lastVerdict}\nNext action: ${this.ledger.listTasks(this.config.missionId).find((t) => t.taskId === "optimize-search")?.nextAction ?? ""}\n${
+          stagnation.stagnated
+            ? `Stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}). This cycle must call profile_candidate before editing or try a mechanism other than: ${stagnation.triedHypotheses.join(" | ")}. Repeating one of those without profiling is rejected without verification.\n`
+            : ""
+        }Filtered from retrieval: ${retrieval.filteredOut.map((f) => `${f.episodeId ?? "?"} (${f.reason})`).join("; ") || "none"}`,
       },
       DEFAULT_PACKET_BUDGET,
     );
