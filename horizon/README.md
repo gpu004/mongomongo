@@ -8,7 +8,7 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ## Requirements
 
 - Node >= 24 (uses `node:sqlite` and type-stripped `.ts` execution)
-- Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra
+- Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra. Container names are recorded in the ledger before `docker run`, so `resume` removes any candidate container orphaned by a controller crash
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
 - An LLM API key for the Pi worker (`"worker": "pi"`); the `scripted` worker needs none
 
