@@ -12,6 +12,7 @@ import {
   Ledger,
   LeaseError,
   type ArtifactRow,
+  type ContainerState,
   type EpisodeRow,
   type LeaseRow,
   type LessonRow,
@@ -192,6 +193,21 @@ export class SqliteLedger implements AsyncLedger {
   }
   async listLearnedScenarios(missionId: string) {
     return this.inner.listLearnedScenarios(missionId);
+  }
+
+  async registerContainer(containerName: string, missionId: string, experimentId: string) {
+    this.guard();
+    this.inner.registerContainer(containerName, missionId, experimentId);
+  }
+  async releaseContainer(containerName: string, state: ContainerState = "released") {
+    this.guard();
+    this.inner.releaseContainer(containerName, state);
+  }
+  async listLiveContainers(missionId: string) {
+    return this.inner.listLiveContainers(missionId);
+  }
+  async listContainers(missionId: string) {
+    return this.inner.listContainers(missionId);
   }
 
   async writeCheckpoint(c: NewCheckpointRow) {

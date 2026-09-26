@@ -222,6 +222,26 @@ for (const makeBackend of backends) {
       assert.deepEqual(await ledger.listLearnedScenarios(MISSION), [
         { scenarioId: "sc-1", lessonId: "l1", suiteVersion: 1, path: "/tmp/sc.json" },
       ]);
+
+      await ledger.registerContainer("horizon-c1", MISSION, "e1");
+      await ledger.registerContainer("horizon-c1", MISSION, "e1");
+      await ledger.registerContainer("horizon-c2", MISSION, "e1");
+      assert.deepEqual(
+        (await ledger.listLiveContainers(MISSION)).map((c) => c.containerName),
+        ["horizon-c1", "horizon-c2"],
+      );
+      await ledger.releaseContainer("horizon-c1");
+      await ledger.releaseContainer("horizon-c1", "orphan_removed");
+      await ledger.releaseContainer("horizon-c2", "orphan_removed");
+      assert.deepEqual(await ledger.listLiveContainers(MISSION), []);
+      const containers = await ledger.listContainers(MISSION);
+      assert.deepEqual(
+        containers.map((c) => [c.containerName, c.experimentId, c.state, c.releasedAt !== null]),
+        [
+          ["horizon-c1", "e1", "released", true],
+          ["horizon-c2", "e1", "orphan_removed", true],
+        ],
+      );
     } finally {
       await ledger.close();
       await backend.teardown();

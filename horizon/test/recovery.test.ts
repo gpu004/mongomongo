@@ -163,3 +163,59 @@ test("drift in frozen identities is refused on resume", async () => {
   await assert.rejects(drifted.run(), /contract hash drift/);
   drifted.close();
 });
+
+test("container names are durable before launch and orphans are removed on resume", async () => {
+  const runs = tempRunsRoot();
+  const first = controllerFor("rec-orphan", runs, { crashAt: "snapshot_ready", maxCycles: 1 });
+  first.initialize();
+  await assert.rejects(first.run(), SimulatedCrash);
+  const experiment = first.ledger
+    .listExperiments("rec-orphan")
+    .find((e) => e.taskId === "optimize-search")!;
+
+  // The registry writes the name before `docker run`; a stopped container is released.
+  const registry = first.containerRegistry(experiment.experimentId);
+  registry.register("horizon-cand-released0001");
+  registry.release("horizon-cand-released0001");
+  // A container whose controller died mid-verification never reaches release().
+  registry.register("horizon-cand-orphan000001");
+  const live = first.ledger.listLiveContainers("rec-orphan");
+  assert.deepEqual(
+    live.map((c) => [c.containerName, c.experimentId, c.state]),
+    [["horizon-cand-orphan000001", experiment.experimentId, "launching"]],
+  );
+  assert.ok(first.ledger.findEvent("container:horizon-cand-orphan000001:launched"));
+  first.close();
+
+  const removed: string[] = [];
+  const second = controllerFor("rec-orphan", runs, {
+    maxCycles: 1,
+    containerRuntime: { remove: (name) => (removed.push(name), true) },
+  });
+  await second.run();
+  const containers = second.ledger.listContainers("rec-orphan");
+  const event = second.ledger.findEvent("recovery:horizon-cand-orphan000001:orphan-removed");
+  const recovered = second.ledger
+    .eventsSince(0, 10_000)
+    .filter((e) => e.type === "controller.recovered")
+    .at(-1)!.payload as { actions: { kind: string; experimentId?: string }[] };
+  const stillLive = second.ledger.listLiveContainers("rec-orphan").length;
+  second.close();
+
+  assert.deepEqual(removed, ["horizon-cand-orphan000001"]);
+  assert.equal(stillLive, 0);
+  assert.deepEqual(
+    containers.map((c) => [c.containerName, c.state]),
+    [
+      ["horizon-cand-released0001", "released"],
+      ["horizon-cand-orphan000001", "orphan_removed"],
+    ],
+  );
+  assert.ok(containers.every((c) => c.releasedAt !== null));
+  assert.deepEqual(event?.payload, { containerName: "horizon-cand-orphan000001", existed: true });
+  assert.ok(
+    recovered.actions.some(
+      (a) => a.kind === "removed_orphaned_container" && a.experimentId === experiment.experimentId,
+    ),
+  );
+});

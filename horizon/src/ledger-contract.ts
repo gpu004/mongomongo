@@ -2,6 +2,8 @@ import type { VerificationReport } from "../verification/reports.ts";
 import type {
   ArtifactRow,
   CheckpointRow,
+  ContainerRow,
+  ContainerState,
   EpisodeRow,
   EventRow,
   ExperimentRow,
@@ -101,6 +103,12 @@ export interface AsyncLedger {
     path: string,
   ): Promise<void>;
   listLearnedScenarios(missionId: string): Promise<LearnedScenarioRow[]>;
+
+  // execution environments
+  registerContainer(containerName: string, missionId: string, experimentId: string): Promise<void>;
+  releaseContainer(containerName: string, state?: ContainerState): Promise<void>;
+  listLiveContainers(missionId: string): Promise<ContainerRow[]>;
+  listContainers(missionId: string): Promise<ContainerRow[]>;
 
   // checkpoints / segments / outbox
   writeCheckpoint(c: NewCheckpointRow): Promise<CheckpointRow>;

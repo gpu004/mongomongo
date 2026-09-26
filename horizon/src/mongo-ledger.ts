@@ -28,6 +28,8 @@ import {
   LeaseError,
   type ArtifactRow,
   type CheckpointRow,
+  type ContainerRow,
+  type ContainerState,
   type EpisodeRow,
   type EventRow,
   type ExperimentRow,
@@ -57,6 +59,7 @@ export const COLLECTIONS = {
   episodes: "episodes",
   lessons: "lessons",
   learnedScenarios: "learnedScenarios",
+  containers: "containers",
   checkpoints: "checkpoints",
   segments: "segments",
   events: "events",
@@ -93,6 +96,9 @@ export const REQUIRED_INDEXES: Record<string, IndexDescription[]> = {
   [COLLECTIONS.lessons]: [{ key: { missionId: 1, createdAt: 1 }, name: "lesson_mission" }],
   [COLLECTIONS.learnedScenarios]: [
     { key: { missionId: 1, suiteVersion: 1 }, name: "scenario_mission" },
+  ],
+  [COLLECTIONS.containers]: [
+    { key: { missionId: 1, state: 1, createdAt: 1 }, name: "container_mission_state" },
   ],
   [COLLECTIONS.checkpoints]: [
     { key: { missionId: 1, seq: 1 }, name: "checkpoint_mission_seq", unique: true },
@@ -722,6 +728,52 @@ export class MongoLedger implements AsyncLedger {
     }));
   }
 
+  // ---- execution environments -------------------------------------------
+
+  async registerContainer(
+    containerName: string,
+    missionId: string,
+    experimentId: string,
+  ): Promise<void> {
+    await this.assertLease();
+    await this.insertIgnore(
+      COLLECTIONS.containers,
+      { _id: containerName },
+      {
+        _id: containerName,
+        missionId,
+        containerName,
+        experimentId,
+        state: "launching",
+        createdAt: now(),
+        releasedAt: null,
+      },
+    );
+  }
+
+  async releaseContainer(containerName: string, state: ContainerState = "released"): Promise<void> {
+    await this.assertLease();
+    await this.col(COLLECTIONS.containers).updateOne(
+      { _id: containerName, state: "launching" },
+      { $set: { state, releasedAt: now() } },
+      this.opts,
+    );
+  }
+
+  async listLiveContainers(missionId: string): Promise<ContainerRow[]> {
+    const docs = await this.col(COLLECTIONS.containers)
+      .find({ missionId, state: "launching" }, { sort: { createdAt: 1, _id: 1 }, ...this.opts })
+      .toArray();
+    return docs.map(toContainer);
+  }
+
+  async listContainers(missionId: string): Promise<ContainerRow[]> {
+    const docs = await this.col(COLLECTIONS.containers)
+      .find({ missionId }, { sort: { createdAt: 1, _id: 1 }, ...this.opts })
+      .toArray();
+    return docs.map(toContainer);
+  }
+
   // ---- checkpoints / segments / outbox -----------------------------------
 
   async writeCheckpoint(c: NewCheckpointRow): Promise<CheckpointRow> {
@@ -926,6 +978,17 @@ function toEvent(doc: Document): EventRow {
     type: String(doc.type),
     entityId: String(doc.entityId),
     payload: JSON.parse(String(doc.payload)),
+  };
+}
+
+function toContainer(doc: Document): ContainerRow {
+  return {
+    containerName: String(doc.containerName),
+    missionId: String(doc.missionId),
+    experimentId: String(doc.experimentId),
+    state: String(doc.state) as ContainerState,
+    createdAt: String(doc.createdAt),
+    releasedAt: doc.releasedAt == null ? null : String(doc.releasedAt),
   };
 }
 
