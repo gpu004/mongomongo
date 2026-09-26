@@ -1,8 +1,9 @@
-import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import type { Operation } from "../verification/reference-model.ts";
 import type { Suite, VerificationReport } from "../verification/reports.ts";
+import { HostSandbox, resolveWorkspacePath, type Sandbox } from "../verification/sandbox.ts";
 import type { ObservedVerification } from "./claim-audit.ts";
 import type { FileEvidenceStore } from "./mission-paths.ts";
 
@@ -36,6 +37,14 @@ export interface ExecResult {
 const MAX_READ_CHARS = 20000;
 const MAX_EXEC_CHARS = 8000;
 const ALLOWED_EXEC = new Set(["node", "ls", "cat", "wc", "grep"]);
+const DEFAULT_EXEC_MEMORY_BYTES = 512 * 1024 * 1024;
+
+export interface BrokerOptions {
+	/** Where workspace commands run. Container missions pass a Docker sandbox; there is no host fallback. */
+	sandbox?: Sandbox;
+	missionId?: string;
+	memoryLimitBytes?: number;
+}
 
 /**
  * The only component that touches the candidate workspace or launches candidate
@@ -47,12 +56,18 @@ export class ToolBroker {
 	readonly evidence: FileEvidenceStore;
 	readonly hooks: BrokerHooks;
 	private readonly deadline: () => number;
-	private readonly children = new Set<ReturnType<typeof spawn>>();
+	private readonly sandbox: Sandbox;
+	private readonly missionId: string;
+	private readonly memoryLimitBytes: number;
+	private readonly running = new Set<AbortController>();
 	/** Every verifier result the worker saw this cycle, in order; used to audit its claim. */
 	readonly verifications: ObservedVerification[] = [];
 
-	constructor(workspaceDir: string, evidence: FileEvidenceStore, hooks: BrokerHooks, deadline: () => number) {
+	constructor(workspaceDir: string, evidence: FileEvidenceStore, hooks: BrokerHooks, deadline: () => number, options: BrokerOptions = {}) {
 		this.workspaceDir = resolve(workspaceDir);
+		this.sandbox = options.sandbox ?? new HostSandbox();
+		this.missionId = options.missionId ?? "adhoc";
+		this.memoryLimitBytes = options.memoryLimitBytes ?? DEFAULT_EXEC_MEMORY_BYTES;
 		this.evidence = evidence;
 		this.hooks = hooks;
 		this.deadline = deadline;
@@ -60,12 +75,7 @@ export class ToolBroker {
 
 	/** Resolve a workspace-relative path; rejects traversal, absolute paths and symlink escapes. */
 	resolveInside(relPath: string): string {
-		if (relPath.startsWith("/") || relPath.includes("\0")) throw new Error(`path denied: ${relPath}`);
-		const full = resolve(this.workspaceDir, relPath);
-		const rel = relative(this.workspaceDir, full);
-		if (rel.startsWith("..") || rel.split(sep).includes("..")) throw new Error(`path escapes candidate workspace: ${relPath}`);
-		if (rel.split(sep).includes("node_modules")) throw new Error(`path denied: ${relPath}`);
-		return full;
+		return resolveWorkspacePath(this.workspaceDir, relPath);
 	}
 
 	private checkDeadline(): void {
@@ -146,29 +156,28 @@ export class ToolBroker {
 		for (const arg of args) {
 			if (arg.startsWith("/") || arg.includes("..")) return Promise.reject(new Error(`argument denied: ${arg}`));
 		}
-		const executable = command === "node" ? process.execPath : command;
+		for (const arg of args) {
+			if (!arg.startsWith("-")) {
+				try {
+					this.resolveInside(arg);
+				} catch (error) {
+					if (error instanceof Error && /escapes/.test(error.message)) return Promise.reject(new Error(`argument denied: ${arg}`));
+				}
+			}
+		}
 		const remaining = Math.max(1000, Math.min(timeoutMs, this.deadline() - Date.now()));
-		return new Promise((resolvePromise) => {
-			const child = spawn(executable, args, { cwd: this.workspaceDir, env: { PATH: process.env.PATH ?? "" }, stdio: ["ignore", "pipe", "pipe"] });
-			this.children.add(child);
-			let stdout = "";
-			let stderr = "";
-			let timedOut = false;
-			child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-			child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-			const timer = setTimeout(() => {
-				timedOut = true;
-				child.kill("SIGKILL");
-			}, remaining);
-			child.on("close", (exitCode) => {
-				clearTimeout(timer);
-				this.children.delete(child);
-				const evidenceId = this.evidence.write("exec", { command, args, exitCode, stdout, stderr, timedOut });
-				const truncated = stdout.length > MAX_EXEC_CHARS || stderr.length > MAX_EXEC_CHARS;
+		const abort = new AbortController();
+		this.running.add(abort);
+		return this.sandbox
+			.exec({ scope: { missionId: this.missionId, operationId: `exec:${randomUUID()}` }, workspaceDir: this.workspaceDir, command, args, timeoutMs: remaining, memoryLimitBytes: this.memoryLimitBytes, signal: abort.signal })
+			.then((outcome) => {
+				const { exitCode, stdout, stderr, timedOut } = outcome;
+				const evidenceId = this.evidence.write("exec", { command, args, exitCode, stdout, stderr, timedOut, sandbox: this.sandbox.kind, sandboxId: outcome.sandboxId });
+				const truncated = outcome.truncated || stdout.length > MAX_EXEC_CHARS || stderr.length > MAX_EXEC_CHARS;
 				this.hooks.onToolEvent("workspace_exec", { command, args }, `exit ${exitCode} ${evidenceId}`);
-				resolvePromise({ exitCode, stdout: stdout.slice(0, MAX_EXEC_CHARS), stderr: stderr.slice(0, MAX_EXEC_CHARS), truncated, timedOut, evidenceId });
-			});
-		});
+				return { exitCode, stdout: stdout.slice(0, MAX_EXEC_CHARS), stderr: stderr.slice(0, MAX_EXEC_CHARS), truncated, timedOut, evidenceId };
+			})
+			.finally(() => this.running.delete(abort));
 	}
 
 	async verifyCandidate(suite: Suite): Promise<{ reportId: string; status: string; failed: string[]; metrics: VerificationReport["metrics"]; infraMessage?: string }> {
@@ -213,7 +222,7 @@ export class ToolBroker {
 
 	/** Deadline or abort: kill anything the worker started. */
 	terminateChildren(): void {
-		for (const child of this.children) child.kill("SIGKILL");
-		this.children.clear();
+		for (const abort of this.running) abort.abort();
+		this.running.clear();
 	}
 }

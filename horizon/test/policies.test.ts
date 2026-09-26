@@ -77,10 +77,10 @@ function memoryFixture() {
 	const adapter = new LocalMemoryAdapter();
 	const payloads = new Map<string, EpisodePayload>();
 	const outbox = new MemoryOutbox(ledger, adapter, "horizon-lag", (id) => payloads.get(id), () => {});
-	const add = (p: EpisodePayload) => {
+	const add = async (p: EpisodePayload) => {
 		payloads.set(p.episodeId, p);
 		ledger.insertEpisode({ episodeId: p.episodeId, missionId: p.missionId, experimentId: p.experimentId, version: p.version, supersedes: p.supersedes, featureIds: [], invariantIds: [], artifactHash: p.artifactHash, parentArtifactHash: p.parentArtifactHash, interpretation: "verified", evidenceIds: [], summary: renderEpisode(p), createdAt: new Date().toISOString() });
-		outbox.enqueue(p);
+		await outbox.enqueue(p);
 	};
 	return { ledger, evidence, adapter, outbox, add };
 }
@@ -93,7 +93,7 @@ test("indexing lag: accepted-but-unindexed episodes are merged from the local in
 	const { ledger, evidence, adapter, outbox, add } = memoryFixture();
 	const scope = { missionId: "lag", containerTag: "horizon-lag", contractVersion: 1 };
 	adapter.deferReadiness = true;
-	add(episode("ep-lagged", "rejected: posting index loses updates"));
+	await add(episode("ep-lagged", "rejected: posting index loses updates"));
 	await outbox.drain(Date.now() + 60_000);
 	assert.equal(ledger.listOutbox(["submitted"]).length, 1, "accepted remotely, not ready");
 	adapter.injectForeign("horizon-lag", "ep-lagged", "Mission other; posting index loses updates", { missionId: "other", episodeId: "ep-lagged" });
@@ -110,11 +110,11 @@ test("indexing lag: accepted-but-unindexed episodes are merged from the local in
 test("supersession: a remote hit on an old version is replaced by the current version, even before it is indexed", async () => {
 	const { ledger, evidence, adapter, outbox, add } = memoryFixture();
 	const scope = { missionId: "lag", containerTag: "horizon-lag", contractVersion: 1 };
-	add(episode("ep-x-v1", "verdict rsk1 before re-measurement"));
+	await add(episode("ep-x-v1", "verdict rsk1 before re-measurement"));
 	await outbox.drain(Date.now() + 60_000);
 	await outbox.drain(Date.now() + 60_000);
 	adapter.deferReadiness = true;
-	add(episode("ep-x-v2", "verdict rsk2 after re-measurement", { version: 2, supersedes: "ep-x-v1", experimentId: "exp-ep-x-v1" }));
+	await add(episode("ep-x-v2", "verdict rsk2 after re-measurement", { version: 2, supersedes: "ep-x-v1", experimentId: "exp-ep-x-v1" }));
 	const selection = await retrieveEpisodes(adapter, ledger, evidence, scope, "verdict before re-measurement");
 	assert.deepEqual(selection.injected.map((i) => i.episodeId), ["ep-x-v2"]);
 	assert.match(selection.injected[0]!.text, /rsk2/);

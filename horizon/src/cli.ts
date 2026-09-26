@@ -12,6 +12,10 @@ import { compareConfigurations, renderComparison } from "./compare.ts";
 import { BaselineError, MissionController, RESOURCES_DIR, SimulatedCrash } from "./controller.ts";
 import { loadFeatureMap, validateFeatureMap } from "./feature-map.ts";
 import { Ledger } from "./ledger.ts";
+import { LedgerUnavailableError } from "./ledger-store.ts";
+import { probeMongo } from "./mongo-ledger.ts";
+import { ledgerBackend, mongoSettings, openMissionStore } from "./open-ledger.ts";
+import { createSandbox } from "../verification/sandbox.ts";
 import { renderMemoryBench, runMemoryBench, type MemoryBenchResult } from "./memory-bench.ts";
 import { loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
 import { FileEvidenceStore, missionPaths, RUNS_ROOT } from "./mission-paths.ts";
@@ -23,7 +27,8 @@ import type { Worker } from "./worker.ts";
 
 const USAGE = `horizon <command> [options]
 
-  doctor                                   check node, sqlite, docker, seed, evaluator hash
+  doctor [--config mission.json]           check node, sqlite, docker, seed, evaluator hash,
+                                           sandbox and (when configured) the MongoDB ledger
   mission create --config mission.json     freeze identities and import the seed
   run --mission M [--cycles N]             run (or resume) the mission loop
   resume --mission M                       alias of run
@@ -100,30 +105,55 @@ async function main(): Promise<number> {
 			checks.push(["environmentHash(subprocess)", computeEnvironmentHash("subprocess", "").slice(0, 16)]);
 			checks.push(["supermemory", process.env.SUPERMEMORY_API_KEY ? "api key present" : "no SUPERMEMORY_API_KEY (local memory adapter)"]);
 			checks.push(["runsRoot", runsRoot]);
+			let ok = true;
+			const config = values.config ? loadMissionConfig(resolve(values.config)) : undefined;
+			if (config) {
+				checks.push(["isolation", config.isolation]);
+				try {
+					await createSandbox(config.isolation, config.containerImage).assertAvailable();
+					checks.push(["sandbox", `${config.isolation === "container" ? "docker" : "host"} ok`]);
+				} catch (e) {
+					ok = false;
+					checks.push(["sandbox", `unavailable: ${e instanceof Error ? e.message : String(e)}`]);
+				}
+			}
+			const wantsMongo = config ? ledgerBackend(config) === "mongodb" : Boolean(process.env.MONGODB_URI);
+			checks.push(["ledger", config ? ledgerBackend(config) : process.env.MONGODB_URI ? "mongodb (MONGODB_URI set)" : "sqlite"]);
+			if (wantsMongo) {
+				try {
+					const { uri, dbName } = config ? mongoSettings(config) : { uri: process.env.MONGODB_URI!, dbName: process.env.MONGODB_DB ?? "horizon_dev" };
+					const probe = await probeMongo(uri, dbName);
+					for (const c of probe.checks) checks.push([`mongodb:${c.name}`, `${c.ok ? "ok" : "FAILED"} ${c.detail}`]);
+					ok &&= probe.ok;
+				} catch (e) {
+					ok = false;
+					checks.push(["mongodb", e instanceof Error ? e.message : String(e)]);
+				}
+			}
 			for (const [k, v] of checks) log(`${k.padEnd(28)} ${v}`);
-			return 0;
+			return ok ? 0 : 2;
 		}
 		case "mission": {
 			if (sub !== "create") throw new Error(USAGE);
 			if (!values.config) throw new Error("--config is required");
 			const config = loadMissionConfig(resolve(values.config));
-			const controller = new MissionController(config, missionPaths(config.missionId, runsRoot), { log });
+			const controller = await MissionController.open(config, missionPaths(config.missionId, runsRoot), { log });
 			try {
-				const row = controller.initialize();
+				const row = await controller.initialize();
 				log(`mission ${row.missionId} ready: contract ${row.contractHash.slice(0, 12)} evaluator ${row.evaluatorHash.slice(0, 12)} env ${row.environmentHash.slice(0, 12)} seed ${row.seedArtifactHash?.slice(0, 12)}`);
 			} finally {
-				controller.close();
+				await controller.close();
 			}
 			return 0;
 		}
 		case "run":
 		case "resume": {
 			const { config, paths } = loadMission();
-			const controller = new MissionController(config, paths, { log, worker: makeWorker(config, paths), ...(values.cycles ? { maxCycles: Number(values.cycles) } : {}), ...(values["crash-at"] ? { crashAt: values["crash-at"] } : {}) });
+			const controller = await MissionController.open(config, paths, { log, worker: makeWorker(config, paths), ...(values.cycles ? { maxCycles: Number(values.cycles) } : {}), ...(values["crash-at"] ? { crashAt: values["crash-at"] } : {}) });
 			try {
 				const row = await controller.run();
 				log("");
-				log(renderProgress(summarize(controller.ledger, config)));
+				log(renderProgress(await summarize(controller.ledger, config)));
 				return row.status === "succeeded" ? 0 : 2;
 			} catch (error) {
 				if (error instanceof SimulatedCrash) {
@@ -131,9 +161,13 @@ async function main(): Promise<number> {
 					return 3;
 				}
 				if (error instanceof BaselineError) return 2;
+				if (error instanceof LedgerUnavailableError) {
+					log(`ledger unavailable, mission paused: ${error.message}`);
+					return 4;
+				}
 				throw error;
 			} finally {
-				controller.close();
+				await controller.close();
 			}
 		}
 		case "verify":
@@ -141,9 +175,9 @@ async function main(): Promise<number> {
 			const { config, paths } = loadMission();
 			const suite: Suite = command === "profile" ? "performance" : (values.suite as Suite);
 			if (!suite) throw new Error("--suite is required");
-			const ledger = new Ledger(paths.db);
+			const ledger = await openMissionStore(config, paths);
 			try {
-				const mission = ledger.getMission(config.missionId);
+				const mission = await ledger.getMission(config.missionId);
 				const artifacts = new ArtifactStore(paths.artifacts);
 				const hash = values.artifact ?? mission?.bestArtifactHash;
 				if (!hash || !artifacts.verify(hash)) throw new Error(`artifact ${hash ?? "(none)"} not found or corrupt`);
@@ -170,7 +204,7 @@ async function main(): Promise<number> {
 				log(JSON.stringify({ scenario: values.scenario ?? null, reportId: report.reportId, suite, status: report.status, isolation: report.isolation, metrics: report.metrics, failed: report.assertions.filter((a) => !a.passed), infraMessage: report.infraMessage ?? null }, null, 2));
 				return report.status === "passed" ? 0 : 2;
 			} finally {
-				ledger.close();
+				await ledger.close();
 			}
 		}
 		case "features": {
@@ -237,22 +271,22 @@ async function main(): Promise<number> {
 		}
 		case "inspect": {
 			const { config, paths } = loadMission();
-			const ledger = new Ledger(paths.db);
+			const ledger = await openMissionStore(config, paths);
 			try {
-				log(renderProgress(summarize(ledger, config)));
+				log(renderProgress(await summarize(ledger, config)));
 			} finally {
-				ledger.close();
+				await ledger.close();
 			}
 			return 0;
 		}
 		case "export": {
 			const { config, paths } = loadMission();
-			const ledger = new Ledger(paths.db);
+			const ledger = await openMissionStore(config, paths);
 			try {
-				const out = exportMission(ledger, config, paths);
+				const out = await exportMission(ledger, config, paths);
 				log(`${out.json}\n${out.markdown}`);
 			} finally {
-				ledger.close();
+				await ledger.close();
 			}
 			return 0;
 		}

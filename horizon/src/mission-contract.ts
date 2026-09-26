@@ -45,6 +45,12 @@ export interface MissionConfig {
 		containerTag: string;
 		materializeCorrections: boolean;
 	};
+	/**
+	 * Canonical mission store; exactly one backend per mission, frozen in the
+	 * contract. Omitted means local SQLite. The MongoDB connection string comes
+	 * from MONGODB_URI and is never part of the config.
+	 */
+	ledger?: { backend: "sqlite" | "mongodb"; database?: string };
 }
 
 export function loadMissionConfig(path: string): MissionConfig {
@@ -80,6 +86,11 @@ export function validateMissionConfig(value: unknown): MissionConfig {
 	if (c.worker !== "scripted" && c.worker !== "pi") fail("worker must be scripted|pi");
 	if (!c.memory || typeof c.memory.enabled !== "boolean" || typeof c.memory.containerTag !== "string") fail("memory config incomplete");
 	if (c.memory!.containerTag !== `horizon-${c.missionId}`) fail("memory.containerTag must be horizon-<missionId> (mission-scoped)");
+	if (c.ledger !== undefined) {
+		if (c.ledger.backend !== "sqlite" && c.ledger.backend !== "mongodb") fail("ledger.backend must be sqlite|mongodb");
+		if (c.ledger.database !== undefined && (typeof c.ledger.database !== "string" || !/^[A-Za-z0-9_-]{1,63}$/.test(c.ledger.database))) fail("ledger.database must be a plain database name");
+		if (c.ledger.backend === "sqlite" && c.ledger.database !== undefined) fail("ledger.database applies to mongodb only");
+	}
 	return c as MissionConfig;
 }
 

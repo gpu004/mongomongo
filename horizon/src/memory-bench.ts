@@ -109,6 +109,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
 	const base = Date.parse("2026-01-01T00:00:00Z");
 	const BATCH = 2000;
 	for (let start = 0; start < timeline.length; start += BATCH) {
+		const enqueued: Promise<string>[] = [];
 		ledger.transaction(() => {
 			for (let i = start; i < Math.min(timeline.length, start + BATCH); i += 1) {
 				const { experiment, version } = timeline[i]!;
@@ -151,10 +152,11 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
 				archivedTokens += estimateTokens(summary);
 				payloads.set(episodeId, payload);
 				ledger.insertEpisode({ episodeId, missionId, experimentId: id, version, supersedes: payload.supersedes, featureIds: payload.featureIds, invariantIds: [], artifactHash: payload.artifactHash, parentArtifactHash: payload.parentArtifactHash, interpretation: "verified", evidenceIds, summary, createdAt: new Date(base + i * 1000).toISOString() });
-				outbox.enqueue(payload);
+				enqueued.push(outbox.enqueue(payload));
 				latest.set(experiment, { episodeId, value, values: [...(prior?.values ?? []), value] });
 			}
 		});
+		await Promise.all(enqueued);
 	}
 	const ingestMs = Date.now() - started;
 

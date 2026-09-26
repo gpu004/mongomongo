@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { CandidateStartupError, launchCandidate, type IsolationMode, type RunningCandidate } from "./candidate-process.ts";
 import { type ExpectedOutcome, type Operation, ReferenceModel } from "./reference-model.ts";
@@ -33,13 +33,15 @@ export interface RunnerConfig {
 	evidence: EvidenceSink;
 	/** Scenario directory override (tests). */
 	scenariosDir?: string;
+	/** Stable id of the ledger operation this run belongs to; labels every sandbox it starts. */
+	operationId?: string;
 }
 
 const VERIFICATION_DIR = new URL("./", import.meta.url).pathname;
 
 /** Hash of every file that decides a verdict. Frozen into the mission and re-checked before each run. */
 export function computeEvaluatorHash(root = VERIFICATION_DIR): string {
-	const files = ["runner.ts", "reference-model.ts", "reports.ts", "structural.ts", "candidate-process.ts", "workloads/index.ts", "scenarios/index.ts"];
+	const files = ["runner.ts", "reference-model.ts", "reports.ts", "structural.ts", "candidate-process.ts", "sandbox.ts", "workloads/index.ts", "scenarios/index.ts"];
 	for (const name of readdirSync(join(root, "scenarios")).sort()) {
 		if (name.endsWith(".json")) files.push(`scenarios/${name}`);
 	}
@@ -59,7 +61,9 @@ export function hashDirectory(dir: string): { hash: string; manifest: Record<str
 			if (entry === "node_modules" || entry === ".git" || (prefix === "" && entry === ".manifest.json")) continue;
 			const full = join(current, entry);
 			const rel = prefix ? `${prefix}/${entry}` : entry;
-			if (statSync(full).isDirectory()) walk(full, rel);
+			const stat = lstatSync(full);
+			if (stat.isSymbolicLink()) throw new Error(`snapshot contains a symlink: ${rel}`);
+			if (stat.isDirectory()) walk(full, rel);
 			else manifest[rel] = sha256(readFileSync(full));
 		}
 	};
@@ -133,6 +137,7 @@ export async function runSuite(config: RunnerConfig, suite: Suite): Promise<Veri
 			containerImage: config.containerImage,
 			startupTimeoutMs: config.startupTimeoutMs,
 			memoryLimitBytes: config.memoryLimitBytes,
+			scope: sandboxScope(config, suite),
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -155,13 +160,13 @@ export async function runSuite(config: RunnerConfig, suite: Suite): Promise<Veri
 		} else {
 			for (const scenario of scenarios) {
 				// Each scenario runs against a fresh service so scenarios cannot mask each other.
-				const fresh = await relaunch(candidate, config);
+				const fresh = await relaunch(candidate, config, suite);
 				candidate = fresh;
 				const freshClient = new HttpDriver(fresh.baseUrl, config.requestTimeoutMs);
 				assertions.push(await runScenario(freshClient, scenario, config.evidence, evidenceIds));
 			}
 			if (suite === "holdout" && workload) {
-				const fresh = await relaunch(candidate, config);
+				const fresh = await relaunch(candidate, config, suite);
 				candidate = fresh;
 				const freshClient = new HttpDriver(fresh.baseUrl, config.requestTimeoutMs);
 				assertions.push(await runHoldoutTrace(freshClient, workload, config.evidence, evidenceIds));
@@ -185,7 +190,7 @@ export async function runSuite(config: RunnerConfig, suite: Suite): Promise<Veri
 	return finish(status, assertions, metrics, workloadHash);
 }
 
-async function relaunch(current: RunningCandidate, config: RunnerConfig): Promise<RunningCandidate> {
+async function relaunch(current: RunningCandidate, config: RunnerConfig, suite: Suite): Promise<RunningCandidate> {
 	await current.stop();
 	return launchCandidate({
 		snapshotDir: config.snapshotDir,
@@ -193,7 +198,12 @@ async function relaunch(current: RunningCandidate, config: RunnerConfig): Promis
 		containerImage: config.containerImage,
 		startupTimeoutMs: config.startupTimeoutMs,
 		memoryLimitBytes: config.memoryLimitBytes,
+		scope: sandboxScope(config, suite),
 	});
+}
+
+function sandboxScope(config: RunnerConfig, suite: Suite): { missionId: string; operationId: string } {
+	return { missionId: config.missionId, operationId: config.operationId ?? `${config.experimentId}:${suite}` };
 }
 
 function selectScenarios(config: RunnerConfig, suite: Suite): Scenario[] {
@@ -354,7 +364,7 @@ async function runPerformance(
 	const assertions: AssertionResult[] = [];
 	for (let rep = 0; rep < workload.spec.repetitions; rep++) {
 		if (rep > 0) {
-			candidate = await relaunch(candidate, config);
+			candidate = await relaunch(candidate, config, "performance");
 			driver = new HttpDriver(candidate.baseUrl, config.requestTimeoutMs);
 		}
 		const model = new ReferenceModel();

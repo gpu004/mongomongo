@@ -51,10 +51,10 @@ function payload(i: number, version = 1): EpisodePayload {
 		uncertainty: "probe", reportIds: [], evidenceIds: [evidenceId], nextAction: "none", interpretation: "verified", seededFixture: null,
 	};
 }
-function add(p: EpisodePayload): void {
+async function add(p: EpisodePayload): Promise<void> {
 	payloads.set(p.episodeId, p);
 	ledger.insertEpisode({ episodeId: p.episodeId, missionId, experimentId: p.experimentId, version: p.version, supersedes: p.supersedes, featureIds: p.featureIds, invariantIds: [], artifactHash: p.artifactHash, parentArtifactHash: p.parentArtifactHash, interpretation: "verified", evidenceIds: p.evidenceIds, summary: renderEpisode(p), createdAt: new Date().toISOString() });
-	outbox.enqueue(p);
+	await outbox.enqueue(p);
 }
 const pct = (xs: number[], p: number) => (xs.length ? [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(p * xs.length))]! : 0);
 
@@ -72,7 +72,7 @@ const n = Math.min(count, CODES.length);
 const submittedAt = new Map<string, number>();
 const readyAt = new Map<string, number>();
 const addLatency: number[] = [];
-for (let i = 0; i < n; i++) add(payload(i));
+for (let i = 0; i < n; i++) await add(payload(i));
 // A foreign-mission document in the same container: must never be injected.
 await adapter.add(containerTag, `foreign-${runId}`, `Mission other; ${CODES[0]} verdict revision 9: foreign result`, { missionId: "other-mission", episodeId: `ep-${runId}-0-v1`, contractVersion: 1 });
 operations += 1;
@@ -98,7 +98,7 @@ while (Date.now() < deadline) {
 }
 
 // Supersede half the episodes after indexing; v2 is not yet indexed when first asked.
-for (let i = 0; i < n; i += 2) add(payload(i, 2));
+for (let i = 0; i < n; i += 2) await add(payload(i, 2));
 await outbox.drain(Date.now() + 60_000);
 const afterSupersede = await Promise.all(Array.from({ length: n }, (_, i) => ask(i)));
 const afterIndex: Awaited<ReturnType<typeof ask>>[] = [];

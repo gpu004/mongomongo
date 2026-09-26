@@ -152,6 +152,23 @@ export interface SegmentRow {
 	committed: number;
 }
 
+export type OperationKind = "verify" | "exec" | "snapshot" | "memory_upload";
+export type OperationState = "started" | "completed" | "failed" | "abandoned";
+
+/** Intent recorded before external work (sandbox run, verification, upload) so restart can reconcile it. */
+export interface OperationRow {
+	operationId: string;
+	missionId: string;
+	kind: OperationKind;
+	experimentId: string | null;
+	sandboxId: string | null;
+	state: OperationState;
+	detail: string | null;
+	resultRef: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
 export interface EventRow {
 	seq: number;
 	eventKey: string;
@@ -225,6 +242,11 @@ CREATE INDEX IF NOT EXISTS outbox_episode ON outbox(episode_id);
 CREATE INDEX IF NOT EXISTS verification_artifact ON verification(mission_id, artifact_hash, suite);
 CREATE VIRTUAL TABLE IF NOT EXISTS episode_fts USING fts5(episode_id UNINDEXED, mission_id UNINDEXED, summary);
 CREATE VIRTUAL TABLE IF NOT EXISTS episode_fts_vocab USING fts5vocab(episode_fts, row);
+CREATE TABLE IF NOT EXISTS operation (
+  operation_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, kind TEXT NOT NULL, experiment_id TEXT, sandbox_id TEXT,
+  state TEXT NOT NULL, detail TEXT, result_ref TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS operation_state ON operation(mission_id, state);
 CREATE TABLE IF NOT EXISTS learned_scenario (
   scenario_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, lesson_id TEXT NOT NULL, suite_version INTEGER NOT NULL, path TEXT NOT NULL
 );
@@ -670,6 +692,33 @@ export class Ledger {
 			state: r.state as OutboxState, retries: Number(r.retries), nextAttemptAt: String(r.next_attempt_at), lastError: nullableString(r.last_error), updatedAt: String(r.updated_at),
 		}));
 	}
+
+	beginOperation(op: Pick<OperationRow, "operationId" | "missionId" | "kind" | "experimentId" | "sandboxId" | "detail">): void {
+		const at = now();
+		this.db
+			.prepare(
+				`INSERT INTO operation (operation_id, mission_id, kind, experiment_id, sandbox_id, state, detail, result_ref, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, 'started', ?, NULL, ?, ?)
+				 ON CONFLICT(operation_id) DO UPDATE SET state = 'started', sandbox_id = excluded.sandbox_id, detail = excluded.detail, result_ref = NULL, updated_at = excluded.updated_at`,
+			)
+			.run(op.operationId, op.missionId, op.kind, op.experimentId, op.sandboxId, op.detail, at, at);
+	}
+
+	finishOperation(operationId: string, state: Exclude<OperationState, "started">, resultRef: string | null): void {
+		this.db.prepare("UPDATE operation SET state = ?, result_ref = ?, updated_at = ? WHERE operation_id = ?").run(state, resultRef, now(), operationId);
+	}
+
+	getOperation(operationId: string): OperationRow | undefined {
+		const r = this.db.prepare("SELECT * FROM operation WHERE operation_id = ?").get(operationId) as Row | undefined;
+		return r ? toOperation(r) : undefined;
+	}
+
+	listOperations(missionId: string, states?: OperationState[]): OperationRow[] {
+		const rows = (states
+			? this.db.prepare(`SELECT * FROM operation WHERE mission_id = ? AND state IN (${states.map(() => "?").join(",")}) ORDER BY rowid`).all(missionId, ...states)
+			: this.db.prepare("SELECT * FROM operation WHERE mission_id = ? ORDER BY rowid").all(missionId)) as Row[];
+		return rows.map(toOperation);
+	}
 }
 
 function isAlive(pid: number): boolean {
@@ -720,5 +769,13 @@ function toSegment(r: Row): SegmentRow {
 		missionId: String(r.mission_id), ordinal: Number(r.ordinal), sessionPath: nullableString(r.session_path), sessionId: nullableString(r.session_id), checkpointId: nullableString(r.checkpoint_id),
 		startedAt: String(r.started_at), closedAt: nullableString(r.closed_at), firstEventSeq: Number(r.first_event_seq), lastEventSeq: nullableNumber(r.last_event_seq),
 		archiveHash: nullableString(r.archive_hash), committed: Number(r.committed),
+	};
+}
+
+function toOperation(r: Row): OperationRow {
+	return {
+		operationId: String(r.operation_id), missionId: String(r.mission_id), kind: r.kind as OperationKind, experimentId: nullableString(r.experiment_id),
+		sandboxId: nullableString(r.sandbox_id), state: r.state as OperationState, detail: nullableString(r.detail), resultRef: nullableString(r.result_ref),
+		createdAt: String(r.created_at), updatedAt: String(r.updated_at),
 	};
 }

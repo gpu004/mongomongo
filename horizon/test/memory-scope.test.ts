@@ -73,7 +73,7 @@ test("retrieval only injects episodes from this mission's scope with local evide
 	const ours = payload("ep-1", { evidenceIds: [evidence.write("timing", { p95: 1 })] });
 	payloads.set(ours.episodeId, ours);
 	ledger.insertEpisode(row(ours, ours.evidenceIds));
-	outbox.enqueue(ours);
+	await outbox.enqueue(ours);
 	await outbox.drain();
 	await outbox.drain();
 
@@ -105,7 +105,7 @@ test("superseded episodes and episodes whose evidence is gone are filtered out",
 	for (const p of [v1, v2, missing]) {
 		payloads.set(p.episodeId, p);
 		ledger.insertEpisode(row(p, p.evidenceIds));
-		outbox.enqueue(p);
+		await outbox.enqueue(p);
 	}
 	await outbox.drain();
 	const selection = await retrieveEpisodes(adapter, ledger, evidence, SCOPE, "cache normalized documents");
@@ -121,8 +121,8 @@ test("outbox: acceptance is not readiness; retries reuse the same customId; outa
 	const p = payload("ep-retry");
 	payloads.set(p.episodeId, p);
 	ledger.insertEpisode(row(p));
-	const key = outbox.enqueue(p);
-	assert.equal(outbox.enqueue(p), key, "re-enqueue of the same payload is idempotent");
+	const key = await outbox.enqueue(p);
+	assert.equal(await outbox.enqueue(p), key, "re-enqueue of the same payload is idempotent");
 	assert.equal(ledger.listOutbox().length, 1);
 
 	adapter.unavailable = true;
