@@ -3,9 +3,7 @@
   "scenarioId": "update-removes-old-match",
   "suite": "correctness",
   "description": "After an update, the old content no longer matches.",
-  "invariantIds": [
-    "INV-UPDATE-VISIBILITY"
-  ],
+  "invariantIds": ["INV-UPDATE-VISIBILITY"],
   "sequence": [
     {
       "op": "insert",

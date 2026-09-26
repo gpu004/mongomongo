@@ -3,9 +3,7 @@
   "scenarioId": "insert-visible-immediately",
   "suite": "correctness",
   "description": "A document is searchable as soon as the insert response returns; duplicate ids are rejected.",
-  "invariantIds": [
-    "INV-INSERT-VISIBILITY"
-  ],
+  "invariantIds": ["INV-INSERT-VISIBILITY"],
   "sequence": [
     {
       "op": "search",

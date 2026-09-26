@@ -3,10 +3,7 @@
   "scenarioId": "multi-term-substring-match",
   "suite": "correctness",
   "description": "Every term must be a substring of title+' '+body; token boundaries are not required.",
-  "invariantIds": [
-    "INV-SUBSTRING-MATCH",
-    "INV-MULTI-TERM"
-  ],
+  "invariantIds": ["INV-SUBSTRING-MATCH", "INV-MULTI-TERM"],
   "sequence": [
     {
       "op": "insert",

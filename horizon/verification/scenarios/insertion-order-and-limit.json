@@ -3,10 +3,7 @@
   "scenarioId": "insertion-order-and-limit",
   "suite": "correctness",
   "description": "Results are in insertion order and truncated to limit; limit 0 returns nothing.",
-  "invariantIds": [
-    "INV-RESULT-ORDER",
-    "INV-LIMIT"
-  ],
+  "invariantIds": ["INV-RESULT-ORDER", "INV-LIMIT"],
   "sequence": [
     {
       "op": "insert",

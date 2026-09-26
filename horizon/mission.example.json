@@ -6,9 +6,25 @@
   "targetP95Reduction": 0.3,
   "acceptanceMargin": 0.05,
   "requiredImprovedRepetitions": 2,
-  "workload": { "corpusSize": 2000, "seed": 11, "warmupRequests": 50, "measuredRequests": 300, "repetitions": 3, "mutationRatio": 0.05 },
-  "holdoutWorkload": { "corpusSize": 2500, "seed": 97, "warmupRequests": 50, "measuredRequests": 300, "repetitions": 3, "mutationRatio": 0.1 },
-  "ledger": { "backend": "sqlite" },
+  "workload": {
+    "corpusSize": 2000,
+    "seed": 11,
+    "warmupRequests": 50,
+    "measuredRequests": 300,
+    "repetitions": 3,
+    "mutationRatio": 0.05
+  },
+  "holdoutWorkload": {
+    "corpusSize": 2500,
+    "seed": 97,
+    "warmupRequests": 50,
+    "measuredRequests": 300,
+    "repetitions": 3,
+    "mutationRatio": 0.1
+  },
+  "ledger": {
+    "backend": "sqlite"
+  },
   "isolation": "subprocess",
   "containerImage": "node:24-alpine",
   "memoryLimitBytes": 536870912,
@@ -24,7 +40,14 @@
   },
   "segmentRotationCycles": 3,
   "stagnationLimit": 3,
-  "model": { "provider": "anthropic", "id": "claude-sonnet-4-5" },
+  "model": {
+    "provider": "anthropic",
+    "id": "claude-sonnet-4-5"
+  },
   "worker": "scripted",
-  "memory": { "enabled": true, "containerTag": "horizon-search-p95-demo", "materializeCorrections": true }
+  "memory": {
+    "enabled": true,
+    "containerTag": "horizon-search-p95-demo",
+    "materializeCorrections": true
+  }
 }
