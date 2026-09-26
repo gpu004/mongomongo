@@ -10,11 +10,22 @@ import {
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { type TSchema, Type } from "typebox";
 import type { Operation } from "../verification/reference-model.ts";
 import type { Suite } from "../verification/reports.ts";
 import type { ToolBroker } from "./tool-broker.ts";
-import type { SegmentHandle, Worker, WorkerCycleInput, WorkerCycleResult } from "./worker.ts";
+import {
+  providerApiKeyEnv,
+  type SegmentHandle,
+  type Worker,
+  type WorkerCycleInput,
+  type WorkerCycleResult,
+  WorkerUnavailableError,
+} from "./worker.ts";
+
+/** Wake-up delay when a rate-limited provider does not say how long to wait. */
+export const DEFAULT_RATE_LIMIT_RETRY_MS = 60_000;
 
 export interface PiWorkerOptions {
   workspaceDir: string;
@@ -65,6 +76,11 @@ export class PiWorker implements Worker {
     });
     if (this.options.apiKey)
       await modelRuntime.setRuntimeApiKey(this.options.provider, this.options.apiKey);
+    if (!modelRuntime.hasConfiguredAuth(this.options.provider))
+      throw new WorkerUnavailableError(
+        "missing_credential",
+        `no API key for provider ${this.options.provider}; set ${providerApiKeyEnv(this.options.provider)}`,
+      );
     const model = modelRuntime.getModel(this.options.provider, this.options.modelId);
     if (!model) throw new Error(`unknown model ${this.options.provider}/${this.options.modelId}`);
 
@@ -149,9 +165,12 @@ export class PiWorker implements Worker {
     const before = this.session.getSessionStats().tokens;
     let text = "";
     let aborted = false;
+    let retriesExhausted: string | null = null;
     const unsubscribe = this.session.subscribe((event) => {
       if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta")
         text += event.assistantMessageEvent.delta;
+      if (event.type === "auto_retry_end" && !event.success)
+        retriesExhausted = event.finalError ?? "provider error";
     });
     const timer = setTimeout(
       () => {
@@ -170,14 +189,33 @@ export class PiWorker implements Worker {
         .filter((line): line is string => line !== null)
         .join("\n");
       await this.session.prompt(prompt, { expandPromptTemplates: false });
-      const finalMessage = this.session.messages.at(-1);
-      if (finalMessage?.role === "assistant" && finalMessage.stopReason === "error")
-        throw new Error(
-          `Pi model request failed (${this.options.provider}/${this.options.modelId}); inspect the Pi session for details`,
+    } catch (error) {
+      if (error instanceof Error && /^No API key found/.test(error.message))
+        throw new WorkerUnavailableError(
+          "missing_credential",
+          `no API key for provider ${this.options.provider}; set ${providerApiKeyEnv(this.options.provider)}`,
         );
+      throw error;
     } finally {
       clearTimeout(timer);
       unsubscribe();
+    }
+    if (!aborted) {
+      const last = this.session.messages.at(-1);
+      const providerError =
+        last?.role === "assistant" && isRetryableAssistantError(last)
+          ? (last.errorMessage ?? retriesExhausted ?? "provider error")
+          : retriesExhausted;
+      if (providerError)
+        throw new WorkerUnavailableError(
+          "rate_limited",
+          `provider ${this.options.provider} unavailable after in-session retries: ${providerError}`,
+          parseRetryAfterMs(providerError) ?? DEFAULT_RATE_LIMIT_RETRY_MS,
+        );
+      if (last?.role === "assistant" && last.stopReason === "error")
+        throw new Error(
+          `Pi model request failed (${this.options.provider}/${this.options.modelId}); inspect the Pi session for details`,
+        );
     }
     const after = this.session.getSessionStats().tokens;
     const usage = this.session.getContextUsage();
@@ -390,6 +428,20 @@ export class PiWorker implements Worker {
 
 function defineTool<T extends TSchema>(tool: ToolDefinition<T>): ToolDefinition {
   return tool as unknown as ToolDefinition;
+}
+
+/** Best-effort `retry-after` / `retry after N s|ms` extraction from a provider error message. */
+export function parseRetryAfterMs(message: string): number | null {
+  const match =
+    /retry[-_ ]after\D{0,4}(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec(?:onds?)?|m|min(?:utes?)?)?\b/i.exec(
+      message,
+    );
+  if (!match) return null;
+  const value = Number(match[1]);
+  const unit = (match[2] ?? "s").toLowerCase();
+  const scale =
+    unit.startsWith("ms") || unit.startsWith("milli") ? 1 : unit.startsWith("m") ? 60_000 : 1000;
+  return Math.round(value * scale);
 }
 
 function pick(text: string, label: string): string | undefined {
