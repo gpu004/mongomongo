@@ -2,11 +2,11 @@
   "name": "horizon",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "description": "Pi + Supermemory long-running agent harness: verifies, remembers, and materializes corrections.",
   "bin": {
     "horizon": "./src/cli.ts"
   },
-  "type": "module",
   "scripts": {
     "horizon": "node src/cli.ts",
     "check": "tsc --noEmit",
@@ -15,6 +15,9 @@
     "format:check": "oxfmt --check .",
     "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
     "seed:serve": "node demo/search-service/src/http/server.ts"
+  },
+  "engines": {
+    "node": ">=24"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.87.1",
@@ -27,8 +30,5 @@
     "oxfmt": "^0.70.0",
     "oxlint": "^1.85.0",
     "typescript": "5.9.2"
-  },
-  "engines": {
-    "node": ">=24"
   }
 }
