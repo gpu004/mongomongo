@@ -188,6 +188,7 @@ export const OPERATING_FIELDS = [
   "model",
   "worker",
   "memory",
+  "retention",
 ] as const satisfies readonly (keyof MissionConfig)[];
 
 export type OperatingField = (typeof OPERATING_FIELDS)[number];
@@ -212,6 +213,12 @@ export function operatingOf(config: MissionConfig): OperatingParameters {
 /** Hash of the frozen objective only; budgets, model, worker and the ledger backend never change it. */
 export function contractHash(config: MissionConfig): string {
   return sha256(canonicalJson(objectiveOf(config)));
+}
+
+/** Hash frozen by missions created before operating parameters were split out: every field but `ledger`. */
+export function legacyContractHash(config: MissionConfig): string {
+  const { ledger: _ledger, ...contract } = config;
+  return sha256(canonicalJson(contract));
 }
 
 export interface ParameterChange {

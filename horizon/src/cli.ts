@@ -29,7 +29,12 @@ import { readMongoEnv } from "./mongo-env.ts";
 import { probeMongo, renderMongoProbe } from "./mongo-probe.ts";
 import { evaluateLiveGate, exportLiveGate, renderLiveGate } from "./live-gate.ts";
 import { renderMemoryBench, runMemoryBench, type MemoryBenchResult } from "./memory-bench.ts";
-import { contractHash, loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
+import {
+  contractHash,
+  legacyContractHash,
+  loadMissionConfig,
+  type MissionConfig,
+} from "./mission-contract.ts";
 import { FileEvidenceStore, missionPaths, RUNS_ROOT } from "./mission-paths.ts";
 import { PiWorker, resolveProviderApiKey } from "./pi-worker.ts";
 import { exportMission, renderProgress, summarize } from "./progress.ts";
@@ -109,8 +114,14 @@ function driftNotes(manifest: MissionManifest): string[] {
   notes.push(
     contract === manifest.contractHash
       ? `contract ${contract.slice(0, 12)} matches`
-      : `contract ${manifest.contractHash.slice(0, 12)} -> ${contract.slice(0, 12)}: the persisted config no longer hashes to the frozen objective; resume will refuse`,
+      : legacyContractHash(config) === manifest.contractHash
+        ? `contract ${manifest.contractHash.slice(0, 12)} -> ${contract.slice(0, 12)}: frozen before the objective/operating split; resume migrates it and records contract.migrated`
+        : `contract ${manifest.contractHash.slice(0, 12)} -> ${contract.slice(0, 12)}: the persisted config no longer hashes to the frozen objective; resume will refuse`,
   );
+  if (manifest.pendingAmendment)
+    notes.push(
+      `amendment ${manifest.pendingAmendment.amendmentId} pending: resume adopts it if the ledger holds it, else discards it`,
+    );
   const evaluator = computeEvaluatorHash();
   notes.push(
     evaluator === manifest.evaluatorHash

@@ -1,21 +1,24 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { computeEvaluatorHash, environmentFingerprint } from "../verification/runner.ts";
 import {
   type ControllerOptions,
   MissionController,
   type MissionManifest,
+  SimulatedCrash,
 } from "../src/controller.ts";
 import { LocalMemoryAdapter } from "../src/memory-adapter.ts";
 import {
   contractHash,
   diffParameters,
+  legacyContractHash,
   objectiveOf,
   OPERATING_FIELDS,
   planAmendment,
 } from "../src/mission-contract.ts";
-import { missionPaths } from "../src/mission-paths.ts";
+import { missionPaths, writeJsonAtomic } from "../src/mission-paths.ts";
 import { classifyEnvironmentDrift } from "../src/recovery.ts";
 import { controllerFor, tempRunsRoot, testConfig } from "./helpers.ts";
 
@@ -56,6 +59,7 @@ test("contract hash covers the frozen objective only; operating parameters and t
       segmentRotationCycles: base.segmentRotationCycles + 1,
       stagnationLimit: base.stagnationLimit + 1,
       memory: { ...base.memory, enabled: !base.memory.enabled },
+      retention: { keepRecentCandidates: 1, keepRecentSegments: 1, compactEventsAfter: 1 },
       ledger: { backend: "mongodb" },
     }),
     hash,
@@ -291,6 +295,7 @@ test("evaluator drift is refused on resume until an explicit rebaseline re-measu
   const tasks = await rebaseliner.ledger.listTasks(id);
   assert.equal(tasks.find((t) => t.taskId === "baseline")?.status, "done");
   assert.equal(tasks.find((t) => t.taskId === "holdout")?.status, "pending");
+  assert.deepEqual(await rebaseliner.rebaseline(), outcome, "a completed rebaseline is a no-op");
   await rebaseliner.close();
 
   const manifest = readManifest(id, runs);
@@ -302,4 +307,257 @@ test("evaluator drift is refused on resume until an explicit rebaseline re-measu
   assert.equal(row.evaluatorHash, computeEvaluatorHash());
   assert.ok(["succeeded", "budget_exhausted", "blocked"].includes(row.status));
   await resumed.close();
+});
+
+test("rebaseline after an invalidating runtime change re-measures baseline, best and holdout under the new identity; old reports are never reused", async () => {
+  const runs = tempRunsRoot();
+  const id = "amend-rebase-identity";
+  const first = controllerFor(id, runs, { host: HOST });
+  await first.initialize();
+  const done = await first.run();
+  assert.equal(done.status, "succeeded");
+  const oldEnvironment = done.environmentHash;
+  const oldReports = await first.ledger.listVerifications(id);
+  assert.ok(oldReports.every((v) => v.environmentHash === oldEnvironment));
+  await first.close();
+
+  const moved = { ...HOST, arch: HOST.arch === "arm64" ? "x64" : "arm64" };
+  const refused = resumeFromManifest(id, runs, { host: moved });
+  await assert.rejects(refused.run(), /environment drift invalidates[\s\S]*rebaseline/);
+  await refused.close();
+
+  const rebaseliner = resumeFromManifest(id, runs, { host: moved });
+  const newEnvironment = rebaseliner.environmentHash;
+  assert.notEqual(newEnvironment, oldEnvironment);
+  const outcome = await rebaseliner.rebaseline();
+  assert.equal(outcome.environmentHash.to, newEnvironment);
+  assert.equal(outcome.previousBest, done.bestArtifactHash);
+  const measured = await rebaseliner.mission();
+  assert.equal(measured.environmentHash, newEnvironment);
+  assert.ok(measured.baselineP95Ms !== null);
+  const reports = await rebaseliner.ledger.listVerifications(id);
+  const fresh = reports.filter((v) => v.environmentHash === newEnvironment);
+  const seed = measured.seedArtifactHash!;
+  assert.ok(
+    fresh.some((v) => v.artifactHash === seed && v.suite === "performance"),
+    "seed re-measured under the new identity",
+  );
+  if (outcome.previousBest && outcome.previousBest !== seed)
+    assert.ok(
+      fresh.some((v) => v.artifactHash === outcome.previousBest && v.suite === "performance"),
+      "previous best re-measured under the new identity",
+    );
+  assert.equal(reports.length, oldReports.length + fresh.length, "old reports kept as history");
+  const experiments = await rebaseliner.ledger.listExperiments(id);
+  const baselines = experiments.filter((e) => e.taskId === "baseline").map((e) => e.experimentId);
+  assert.deepEqual(baselines.sort(), [
+    `exp-baseline-${id}`,
+    `exp-baseline-${id}-${computeEvaluatorHash().slice(0, 12)}-${newEnvironment.slice(0, 12)}`,
+  ]);
+  assert.equal(
+    (await rebaseliner.ledger.listTasks(id)).find((t) => t.taskId === "holdout")?.status,
+    "pending",
+  );
+  await rebaseliner.close();
+
+  const resumed = resumeFromManifest(id, runs, { host: moved });
+  const row = await resumed.run();
+  assert.equal(row.status, "succeeded");
+  const holdouts = (await resumed.ledger.listVerifications(id)).filter(
+    (v) => v.suite === "holdout",
+  );
+  assert.ok(holdouts.some((v) => v.environmentHash === oldEnvironment));
+  assert.ok(
+    holdouts.some(
+      (v) => v.environmentHash === newEnvironment && v.artifactHash === row.bestArtifactHash,
+    ),
+    "holdout re-run on the best artifact under the new identity",
+  );
+  await resumed.close();
+  const manifest = readManifest(id, runs);
+  assert.equal(manifest.environmentHash, newEnvironment);
+  assert.equal(manifest.environment.arch, moved.arch);
+});
+
+test("an interrupted rebaseline is retried from the ledger instead of being mistaken for complete", async () => {
+  const runs = tempRunsRoot();
+  const id = "amend-rebase-retry";
+  const first = controllerFor(id, runs, { host: HOST });
+  await first.initialize();
+  const done = await first.run();
+  assert.equal(done.status, "succeeded");
+  await first.close();
+
+  const moved = { ...HOST, arch: HOST.arch === "arm64" ? "x64" : "arm64" };
+  const crashing = resumeFromManifest(id, runs, {
+    host: moved,
+    crashAt: "report-written:fixed:performance",
+  });
+  await assert.rejects(crashing.rebaseline(), SimulatedCrash);
+  const torn = await crashing.mission();
+  assert.equal(torn.environmentHash, crashing.environmentHash);
+  assert.equal(torn.baselineP95Ms, null);
+  await crashing.close();
+
+  const retry = resumeFromManifest(id, runs, { host: moved });
+  const outcome = await retry.rebaseline();
+  assert.ok(outcome.baselineP95Ms !== null, "retry measured the baseline");
+  assert.equal(outcome.previousBest, done.bestArtifactHash);
+  assert.equal(outcome.environmentHash.from, done.environmentHash);
+  const mission = await retry.mission();
+  assert.equal(mission.baselineP95Ms, outcome.baselineP95Ms);
+  assert.equal(mission.bestArtifactHash, outcome.bestArtifactHash);
+  const events = await retry.ledger.eventsSince(0, 10_000);
+  assert.equal(events.filter((e) => e.type === "evaluator.rebaselined").length, 1);
+  await retry.close();
+});
+
+test("a crash after the amendment commits but before the manifest is rewritten is reconciled from the ledger on restart", async () => {
+  const runs = tempRunsRoot();
+  const id = "amend-crash";
+  const small = { ...testConfig(id).budget, maxExperiments: 1 };
+  const first = controllerFor(id, runs, {}, { budget: small });
+  await first.initialize();
+  assert.equal((await first.run()).status, "budget_exhausted");
+  await first.close();
+
+  const crashing = resumeFromManifest(id, runs, { crashAt: "amendment_committed" });
+  await assert.rejects(
+    crashing.amend(testConfig(id, { budget: { ...small, maxExperiments: 3 } })),
+    SimulatedCrash,
+  );
+  assert.equal((await crashing.mission()).status, "ready");
+  await crashing.close();
+  const torn = readManifest(id, runs);
+  assert.equal(torn.config.budget.maxExperiments, 1, "manifest still carries the old config");
+  assert.equal(torn.pendingAmendment?.config.budget.maxExperiments, 3);
+  const reader = resumeFromManifest(id, runs);
+  await reader.open();
+  const payload = (await reader.ledger.findEvent(torn.pendingAmendment!.eventKey))!.payload as {
+    operating: { budget: { maxExperiments: number } };
+  };
+  assert.equal(payload.operating.budget.maxExperiments, 3);
+  await reader.close();
+
+  const restarted = resumeFromManifest(id, runs);
+  const row = await restarted.run();
+  assert.equal(restarted.config.budget.maxExperiments, 3);
+  assert.ok(row.spentExperiments > 1, `resumed with the amended budget (${row.spentExperiments})`);
+  await restarted.close();
+  const healed = readManifest(id, runs);
+  assert.equal(healed.config.budget.maxExperiments, 3);
+  assert.equal(healed.pendingAmendment, undefined);
+});
+
+test("a pending amendment whose event never reached the ledger is discarded on restart", async () => {
+  const runs = tempRunsRoot();
+  const id = "amend-torn";
+  const first = controllerFor(id, runs);
+  await first.initialize();
+  await first.close();
+  const manifest = readManifest(id, runs);
+  writeJsonAtomic(missionPaths(id, runs).manifest, {
+    ...manifest,
+    pendingAmendment: {
+      amendmentId: "deadbeef",
+      eventKey: `mission:${id}:amended:deadbeef`,
+      config: { ...manifest.config, budget: { ...manifest.config.budget, maxExperiments: 99 } },
+    },
+  });
+  const restarted = resumeFromManifest(id, runs);
+  await restarted.amend(manifest.config);
+  assert.equal(restarted.config.budget.maxExperiments, manifest.config.budget.maxExperiments);
+  await restarted.close();
+  assert.equal(readManifest(id, runs).pendingAmendment, undefined);
+});
+
+test("a mission frozen with the legacy full-config hash is migrated once, audited as contract.migrated", async () => {
+  const runs = tempRunsRoot();
+  const id = "amend-legacy";
+  const first = controllerFor(id, runs);
+  await first.initialize();
+  const manifest = readManifest(id, runs);
+  const legacy = legacyContractHash(manifest.config);
+  assert.notEqual(legacy, manifest.contractHash);
+  await first.ledger.updateMission(id, { contractHash: legacy });
+  await first.close();
+  const { environment: _environment, ...legacyManifest } = manifest;
+  writeJsonAtomic(missionPaths(id, runs).manifest, { ...legacyManifest, contractHash: legacy });
+
+  const stranger = resumeFromManifest(id, runs);
+  await stranger.open();
+  await stranger.ledger.updateMission(id, { contractHash: "0".repeat(64) });
+  await assert.rejects(stranger.run(), /contract hash drift/);
+  await stranger.ledger.updateMission(id, { contractHash: legacy });
+  await stranger.close();
+
+  const migrated = resumeFromManifest(id, runs);
+  const row = await migrated.run();
+  assert.equal(row.contractHash, contractHash(manifest.config));
+  const events = await migrated.ledger.eventsSince(0, 10_000);
+  const migration = events.filter((e) => e.type === "contract.migrated");
+  assert.equal(migration.length, 1);
+  assert.deepEqual((migration[0]!.payload as { from: string; to: string }).from, legacy);
+  await migrated.close();
+  const after = readManifest(id, runs);
+  assert.equal(after.contractHash, row.contractHash);
+  assert.equal(contractHash(after.config), after.contractHash);
+
+  const again = resumeFromManifest(id, runs);
+  await again.run();
+  assert.equal(
+    (await again.ledger.eventsSince(0, 10_000)).filter((e) => e.type === "contract.migrated")
+      .length,
+    1,
+  );
+  await again.close();
+});
+
+test("retention is an operating policy: amending it onto a frozen mission compacts events on the next resume", async () => {
+  const runs = tempRunsRoot();
+  const id = "amend-retention";
+  const first = controllerFor(
+    id,
+    runs,
+    {},
+    { budget: { ...testConfig(id).budget, maxExperiments: 1 } },
+  );
+  await first.initialize();
+  assert.equal((await first.run()).status, "budget_exhausted");
+  const eventsBefore = (await first.ledger.eventsSince(0, 10_000)).length;
+  assert.ok(eventsBefore > 5);
+  await first.close();
+
+  const before = readManifest(id, runs);
+  assert.equal(before.config.retention, undefined);
+  const amender = resumeFromManifest(id, runs);
+  const retention = { keepRecentCandidates: 2, keepRecentSegments: 1, compactEventsAfter: 2 };
+  const plan = await amender.amend(testConfig(id, { budget: before.config.budget, retention }));
+  assert.deepEqual(plan.changes, [{ path: "retention", from: undefined, to: retention }]);
+  assert.equal((await amender.mission()).contractHash, before.contractHash);
+  await amender.close();
+  const after = readManifest(id, runs);
+  assert.deepEqual(after.config.retention, retention);
+  assert.equal(after.contractHash, before.contractHash);
+
+  const resumed = resumeFromManifest(id, runs);
+  await resumed.run();
+  assert.ok(
+    await resumed.ledger.findEvent(`mission:${id}:created`),
+    "compacted events stay findable",
+  );
+  const lastSeq = await resumed.ledger.lastEventSeq();
+  await resumed.close();
+  const db = new DatabaseSync(missionPaths(id, runs).db, { readOnly: true });
+  try {
+    const live = db.prepare("SELECT COUNT(*) AS n FROM event").get() as { n: number };
+    const archived = db
+      .prepare("SELECT COALESCE(MAX(through_seq), 0) AS seq FROM event_snapshot")
+      .get() as { seq: number };
+    assert.ok(archived.seq > 0, "events before the cutoff were moved into snapshots");
+    assert.ok(live.n <= retention.compactEventsAfter + 1 && live.n < eventsBefore);
+    assert.ok(lastSeq >= archived.seq);
+  } finally {
+    db.close();
+  }
 });

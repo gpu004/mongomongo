@@ -48,7 +48,9 @@ import { composeRetrievalQuery, MemoryOutbox, retrieveEpisodes } from "./memory-
 import {
   type Amendment,
   contractHash,
+  legacyContractHash,
   type MissionConfig,
+  operatingOf,
   planAmendment,
 } from "./mission-contract.ts";
 import {
@@ -108,6 +110,25 @@ export interface MissionManifest {
   seedArtifactHash: string;
   ledgerBackend: string;
   config: MissionConfig;
+  /** An amendment written to the ledger but not yet reflected in `config`; see `reconcileAmendment`. */
+  pendingAmendment?: PendingAmendment;
+}
+
+export interface PendingAmendment {
+  amendmentId: string;
+  eventKey: string;
+  config: MissionConfig;
+}
+
+/** Payload of `evaluator.rebaselined`: what the mission looked like when the rebaseline began. */
+interface RebaselineStart {
+  evaluatorHash: { from: string; to: string };
+  environmentHash: { from: string; to: string };
+  environment: EnvironmentFingerprint;
+  previousBaselineP95Ms: number | null;
+  previousBestArtifactHash: string | null;
+  previousBestP95Ms: number | null;
+  previousStatus: string;
 }
 
 export interface RebaselineOutcome {
@@ -380,9 +401,10 @@ export class MissionController {
   }
 
   /** Rewrites the manifest so it mirrors the ledger's identities and the current config. */
-  private syncManifest(mission: MissionRow): void {
+  private syncManifest(mission: MissionRow, pendingAmendment?: PendingAmendment): void {
     const previous = this.readManifest();
     this.writeManifest({
+      ...(pendingAmendment ? { pendingAmendment } : {}),
       missionId: mission.missionId,
       contractHash: mission.contractHash,
       evaluatorHash: mission.evaluatorHash,
@@ -395,6 +417,48 @@ export class MissionController {
       ledgerBackend: this.ledger.backend,
       config: { ...this.config, ledger: { backend: this.ledger.backend } },
     });
+  }
+
+  /**
+   * Closes the crash window between an amendment's ledger commit and its
+   * manifest rewrite. The manifest is marked with the pending config before
+   * the commit; on restart the ledger decides: if the amendment event is
+   * durable the pending config is adopted, otherwise the marker is dropped.
+   * Also migrates missions frozen before the contract hash was narrowed to
+   * the objective, guarded by equality to the legacy hash of the persisted config.
+   */
+  private async reconcileAmendment(): Promise<void> {
+    const manifest = this.readManifest();
+    if (!manifest) return;
+    const mission = await this.mission();
+    let dirty = false;
+    if (manifest.pendingAmendment) {
+      const { amendmentId, eventKey, config } = manifest.pendingAmendment;
+      if (await this.ledger.findEvent(eventKey)) {
+        this.currentConfig = { ...config, ledger: { backend: this.ledger.backend } };
+        this.log(`recovery: amendment ${amendmentId} committed; manifest reconciled from ledger`);
+      } else this.log(`recovery: amendment ${amendmentId} never committed; discarded`);
+      dirty = true;
+    }
+    if (
+      mission.contractHash !== this.contractHash &&
+      mission.contractHash === legacyContractHash(manifest.config)
+    ) {
+      await this.transaction(async (tx) => {
+        await tx.appendEvent(
+          `mission:${this.config.missionId}:contract-migrated:${mission.contractHash}`,
+          "contract.migrated",
+          this.config.missionId,
+          { from: mission.contractHash, to: this.contractHash, reason: "objective-only hash" },
+        );
+        await tx.updateMission(this.config.missionId, { contractHash: this.contractHash });
+      });
+      this.log(
+        `recovery: contract hash migrated ${mission.contractHash.slice(0, 12)} -> ${this.contractHash.slice(0, 12)} (objective-only)`,
+      );
+      dirty = true;
+    }
+    if (dirty) this.syncManifest(await this.mission());
   }
 
   /**
@@ -411,39 +475,39 @@ export class MissionController {
       throw new Error(
         `amendment is for mission ${next.missionId}, not ${this.config.missionId}; start a new mission instead`,
       );
-    const amendment = planAmendment(this.config, next);
     await this.open();
-    const mission = await this.mission();
-    if (mission.contractHash !== this.contractHash)
-      throw new Error(
-        `contract hash drift: ledger ${mission.contractHash.slice(0, 12)} vs manifest ${this.contractHash.slice(0, 12)}`,
-      );
-    if (amendment.changes.length === 0) {
-      this.log("amend: no operating parameter differs; nothing recorded");
-      return amendment;
-    }
     await this.claimLease();
     try {
+      await this.reconcileAmendment();
+      const amendment = planAmendment(this.config, next);
+      const mission = await this.mission();
+      if (mission.contractHash !== this.contractHash)
+        throw new Error(
+          `contract hash drift: ledger ${mission.contractHash.slice(0, 12)} vs manifest ${this.contractHash.slice(0, 12)}`,
+        );
+      if (amendment.changes.length === 0) {
+        this.log("amend: no operating parameter differs; nothing recorded");
+        return amendment;
+      }
       const amendedAt = new Date().toISOString();
       const amendmentId = sha256(canonicalJson({ changes: amendment.changes, amendedAt })).slice(
         0,
         16,
       );
+      const eventKey = `mission:${this.config.missionId}:amended:${amendmentId}`;
+      const amended: MissionConfig = { ...next, ledger: { backend: this.ledger.backend } };
       const reopened =
         mission.status === "budget_exhausted" && amendment.budgetExtensions.length > 0;
+      this.syncManifest(mission, { amendmentId, eventKey, config: amended });
       await this.transaction(async (tx) => {
-        await tx.appendEvent(
-          `mission:${this.config.missionId}:amended:${amendmentId}`,
-          "mission.amended",
-          this.config.missionId,
-          {
-            amendmentId,
-            contractHash: this.contractHash,
-            changes: amendment.changes,
-            previousStatus: mission.status,
-            status: reopened ? "ready" : mission.status,
-          },
-        );
+        await tx.appendEvent(eventKey, "mission.amended", this.config.missionId, {
+          amendmentId,
+          contractHash: this.contractHash,
+          changes: amendment.changes,
+          operating: operatingOf(amended),
+          previousStatus: mission.status,
+          status: reopened ? "ready" : mission.status,
+        });
         for (const extension of amendment.budgetExtensions)
           await tx.appendEvent(
             `mission:${this.config.missionId}:budget-extended:${amendmentId}:${extension.path}`,
@@ -454,7 +518,8 @@ export class MissionController {
         if (reopened)
           await tx.updateMission(this.config.missionId, { status: "ready", nextWakeAt: null });
       });
-      this.currentConfig = { ...next, ledger: { backend: this.ledger.backend } };
+      this.crash("amendment_committed");
+      this.currentConfig = amended;
       this.syncManifest(await this.mission());
       for (const change of amendment.changes)
         this.log(
@@ -479,30 +544,59 @@ export class MissionController {
     await this.open();
     await this.claimLease();
     try {
+      await this.reconcileAmendment();
       const before = await this.mission();
       if (before.contractHash !== this.contractHash)
         throw new Error(
           `contract hash drift: ledger ${before.contractHash.slice(0, 12)} vs manifest ${this.contractHash.slice(0, 12)}; the frozen objective cannot be rebaselined`,
         );
+      const seed = before.seedArtifactHash;
+      if (!seed) throw new Error("mission has no seed artifact");
+      const rebaselineId = this.identityScope;
+      const rebaselineKey = `mission:${this.config.missionId}:rebaselined:${rebaselineId}`;
+      const started = (await this.ledger.findEvent(rebaselineKey))?.payload as
+        | RebaselineStart
+        | undefined;
       const drifted =
         before.evaluatorHash !== this.evaluatorHash ||
         before.environmentHash !== this.environmentHash;
-      const outcome: RebaselineOutcome = {
+      const origin: RebaselineStart = started ?? {
         evaluatorHash: { from: before.evaluatorHash, to: this.evaluatorHash },
         environmentHash: { from: before.environmentHash, to: this.environmentHash },
-        baselineP95Ms: before.baselineP95Ms,
-        previousBest: before.bestArtifactHash,
-        bestArtifactHash: before.bestArtifactHash ?? before.seedArtifactHash ?? "",
-        bestRetained: true,
+        environment: this.environment,
+        previousBaselineP95Ms: before.baselineP95Ms,
+        previousBestArtifactHash: before.bestArtifactHash,
+        previousBestP95Ms: before.bestP95Ms,
+        previousStatus: before.status,
       };
-      if (!drifted) {
+      const previousBest = origin.previousBestArtifactHash;
+      const remeasureId =
+        previousBest && previousBest !== seed
+          ? `exp-rebaseline-${this.config.missionId}-${previousBest.slice(0, 12)}-${rebaselineId}`
+          : null;
+      const outcome: RebaselineOutcome = {
+        evaluatorHash: origin.evaluatorHash,
+        environmentHash: origin.environmentHash,
+        baselineP95Ms: before.baselineP95Ms,
+        previousBest,
+        bestArtifactHash: before.bestArtifactHash ?? seed,
+        bestRetained: before.bestArtifactHash === previousBest,
+      };
+      if (!drifted && !started) {
         this.log("rebaseline: evaluator and environment match the frozen mission; nothing to do");
         return outcome;
       }
+      if (
+        !drifted &&
+        before.baselineP95Ms !== null &&
+        (!remeasureId || (await this.ledger.findEvent(`${remeasureId}:remeasured`)))
+      ) {
+        this.log(`rebaseline: ${rebaselineId} already complete; nothing to do`);
+        return outcome;
+      }
+      if (started)
+        this.log(`rebaseline: ${rebaselineId} was interrupted; re-measuring from the ledger`);
       if (this.config.isolation === "container") assertSandboxAvailable(this.config.containerImage);
-      const seed = before.seedArtifactHash;
-      if (!seed) throw new Error("mission has no seed artifact");
-      const rebaselineId = `${this.evaluatorHash.slice(0, 12)}-${this.environmentHash.slice(0, 12)}`;
       await this.transaction(async (tx) => {
         await tx.updateMission(this.config.missionId, {
           evaluatorHash: this.evaluatorHash,
@@ -516,35 +610,23 @@ export class MissionController {
         });
         await tx.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "pending" });
         await tx.upsertTask({ ...TASKS[2]!, missionId: this.config.missionId, status: "pending" });
-        await tx.appendEvent(
-          `mission:${this.config.missionId}:rebaselined:${rebaselineId}`,
-          "evaluator.rebaselined",
-          this.config.missionId,
-          {
-            evaluatorHash: outcome.evaluatorHash,
-            environmentHash: outcome.environmentHash,
-            environment: this.environment,
-            previousBaselineP95Ms: before.baselineP95Ms,
-            previousBestArtifactHash: before.bestArtifactHash,
-            previousBestP95Ms: before.bestP95Ms,
-            previousStatus: before.status,
-          },
-        );
+        if (previousBest && before.bestArtifactHash !== seed)
+          await tx.updateMission(this.config.missionId, { bestArtifactHash: seed });
+        await tx.appendEvent(rebaselineKey, "evaluator.rebaselined", this.config.missionId, origin);
         await this.checkpoint(tx, "ready", "baseline", null, `rebaselined:${rebaselineId}`);
       });
       this.syncManifest(await this.mission());
       this.log(
-        `rebaseline: evaluator ${before.evaluatorHash.slice(0, 12)} -> ${this.evaluatorHash.slice(0, 12)}, env ${before.environmentHash.slice(0, 12)} -> ${this.environmentHash.slice(0, 12)}`,
+        `rebaseline: evaluator ${origin.evaluatorHash.from.slice(0, 12)} -> ${this.evaluatorHash.slice(0, 12)}, env ${origin.environmentHash.from.slice(0, 12)} -> ${this.environmentHash.slice(0, 12)}`,
       );
 
       await this.runBaseline();
       const measured = await this.mission();
       outcome.baselineP95Ms = measured.baselineP95Ms;
       outcome.bestArtifactHash = seed;
-      outcome.bestRetained = before.bestArtifactHash === null || before.bestArtifactHash === seed;
-      const previousBest = before.bestArtifactHash;
-      if (previousBest && previousBest !== seed) {
-        const experimentId = `exp-rebaseline-${this.config.missionId}-${previousBest.slice(0, 12)}-${rebaselineId}`;
+      outcome.bestRetained = previousBest === null || previousBest === seed;
+      if (previousBest && remeasureId) {
+        const experimentId = remeasureId;
         if (!(await this.ledger.getExperiment(experimentId))) {
           await this.ledger.insertExperiment({
             experimentId,
@@ -711,6 +793,7 @@ export class MissionController {
     await this.open();
     await this.claimLease();
     try {
+      await this.reconcileAmendment();
       if (this.config.isolation === "container") {
         // Fail before any work is scheduled; the sandbox is never silently replaced by the host.
         const sandbox = assertSandboxAvailable(this.config.containerImage);
@@ -902,11 +985,35 @@ export class MissionController {
     this.log(`mission ${status}${detail ? `: ${detail}` : ""}`);
   }
 
+  /** `<evaluator>-<environment>` of this process; names everything a rebaseline re-measures. */
+  private get identityScope(): string {
+    return `${this.evaluatorHash.slice(0, 12)}-${this.environmentHash.slice(0, 12)}`;
+  }
+
+  /**
+   * Fixed-task experiments (baseline, holdout) are named per verification identity so a
+   * rebaseline never finds, or collides with, reports measured by an earlier evaluator or
+   * runtime. The identity the mission was created under keeps the unsuffixed names.
+   */
+  private async identitySuffix(): Promise<string> {
+    const created = await this.ledger.findEvent(`mission:${this.config.missionId}:created`);
+    const origin = created?.payload as
+      | { evaluatorHash?: string; environmentHash?: string }
+      | undefined;
+    if (
+      !origin ||
+      (origin.evaluatorHash === this.evaluatorHash &&
+        origin.environmentHash === this.environmentHash)
+    )
+      return "";
+    return `-${this.identityScope}`;
+  }
+
   private async runBaseline(): Promise<void> {
     const mission = await this.mission();
     const seed = mission.seedArtifactHash;
     if (!seed) throw new Error("mission has no seed artifact");
-    const experimentId = `exp-baseline-${this.config.missionId}`;
+    const experimentId = `exp-baseline-${this.config.missionId}${await this.identitySuffix()}`;
     if (!(await this.ledger.getExperiment(experimentId))) {
       await this.ledger.insertExperiment({
         experimentId,
@@ -1034,7 +1141,7 @@ export class MissionController {
     const mission = await this.mission();
     const best = mission.bestArtifactHash;
     if (!best) throw new Error("no best artifact");
-    const experimentId = `exp-holdout-${this.config.missionId}-${best.slice(0, 12)}`;
+    const experimentId = `exp-holdout-${this.config.missionId}-${best.slice(0, 12)}${await this.identitySuffix()}`;
     if (!(await this.ledger.getExperiment(experimentId))) {
       await this.ledger.insertExperiment({
         experimentId,
@@ -1442,7 +1549,9 @@ export class MissionController {
         (v) =>
           v.suite === "performance" &&
           v.status === "passed" &&
-          v.artifactHash === mission.bestArtifactHash,
+          v.artifactHash === mission.bestArtifactHash &&
+          v.evaluatorHash === mission.evaluatorHash &&
+          v.environmentHash === mission.environmentHash,
       )
       .at(-1);
     if (!row || !existsSync(row.path)) return undefined;
@@ -1586,7 +1695,12 @@ export class MissionController {
     suite: Suite,
   ): Promise<VerificationReport> {
     const existing = await this.ledger.findVerification(experimentId, hash, suite);
-    if (existing && existsSync(existing.path)) {
+    if (
+      existing &&
+      existing.evaluatorHash === this.evaluatorHash &&
+      existing.environmentHash === this.environmentHash &&
+      existsSync(existing.path)
+    ) {
       const parsed = JSON.parse(readFileSync(existing.path, "utf8")) as VerificationReport;
       if (parsed.status === "passed" || parsed.status === "failed") return parsed;
     }

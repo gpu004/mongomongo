@@ -100,7 +100,12 @@ Node major change under subprocess isolation (the candidate runs on the host). A
 refused. Both point to `rebaseline --mission`, which adopts the current evaluator and runtime, re-measures
 the seed (new baseline and acceptance margin), re-measures the previous best against it (kept only if it
 still clears the margin, otherwise the seed becomes the best), resets the holdout, and records
-`evaluator.rebaselined`. Earlier reports stay in the ledger as history under their own hashes.
+`evaluator.rebaselined`. Earlier reports stay in the ledger as history under their own hashes and are
+never reused: baseline, holdout and re-measurement experiments are named per evaluator+environment
+identity, and a stored report is only reused when it cites the current hashes. A rebaseline that fails or
+is interrupted after `evaluator.rebaselined` is committed is retried from the ledger on the next
+`rebaseline` (it is only a no-op once the baseline and the previous best are measured under the new
+identity).
 
 ## Layout
 
