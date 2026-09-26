@@ -18,6 +18,8 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 npm install
 npm run check          # tsc --noEmit
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget
+npm run lint           # oxlint
+npm run format:check   # oxfmt
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
 
@@ -41,6 +43,22 @@ node scripts/supermemory-probe.ts --episodes 12            # hosted memory: inde
 
 Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artifacts/<hash>/`
 (immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`.
+
+To exercise the live Pi worker with the low-cost `google/gemini-2.5-flash-lite` model,
+provide `GOOGLE_API_KEY` in the environment and use the bounded mission example:
+
+```sh
+npm run horizon -- mission create --config mission.pi.example.json
+npm run horizon -- run --mission search-p95-flash-lite --cycles 1
+npm run horizon -- inspect --mission search-p95-flash-lite
+npm run horizon -- export --mission search-p95-flash-lite
+```
+
+The live example limits wall time to 10 minutes, experiments to 2, input tokens to 80,000,
+and output tokens to 10,000. The `--cycles 1` command makes a single worker attempt;
+`resume` can continue the mission within the configured budget. A run may exit with
+status 2 when the objective has not yet been met; inspect the verifier evidence to
+distinguish that from a model or infrastructure failure.
 
 ## Layout
 

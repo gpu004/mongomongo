@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "missionId": "search-p95-flash-lite",
+  "contractVersion": 1,
+  "objective": "Reduce p95 latency of GET /search on the fixed read-heavy workload by 30% without violating the search contract.",
+  "targetP95Reduction": 0.3,
+  "acceptanceMargin": 0.05,
+  "requiredImprovedRepetitions": 2,
+  "workload": {
+    "corpusSize": 2000,
+    "seed": 11,
+    "warmupRequests": 50,
+    "measuredRequests": 300,
+    "repetitions": 3,
+    "mutationRatio": 0.05
+  },
+  "holdoutWorkload": {
+    "corpusSize": 2500,
+    "seed": 97,
+    "warmupRequests": 50,
+    "measuredRequests": 300,
+    "repetitions": 3,
+    "mutationRatio": 0.1
+  },
+  "isolation": "subprocess",
+  "containerImage": "node:24-alpine",
+  "memoryLimitBytes": 536870912,
+  "startupTimeoutMs": 15000,
+  "requestTimeoutMs": 5000,
+  "budget": {
+    "maxWallMs": 600000,
+    "maxExperiments": 2,
+    "maxInputTokens": 80000,
+    "maxOutputTokens": 10000,
+    "maxMemoryOperations": 30,
+    "cycleTimeoutMs": 180000
+  },
+  "segmentRotationCycles": 2,
+  "stagnationLimit": 2,
+  "model": { "provider": "google", "id": "gemini-2.5-flash-lite" },
+  "worker": "pi",
+  "memory": {
+    "enabled": true,
+    "containerTag": "horizon-search-p95-flash-lite",
+    "materializeCorrections": true
+  }
+}
