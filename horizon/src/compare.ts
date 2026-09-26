@@ -1,9 +1,9 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MissionController, SimulatedCrash } from "./controller.ts";
-import { LocalMemoryAdapter } from "./memory-adapter.ts";
+import { LocalMemoryAdapter, type MemoryAdapter, SupermemoryAdapter } from "./memory-adapter.ts";
 import type { MissionConfig } from "./mission-contract.ts";
-import { missionPaths, writeJsonAtomic } from "./mission-paths.ts";
+import { type MissionPaths, missionPaths, writeJsonAtomic } from "./mission-paths.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
 import type { Worker } from "./worker.ts";
 
@@ -27,7 +27,18 @@ export interface CompareOptions {
   /** Same schedule applied to every configuration: each entry is one controller launch. */
   interruptions: InterruptionStep[];
   repeats: number;
-  workerFactory?: (configuration: Configuration) => Worker;
+  /**
+   * Builds the worker for one derived mission. Required when `base.worker` is
+   * not "scripted": the comparison never substitutes the scripted worker for
+   * a configured live worker.
+   */
+  workerFactory?: (
+    configuration: Configuration,
+    config: MissionConfig,
+    paths: MissionPaths,
+  ) => Worker;
+  /** Builds the memory adapter shared by every launch of one derived mission. */
+  memoryFactory?: (configuration: Configuration, config: MissionConfig) => MemoryAdapter;
   log?: (line: string) => void;
 }
 
@@ -56,6 +67,8 @@ export interface MissionMeasurement {
 }
 
 export interface CompareResult {
+  worker: MissionConfig["worker"];
+  memoryAdapter: MemoryAdapter["kind"];
   schedule: InterruptionStep[];
   seedHash: string | null;
   evaluatorHash: string | null;
@@ -71,7 +84,6 @@ function configure(
   return {
     ...base,
     missionId,
-    worker: "scripted",
     memory: {
       ...base.memory,
       enabled,
@@ -79,6 +91,12 @@ function configure(
       materializeCorrections: configuration === "durable+retrieval+correction",
     },
   };
+}
+
+/** Same choice the controller makes for `horizon run`: hosted adapter only when memory is enabled and a key is present. */
+export function defaultMemoryAdapter(config: MissionConfig): MemoryAdapter {
+  const key = process.env.SUPERMEMORY_API_KEY;
+  return config.memory.enabled && key ? new SupermemoryAdapter(key) : new LocalMemoryAdapter();
 }
 
 /**
@@ -89,7 +107,15 @@ function configure(
  */
 export async function compareConfigurations(options: CompareOptions): Promise<CompareResult> {
   const log = options.log ?? (() => {});
+  if (options.base.worker !== "scripted" && !options.workerFactory)
+    throw new Error(
+      `compare: config requests worker "${options.base.worker}" but no workerFactory was provided`,
+    );
+  const workerFactory = options.workerFactory ?? (() => new ScriptedWorker());
+  const memoryFactory =
+    options.memoryFactory ?? ((_c: Configuration, cfg: MissionConfig) => defaultMemoryAdapter(cfg));
   const measurements: MissionMeasurement[] = [];
+  let memoryAdapter: MemoryAdapter["kind"] | null = null;
   let seedHash: string | null = null;
   let evaluatorHash: string | null = null;
   for (let repeat = 0; repeat < options.repeats; repeat += 1) {
@@ -97,8 +123,13 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
       const missionId = `cmp-${configuration.replace(/[^a-z]+/g, "-")}-${repeat + 1}`;
       const config = configure(options.base, configuration, missionId);
       const paths = missionPaths(missionId, options.runsRoot);
-      const memory = new LocalMemoryAdapter();
-      const worker = options.workerFactory?.(configuration) ?? new ScriptedWorker();
+      const memory = memoryFactory(configuration, config);
+      if (config.memory.enabled) memoryAdapter ??= memory.kind;
+      const worker = workerFactory(configuration, config, paths);
+      if (worker.mode !== config.worker)
+        throw new Error(
+          `compare: config requests worker "${config.worker}" but factory returned "${worker.mode}"`,
+        );
       const started = Date.now();
       let crashes = 0;
       log(`== ${missionId}`);
@@ -121,7 +152,11 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
           controller.close();
         }
       }
-      const controller = new MissionController(config, paths, { worker, memory, log: () => {} });
+      const controller = new MissionController(config, paths, {
+        worker,
+        memory,
+        log: () => {},
+      });
       try {
         const mission = controller.mission();
         seedHash = mission.seedArtifactHash;
@@ -136,7 +171,14 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
         const events = controller.ledger.eventsSince(0, 100000);
         const packets = events
           .filter((e) => e.type === "packet.built")
-          .map((e) => e.payload as { tokens: number; injected: string[]; filteredOut: unknown[] });
+          .map(
+            (e) =>
+              e.payload as {
+                tokens: number;
+                injected: string[];
+                filteredOut: unknown[];
+              },
+          );
         const required =
           mission.baselineP95Ms !== null
             ? mission.baselineP95Ms * (1 - config.targetP95Reduction)
@@ -171,6 +213,8 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
     }
   }
   const result: CompareResult = {
+    worker: options.base.worker,
+    memoryAdapter: memoryAdapter ?? "local",
     schedule: options.interruptions,
     seedHash,
     evaluatorHash,
@@ -207,7 +251,7 @@ export function renderComparison(result: CompareResult): string {
     "# Configuration comparison",
     "",
     `Seed ${result.seedHash?.slice(0, 12) ?? "?"}, evaluator ${result.evaluatorHash?.slice(0, 12) ?? "?"}; identical workload and interruption schedule: ${JSON.stringify(result.schedule)}.`,
-    "Scripted worker, local memory adapter. `*` marks estimated token usage (no provider usage report).",
+    `${result.worker === "pi" ? "Pi" : "Scripted"} worker, ${result.memoryAdapter === "supermemory" ? "hosted Supermemory" : "local memory"} adapter. \`*\` marks estimated token usage (no provider usage report).`,
     "",
     header,
     sep,

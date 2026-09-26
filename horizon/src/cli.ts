@@ -71,7 +71,10 @@ const { values, positionals } = parseArgs({
 const runsRoot = values["runs-root"] ? resolve(values["runs-root"]) : RUNS_ROOT;
 const log = (line: string) => console.log(line);
 
-function loadMission(): { config: MissionConfig; paths: ReturnType<typeof missionPaths> } {
+function loadMission(): {
+  config: MissionConfig;
+  paths: ReturnType<typeof missionPaths>;
+} {
   const missionId = values.mission;
   if (!missionId) throw new Error("--mission is required");
   const paths = missionPaths(missionId, runsRoot);
@@ -79,7 +82,9 @@ function loadMission(): { config: MissionConfig; paths: ReturnType<typeof missio
     throw new Error(
       `mission ${missionId} not found under ${runsRoot}; run 'horizon mission create'`,
     );
-  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8")) as { config: MissionConfig };
+  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8")) as {
+    config: MissionConfig;
+  };
   return { config: manifest.config, paths };
 }
 
@@ -332,12 +337,20 @@ async function main(): Promise<number> {
     case "compare": {
       if (!values.config) throw new Error("--config is required");
       const base = loadMissionConfig(resolve(values.config));
+      if (base.worker === "pi") {
+        const { apiKey, envKeys } = resolveProviderApiKey(base.model.provider, process.env);
+        if (!apiKey)
+          throw new Error(
+            `worker "pi" with provider ${base.model.provider} requires ${envKeys.join(" or ")} in the environment`,
+          );
+      }
       const root = values["runs-root"]
         ? resolve(values["runs-root"])
         : mkdtempSync(join(tmpdir(), "horizon-compare-"));
       const result = await compareConfigurations({
         runsRoot: root,
         base: { ...base, segmentRotationCycles: 1 },
+        workerFactory: (_configuration, config, paths) => makeWorker(config, paths),
         // Same schedule for every configuration: crash right after the first candidate snapshot, then resume to completion.
         interruptions: [{ crashAt: "snapshot_ready" }, { crashAt: null }],
         repeats: values.repeats ? Number(values.repeats) : 1,
