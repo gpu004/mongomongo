@@ -1,0 +1,158 @@
+---
+title: "OpenCode"
+sidebarTitle: "OpenCode"
+description: "OpenCode Supermemory Plugin — persistent memory across coding sessions"
+icon: "/images/opencode-logo.svg"
+---
+
+[OpenCode-Supermemory](https://github.com/supermemoryai/opencode-supermemory) is an OpenCode plugin that gives your AI persistent memory across sessions. Your agent remembers what you worked on — across sessions, across projects.
+
+<Tip>
+**Prefer to keep everything on your machine?** This plugin works with [self-hosted Supermemory](/self-hosting/overview) — run `npx supermemory local`, then set `apiKey` / base URL in `~/.config/opencode/supermemory.jsonc` and use the API key printed on first boot.
+</Tip>
+
+## Install the Plugin
+
+```bash
+bunx opencode-supermemory@latest install
+```
+
+For LLM agents (non-interactive):
+
+```bash
+bunx opencode-supermemory@latest install --no-tui
+```
+
+## Authenticate
+
+Browser login (recommended):
+
+```bash
+bunx opencode-supermemory@latest login
+```
+
+Check the connection any time:
+
+```bash
+bunx opencode-supermemory@latest status
+```
+
+Or set an API key manually from the [API Keys](https://console.supermemory.ai/keys) page in the console:
+
+<Tabs>
+  <Tab title="macOS / Linux (zsh)">
+    ```bash
+    echo 'export SUPERMEMORY_API_KEY="sm_..."' >> ~/.zshrc
+    source ~/.zshrc
+    ```
+  </Tab>
+  <Tab title="macOS / Linux (bash)">
+    ```bash
+    echo 'export SUPERMEMORY_API_KEY="sm_..."' >> ~/.bashrc
+    source ~/.bashrc
+    ```
+  </Tab>
+  <Tab title="Windows (PowerShell)">
+    ```powershell
+    [System.Environment]::SetEnvironmentVariable("SUPERMEMORY_API_KEY", "sm_...", "User")
+    ```
+    Restart your terminal after running this.
+  </Tab>
+</Tabs>
+
+Ensure your `~/.config/opencode/opencode.jsonc` contains:
+
+```json
+{
+  "plugin": ["opencode-supermemory"]
+}
+```
+
+## How It Works
+
+Once installed, the plugin runs automatically:
+
+- **Context Injection** — On session start, relevant memories are fetched and injected into the agent's context (user profile, project knowledge, semantic matches).
+- **Keyword Detection** — Phrases like "remember" or "save this" trigger automatic storage.
+- **Smart Compaction** — At 80% context capacity, sessions are summarized and saved as memories.
+- **Privacy Protection** — Content within `<private>` tags never persists.
+
+### Memory Scopes
+
+| Scope | Description |
+|-------|-------------|
+| `user` | Memories that persist across all projects |
+| `project` | Memories isolated to the current project (default) |
+
+### Memory Types
+
+| Type | Description |
+|------|-------------|
+| `project-config` | Project configuration and setup details |
+| `architecture` | Codebase structure and design patterns |
+| `error-solution` | Problems encountered and their fixes |
+| `preference` | User preferences and coding style |
+| `learned-pattern` | Patterns discovered during sessions |
+| `conversation` | Important conversation context |
+
+## Commands
+
+### /supermemory-init
+
+Explore and index your codebase structure into memory:
+
+```
+/supermemory-init
+```
+
+## Tools
+
+The agent has access to a `supermemory` tool with these modes:
+
+| Mode | Parameters | Function |
+|------|------------|----------|
+| `add` | content, type?, scope? | Store information |
+| `search` | query, scope? | Find relevant memories |
+| `profile` | query? | View user preferences |
+| `list` | scope?, limit? | Display stored items |
+| `forget` | memoryId, scope? | Remove memory |
+
+## Configuration
+
+Create `~/.config/opencode/supermemory.jsonc`:
+
+```jsonc
+{
+  "apiKey": "sm_...",              // Or use SUPERMEMORY_API_KEY / browser login
+  "similarityThreshold": 0.6,      // Minimum match score (0-1)
+  "maxMemories": 5,                // Memories per injection
+  "maxProjectMemories": 10,        // Project memory listings
+  "maxProfileItems": 5,            // Profile facts injected
+  "injectProfile": true,           // Include user preferences in context
+  "containerTagPrefix": "opencode", // Tag prefix for scoping
+  "userContainerTag": "my-user-tag",       // Optional override
+  "projectContainerTag": "my-project-tag", // Optional override
+  "keywordPatterns": ["log\\s+this"],      // Extra auto-save triggers
+  "compactionThreshold": 0.80      // Context usage ratio for summarization
+}
+```
+
+## Logging
+
+View plugin activity:
+
+```bash
+tail -f ~/.opencode-supermemory.log
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="GitHub Repository" icon="/images/github-icon.svg" href="https://github.com/supermemoryai/opencode-supermemory">
+    Source code, issues, and detailed README.
+  </Card>
+
+  <Card title="Claude Code Plugin" icon="code" href="/integrations/claude-code">
+    Memory plugin for Claude Code.
+  </Card>
+</CardGroup>

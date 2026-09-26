@@ -1,0 +1,19 @@
+{
+	"compilerOptions": {
+		"target": "ESNext",
+		"module": "ESNext",
+		"moduleResolution": "Bundler",
+		"strict": true,
+		"skipLibCheck": true,
+		"lib": ["ESNext"],
+		"types": ["@cloudflare/workers-types"],
+		"esModuleInterop": true,
+		"resolveJsonModule": true,
+		"outDir": "dist",
+		"rootDir": "src",
+		"baseUrl": ".",
+		"noEmit": true
+	},
+	"include": ["src/server/**/*", "src/shared/**/*"],
+	"exclude": ["node_modules", "dist"]
+}

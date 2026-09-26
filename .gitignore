@@ -1,0 +1,42 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Dependencies and generated output
+node_modules/
+.pnp.*
+dist/
+build/
+out/
+coverage/
+.turbo/
+.next/
+.vercel/
+
+# Tool caches
+.cache/
+.parcel-cache/
+.vite/
+.eslintcache
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
