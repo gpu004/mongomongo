@@ -94,7 +94,7 @@ export function renderProgress(s: MissionSummary): string {
     `Mission ${m.missionId}  status=${m.status}  contract=${m.contractHash.slice(0, 12)} evaluator=${m.evaluatorHash.slice(0, 12)} env=${m.environmentHash.slice(0, 12)}`,
   );
   lines.push(
-    `Goal: baseline p95 ${fmt(s.target.baselineP95Ms)} -> required ${fmt(s.target.requiredP95Ms)}; best ${fmt(s.target.bestP95Ms)} (${(m.bestArtifactHash ?? "").slice(0, 12)}) ${s.target.reached ? "REACHED" : "not reached"}`,
+    `Goal: baseline p95 ${fmt(s.target.baselineP95Ms)} -> required ${fmt(s.target.requiredP95Ms)}; best ${fmt(s.target.bestP95Ms)} (${(m.bestArtifactHash ?? "").slice(0, 12)}) ${s.target.reached ? "REACHED" : "not reached"}; frozen acceptance margin ${m.frozenAcceptanceMargin ?? "n/a"}`,
   );
   lines.push(
     `Budget: experiments ${m.spentExperiments}, tokens in/out ${m.spentInputTokens}/${m.spentOutputTokens}${m.usageUncertain ? " (estimated)" : ""}, memory ops ${m.spentMemoryOperations}, wall ${(m.spentWallMs / 1000).toFixed(0)}s`,
