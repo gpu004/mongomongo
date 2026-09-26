@@ -1,20 +1,24 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Suite } from "../verification/reports.ts";
 import { computeEnvironmentHash, computeEvaluatorHash, hashDirectory, runSuite } from "../verification/runner.ts";
+import { loadScenarios } from "../verification/scenarios/index.ts";
 import { checkImportBoundaries } from "../verification/structural.ts";
 import { ArtifactStore, SEED_DIR } from "./artifact-store.ts";
 import { compareConfigurations, renderComparison } from "./compare.ts";
 import { BaselineError, MissionController, RESOURCES_DIR, SimulatedCrash } from "./controller.ts";
+import { loadFeatureMap, validateFeatureMap } from "./feature-map.ts";
 import { Ledger } from "./ledger.ts";
+import { renderMemoryBench, runMemoryBench, type MemoryBenchResult } from "./memory-bench.ts";
 import { loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
 import { FileEvidenceStore, missionPaths, RUNS_ROOT } from "./mission-paths.ts";
 import { PiWorker } from "./pi-worker.ts";
 import { exportMission, renderProgress, summarize } from "./progress.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
+import { renderSkillEval, runSkillEval } from "./skill-eval.ts";
 import type { Worker } from "./worker.ts";
 
 const USAGE = `horizon <command> [options]
@@ -25,11 +29,15 @@ const USAGE = `horizon <command> [options]
   resume --mission M                       alias of run
   verify --mission M --artifact A --suite smoke|correctness|performance|holdout|learned|structural
   profile --mission M --scenario search-read-heavy [--artifact A]
-  features check --artifact A|--dir DIR    structural import-boundary check
+  features check --artifact A|--dir DIR    structural import-boundary check + feature-map reference check
   inspect --mission M                      progress view
   export --mission M                       write exports/summary.{json,md}
   compare --config mission.json [--repeats N] [--runs-root DIR]
                                            run the three memory configurations under one crash schedule
+  skill-eval [--config mission.json] [--out DIR]
+                                           grade the worker on fixed verification-skill fixtures
+  memory-bench [--episodes 1000,10000,100000] [--out DIR]
+                                           synthetic history benchmark of the retrieval path
 `;
 
 const { values, positionals } = parseArgs({
@@ -46,6 +54,8 @@ const { values, positionals } = parseArgs({
 		"runs-root": { type: "string" },
 		"crash-at": { type: "string" },
 		repeats: { type: "string" },
+		episodes: { type: "string" },
+		out: { type: "string" },
 	},
 });
 
@@ -172,8 +182,41 @@ async function main(): Promise<number> {
 			}
 			if (!dir) dir = SEED_DIR;
 			const violations = checkImportBoundaries(join(dir, "src"));
-			log(JSON.stringify({ dir, hash: hashDirectory(dir).hash, violations }, null, 2));
-			return violations.length === 0 ? 0 : 2;
+			const featureMapIssues = validateFeatureMap(loadFeatureMap(join(RESOURCES_DIR, "features.json")), loadScenarios(), dir);
+			log(JSON.stringify({ dir, hash: hashDirectory(dir).hash, violations, featureMapIssues }, null, 2));
+			return violations.length === 0 && featureMapIssues.length === 0 ? 0 : 2;
+		}
+		case "skill-eval": {
+			const config = values.config ? loadMissionConfig(resolve(values.config)) : undefined;
+			const root = mkdtempSync(join(tmpdir(), "horizon-skill-eval-"));
+			const worker = config && config.worker !== "scripted" ? makeWorker(config, missionPaths(config.missionId, root)) : new ScriptedWorker();
+			const result = await runSkillEval(worker);
+			const text = renderSkillEval(result);
+			log(text);
+			if (values.out) {
+				mkdirSync(resolve(values.out), { recursive: true });
+				writeFileSync(join(resolve(values.out), "skill-eval.json"), JSON.stringify(result, null, 2));
+				writeFileSync(join(resolve(values.out), "skill-eval.md"), `${text}\n`);
+			}
+			return result.passed === result.total ? 0 : 2;
+		}
+		case "memory-bench": {
+			const sizes = (values.episodes ?? "1000,10000").split(",").map(Number);
+			const results: MemoryBenchResult[] = [];
+			for (const episodes of sizes) {
+				const result = await runMemoryBench({ episodes });
+				results.push(result);
+				log(`${episodes} episodes: ${JSON.stringify(result)}`);
+			}
+			const table = renderMemoryBench(results);
+			log("");
+			log(table);
+			if (values.out) {
+				mkdirSync(resolve(values.out), { recursive: true });
+				writeFileSync(join(resolve(values.out), "memory-bench.json"), JSON.stringify(results, null, 2));
+				writeFileSync(join(resolve(values.out), "memory-bench.md"), `${table}\n`);
+			}
+			return 0;
 		}
 		case "compare": {
 			if (!values.config) throw new Error("--config is required");

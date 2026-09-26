@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { VerificationReport } from "../verification/reports.ts";
 import { MissionController, type ControllerOptions } from "../src/controller.ts";
 import { loadMissionConfig, type MissionConfig } from "../src/mission-contract.ts";
+import { LocalMemoryAdapter } from "../src/memory-adapter.ts";
 import { missionPaths } from "../src/mission-paths.ts";
 
 export const EXAMPLE_CONFIG = new URL("../mission.example.json", import.meta.url).pathname;
@@ -31,7 +32,8 @@ export function tempRunsRoot(): string {
 
 export function controllerFor(missionId: string, runsRoot: string, options: ControllerOptions = {}, overrides: Partial<MissionConfig> = {}): MissionController {
 	const config = testConfig(missionId, overrides);
-	return new MissionController(config, missionPaths(missionId, runsRoot), options);
+	// Hermetic by default: a SUPERMEMORY_API_KEY in the environment must not route tests to the hosted service.
+	return new MissionController(config, missionPaths(missionId, runsRoot), { memory: new LocalMemoryAdapter(), ...options });
 }
 
 export function readReport(path: string): VerificationReport {

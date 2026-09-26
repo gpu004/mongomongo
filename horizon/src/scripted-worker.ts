@@ -79,9 +79,9 @@ export class ScriptedWorker implements Worker {
 			const overlay = readFileSync(join(FIXTURES_DIR, "stale-cache", "overlay", "search", "search-engine.ts"), "utf8");
 			broker.workspaceEdit("src/search/search-engine.ts", { content: overlay });
 			const smoke = await broker.verifyCandidate("smoke");
-			const correctness = smoke.status === "passed" ? await broker.verifyCandidate("correctness") : smoke;
-			let claim = `smoke ${smoke.status}; correctness ${correctness.status}`;
-			if (correctness.status === "failed") {
+			const correctness = smoke.status === "passed" ? await broker.verifyCandidate("correctness") : null;
+			let claim = `smoke ${smoke.status}; correctness ${correctness?.status ?? "not run"}`;
+			if (correctness?.status === "failed") {
 				const proposal = await broker.proposeRegression({
 					scenarioId: "learned-update-then-repeat-search",
 					invariantId: "INV-UPDATE-VISIBILITY",
@@ -103,11 +103,11 @@ export class ScriptedWorker implements Worker {
 		if (step === "normalized-index") {
 			broker.workspaceEdit("src/search/search-engine.ts", { content: NORMALIZED_INDEX_ENGINE });
 			const smoke = await broker.verifyCandidate("smoke");
-			const correctness = smoke.status === "passed" ? await broker.verifyCandidate("correctness") : smoke;
+			const correctness = smoke.status === "passed" ? await broker.verifyCandidate("correctness") : null;
 			return {
 				hypothesis: "pre-normalize document text once per mutation version instead of per query",
 				whatChanged: "SearchEngine keeps a lazily rebuilt normalized index; invalidate() drops it",
-				claim: `smoke ${smoke.status}; correctness ${correctness.status}`,
+				claim: `smoke ${smoke.status}; correctness ${correctness?.status ?? "not run"}`,
 				usage,
 				seededFixture: null,
 				aborted: false,

@@ -219,6 +219,12 @@ CREATE TABLE IF NOT EXISTS event (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE, at TEXT NOT NULL, type TEXT NOT NULL,
   entity_id TEXT NOT NULL, payload TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS episode_mission ON episode(mission_id, created_at);
+CREATE INDEX IF NOT EXISTS episode_supersedes ON episode(supersedes);
+CREATE INDEX IF NOT EXISTS outbox_episode ON outbox(episode_id);
+CREATE INDEX IF NOT EXISTS verification_artifact ON verification(mission_id, artifact_hash, suite);
+CREATE VIRTUAL TABLE IF NOT EXISTS episode_fts USING fts5(episode_id UNINDEXED, mission_id UNINDEXED, summary);
+CREATE VIRTUAL TABLE IF NOT EXISTS episode_fts_vocab USING fts5vocab(episode_fts, row);
 CREATE TABLE IF NOT EXISTS learned_scenario (
   scenario_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, lesson_id TEXT NOT NULL, suite_version INTEGER NOT NULL, path TEXT NOT NULL
 );
@@ -250,6 +256,7 @@ export class Ledger {
 		this.db.exec("PRAGMA synchronous = FULL;");
 		this.db.exec("PRAGMA foreign_keys = ON;");
 		this.db.exec(SCHEMA);
+		this.backfillEpisodeIndex();
 		this.lockPath = join(dirname(path), "controller.lock");
 	}
 
@@ -455,12 +462,75 @@ export class Ledger {
 	// ---- episodes / lessons -------------------------------------------------
 
 	insertEpisode(e: EpisodeRow): void {
-		this.db
+		const inserted = this.db
 			.prepare(
 				`INSERT OR IGNORE INTO episode (episode_id, mission_id, experiment_id, version, supersedes, feature_ids, invariant_ids, artifact_hash, parent_artifact_hash, interpretation, evidence_ids, summary, created_at)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(e.episodeId, e.missionId, e.experimentId, e.version, e.supersedes, JSON.stringify(e.featureIds), JSON.stringify(e.invariantIds), e.artifactHash, e.parentArtifactHash, e.interpretation, JSON.stringify(e.evidenceIds), e.summary, e.createdAt);
+		if (Number(inserted.changes) > 0) this.db.prepare("INSERT INTO episode_fts (episode_id, mission_id, summary) VALUES (?, ?, ?)").run(e.episodeId, e.missionId, e.summary);
+	}
+
+	private backfillEpisodeIndex(): void {
+		const episodes = Number((this.db.prepare("SELECT COUNT(*) AS n FROM episode").get() as { n: number }).n);
+		const indexed = Number((this.db.prepare("SELECT COUNT(*) AS n FROM episode_fts").get() as { n: number }).n);
+		if (episodes === indexed) return;
+		this.db.exec("DELETE FROM episode_fts; INSERT INTO episode_fts (episode_id, mission_id, summary) SELECT episode_id, mission_id, summary FROM episode;");
+	}
+
+	/** True once the remote memory service reported this episode's document as ready. */
+	isIndexed(episodeId: string): boolean {
+		return this.db.prepare("SELECT 1 FROM outbox WHERE episode_id = ? AND state = 'memory_ready' LIMIT 1").get(episodeId) !== undefined;
+	}
+
+	isSuperseded(episodeId: string): boolean {
+		return this.db.prepare("SELECT 1 FROM episode WHERE supersedes = ? LIMIT 1").get(episodeId) !== undefined;
+	}
+
+	/** Follows the supersession chain from `episodeId` to its newest version. */
+	currentVersionOf(episodeId: string): EpisodeRow | undefined {
+		let current = this.getEpisode(episodeId);
+		for (let hops = 0; current && hops < 64; hops += 1) {
+			const next = this.db.prepare("SELECT * FROM episode WHERE supersedes = ? ORDER BY version DESC LIMIT 1").get(current.episodeId) as Row | undefined;
+			if (!next) return current;
+			current = toEpisode(next);
+		}
+		return current;
+	}
+
+	/**
+	 * Local full-text search over this mission's episode summaries. With
+	 * `unindexedOnly`, only episodes whose memory delivery is not yet ready.
+	 */
+	searchEpisodes(missionId: string, query: string, limit: number, options: { unindexedOnly?: boolean } = {}): EpisodeRow[] {
+		const terms = this.selectiveTerms([...new Set(query.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(Boolean))]);
+		if (terms.length === 0 || limit <= 0) return [];
+		const match = terms.map((t) => `"${t.replaceAll('"', '""')}"`).join(" OR ");
+		const pending = options.unindexedOnly ? "AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.episode_id = e.episode_id AND o.state = 'memory_ready')" : "";
+		const rows = this.db
+			.prepare(`SELECT e.* FROM episode_fts f JOIN episode e ON e.episode_id = f.episode_id WHERE episode_fts MATCH ? AND f.mission_id = ? ${pending} ORDER BY bm25(episode_fts) LIMIT ?`)
+			.all(match, missionId, limit) as Row[];
+		return rows.map(toEpisode);
+	}
+
+	/** Inverse document frequency of each term over this ledger's episodes. */
+	termWeights(terms: string[]): Map<string, number> {
+		const total = Number((this.db.prepare("SELECT COUNT(*) AS n FROM episode").get() as { n: number }).n);
+		const counts = this.db.prepare("SELECT doc FROM episode_fts_vocab WHERE term = ?");
+		return new Map(terms.map((t) => [t, Math.log((total + 1) / (Number((counts.get(t) as { doc: number } | undefined)?.doc ?? 0) + 1)) + 0.01]));
+	}
+
+	/**
+	 * Drops query terms that occur in more than a fifth of all episodes when at
+	 * least one rarer term remains, so a search costs the rare terms' postings
+	 * rather than a scan of the whole history.
+	 */
+	private selectiveTerms(terms: string[]): string[] {
+		if (terms.length <= 1) return terms;
+		const total = Number((this.db.prepare("SELECT COUNT(*) AS n FROM episode").get() as { n: number }).n);
+		const counts = this.db.prepare("SELECT doc FROM episode_fts_vocab WHERE term = ?");
+		const rare = terms.filter((t) => Number((counts.get(t) as { doc: number } | undefined)?.doc ?? 0) <= Math.max(50, total / 5));
+		return rare.length > 0 ? rare : terms;
 	}
 
 	getEpisode(episodeId: string): EpisodeRow | undefined {
@@ -567,6 +637,11 @@ export class Ledger {
 			.prepare("INSERT OR IGNORE INTO outbox (idempotency_key, episode_id, payload_hash, payload, state, retries, next_attempt_at, updated_at) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)")
 			.run(idempotencyKey, episodeId, payloadHash, JSON.stringify(payload), now(), now());
 		return idempotencyKey;
+	}
+
+	outboxPayloadForEpisode(episodeId: string): unknown {
+		const r = this.db.prepare("SELECT payload FROM outbox WHERE episode_id = ? ORDER BY rowid DESC LIMIT 1").get(episodeId) as { payload: string } | undefined;
+		return r ? JSON.parse(r.payload) : undefined;
 	}
 
 	outboxPayload(key: string): unknown {
