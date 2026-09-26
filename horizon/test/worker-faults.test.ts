@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { DEFAULT_RATE_LIMIT_RETRY_MS, parseRetryAfterMs } from "../src/pi-worker.ts";
+import {
+  DEFAULT_RATE_LIMIT_RETRY_MS,
+  isRateLimitedProviderError,
+  parseRetryAfterMs,
+} from "../src/pi-worker.ts";
 import { ScriptedWorker } from "../src/scripted-worker.ts";
 import {
   providerApiKeyEnv,
@@ -155,6 +159,25 @@ test("retry-after hints are parsed from provider error text; default applies oth
   assert.equal(DEFAULT_RATE_LIMIT_RETRY_MS, 60_000);
   assert.equal(providerApiKeyEnv("anthropic"), "ANTHROPIC_API_KEY");
   assert.equal(providerApiKeyEnv("openai-codex"), "OPENAI_CODEX_API_KEY");
+});
+
+test("Google's wrapped 429 is a rate limit but an invalid API key is not", () => {
+  assert.equal(
+    isRateLimitedProviderError(
+      JSON.stringify({
+        error: {
+          message: JSON.stringify({ error: { code: 429, status: "RESOURCE_EXHAUSTED" } }),
+          code: 429,
+          status: "Too Many Requests",
+        },
+      }),
+    ),
+    true,
+  );
+  assert.equal(
+    isRateLimitedProviderError('{"error":{"code":400,"status":"INVALID_ARGUMENT"}}'),
+    false,
+  );
 });
 
 test("doctor reports the configured provider's API key next to SUPERMEMORY_API_KEY", () => {
