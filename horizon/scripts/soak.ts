@@ -1,0 +1,177 @@
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { parseArgs } from "node:util";
+import { Ledger } from "../src/ledger.ts";
+import { loadMissionConfig, type MissionConfig } from "../src/mission-contract.ts";
+import { missionPaths, writeJsonAtomic } from "../src/mission-paths.ts";
+
+const { values } = parseArgs({
+  options: {
+    config: { type: "string" },
+    out: { type: "string" },
+    missions: { type: "string" },
+    "max-runs": { type: "string" },
+    "fault-every": { type: "string" },
+  },
+});
+
+function positiveInteger(value: string | undefined, fallback: number, name: string): number {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isSafeInteger(parsed) || parsed < 1)
+    throw new Error(`${name} must be a positive integer`);
+  return parsed;
+}
+
+const configPath = resolve(
+  values.config ?? new URL("../mission.example.json", import.meta.url).pathname,
+);
+const out = resolve(values.out ?? join("runs", `soak-${Date.now()}`));
+const missionCount = positiveInteger(values.missions, 10, "missions");
+const maxRuns = positiveInteger(values["max-runs"], 8, "max-runs");
+const faultEvery = positiveInteger(values["fault-every"], 2, "fault-every");
+const base = loadMissionConfig(configPath);
+if (base.worker !== "scripted") throw new Error("soak requires a scripted worker config");
+mkdirSync(out, { recursive: true });
+const runsRoot = join(out, "missions");
+mkdirSync(runsRoot, { recursive: true });
+
+function bytes(path: string): number {
+  if (!existsSync(path)) return 0;
+  const stats = statSync(path);
+  if (!stats.isDirectory()) return stats.size;
+  return readdirSync(path).reduce((total, name) => total + bytes(join(path, name)), 0);
+}
+
+function run(args: string[], expected: number[]): { code: number; ms: number } {
+  const started = performance.now();
+  const result = spawnSync(
+    process.execPath,
+    [new URL("../src/cli.ts", import.meta.url).pathname, ...args],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      encoding: "utf8",
+      timeout: 600_000,
+      env: { ...process.env, MONGODB_URI: "", SUPERMEMORY_API_KEY: "" },
+    },
+  );
+  if (result.error) throw result.error;
+  if (result.status === null || !expected.includes(result.status))
+    throw new Error(
+      `horizon ${args.join(" ")} exited ${result.status}: ${result.stderr || result.stdout}`,
+    );
+  return { code: result.status, ms: Math.round(performance.now() - started) };
+}
+
+interface SoakSample {
+  missionId: string;
+  run: number;
+  status: string;
+  exitCode: number;
+  faultInjected: boolean;
+  runMs: number;
+  spentExperiments: number;
+  packetTokens: number[];
+  retrievalMs: number[];
+  ledgerBytes: number;
+  sessionBytes: number;
+  artifactBytes: number;
+  segments: number;
+  checkpoints: number;
+  replayedFault: boolean;
+}
+
+const samples: SoakSample[] = [];
+const suffix = randomUUID().slice(0, 8);
+for (let i = 0; i < missionCount; i++) {
+  const missionId = `soak-${suffix}-${i + 1}`;
+  const config: MissionConfig = {
+    ...base,
+    missionId,
+    isolation: "subprocess",
+    segmentRotationCycles: 1,
+    memory: { ...base.memory, enabled: true, containerTag: `horizon-${missionId}` },
+  };
+  const paths = missionPaths(missionId, runsRoot);
+  const missionConfigPath = join(out, `${missionId}.json`);
+  writeJsonAtomic(missionConfigPath, config);
+  run(["mission", "create", "--config", missionConfigPath, "--runs-root", runsRoot], [0]);
+  let lastSeq = 0;
+  let finished = false;
+  for (let attempt = 1; attempt <= maxRuns; attempt++) {
+    const faultInjected = i % faultEvery === 0 && attempt === 1;
+    const result = run(
+      [
+        "run",
+        "--mission",
+        missionId,
+        "--runs-root",
+        runsRoot,
+        "--cycles",
+        "2",
+        ...(faultInjected ? ["--crash-at", "snapshot_ready"] : []),
+      ],
+      faultInjected ? [3] : [0, 2],
+    );
+    const ledger = new Ledger(paths.db);
+    const mission = ledger.getMission(missionId);
+    const events = ledger.eventsSince(lastSeq, 100_000);
+    lastSeq = ledger.lastEventSeq();
+    const packetTokens = events
+      .filter((event) => event.type === "packet.built")
+      .map((event) => Number((event.payload as { tokens: number }).tokens));
+    const retrievalMs = events
+      .filter((event) => event.type === "packet.built")
+      .map((event) => (event.payload as { retrievalMs?: number }).retrievalMs)
+      .filter((value): value is number => value !== undefined);
+    const sample: SoakSample = {
+      missionId,
+      run: attempt,
+      status: mission?.status ?? "missing",
+      exitCode: result.code,
+      faultInjected,
+      runMs: result.ms,
+      spentExperiments: mission?.spentExperiments ?? 0,
+      packetTokens,
+      retrievalMs,
+      ledgerBytes: bytes(paths.db),
+      sessionBytes: bytes(paths.sessions),
+      artifactBytes: bytes(paths.artifacts),
+      segments: ledger.listSegments(missionId).length,
+      checkpoints: ledger.countCheckpoints(missionId),
+      replayedFault: events.some(
+        (event) =>
+          event.type === "controller.recovered" &&
+          (event.payload as { actions: { kind: string }[] }).actions.some(
+            (action) => action.kind !== "resume_idle",
+          ),
+      ),
+    };
+    ledger.close();
+    samples.push(sample);
+    console.log(JSON.stringify(sample));
+    writeFileSync(join(out, "samples.json"), JSON.stringify(samples, null, 2));
+    finished =
+      mission?.status === "succeeded" ||
+      mission?.status === "budget_exhausted" ||
+      mission?.status === "blocked";
+    if (finished) break;
+  }
+  if (!finished) throw new Error(`mission ${missionId} did not finish within ${maxRuns} runs`);
+}
+
+const report = {
+  configPath,
+  out,
+  missions: missionCount,
+  injectedFaults: samples.filter((sample) => sample.faultInjected).length,
+  replayedFaults: samples.filter((sample) => sample.replayedFault).length,
+  maxPacketTokens: Math.max(0, ...samples.flatMap((sample) => sample.packetTokens)),
+  maxLedgerBytes: Math.max(0, ...samples.map((sample) => sample.ledgerBytes)),
+  maxSessionBytes: Math.max(0, ...samples.map((sample) => sample.sessionBytes)),
+  maxArtifactBytes: Math.max(0, ...samples.map((sample) => sample.artifactBytes)),
+  samples: samples.length,
+};
+writeFileSync(join(out, "report.json"), JSON.stringify(report, null, 2));
+console.log(JSON.stringify(report, null, 2));
