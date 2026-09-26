@@ -137,7 +137,7 @@ for (let i = 0; i < missionCount; i++) {
   let lastInputTokens = 0;
   let finished = false;
   for (let attempt = 1; attempt <= maxRuns; attempt++) {
-    const faultInjected = i % faultEvery === 0 && attempt === 1;
+    const faultRequested = i % faultEvery === 0 && attempt === 1;
     const result = run(
       [
         "run",
@@ -147,9 +147,9 @@ for (let i = 0; i < missionCount; i++) {
         runsRoot,
         "--cycles",
         "1",
-        ...(faultInjected ? ["--crash-at", "snapshot_ready"] : []),
+        ...(faultRequested ? ["--crash-at", "snapshot_ready"] : []),
       ],
-      faultInjected ? [3] : [0, 2],
+      faultRequested ? [2, 3] : [0, 2],
     );
     const ledger = await openLedger(config, paths);
     const mission = await ledger.getMission(missionId);
@@ -172,7 +172,7 @@ for (let i = 0; i < missionCount; i++) {
       run: attempt,
       status: mission?.status ?? "missing",
       exitCode: result.code,
-      faultInjected,
+      faultInjected: faultRequested && result.code === 3,
       runMs: result.ms,
       spentExperiments: mission?.spentExperiments ?? 0,
       workerInputTokens: (mission?.spentInputTokens ?? 0) - lastInputTokens,
