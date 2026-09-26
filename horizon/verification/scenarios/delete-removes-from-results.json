@@ -3,9 +3,7 @@
   "scenarioId": "delete-removes-from-results",
   "suite": "correctness",
   "description": "A deleted document never appears again, even for a query that was answered before the delete.",
-  "invariantIds": [
-    "INV-DELETE-VISIBILITY"
-  ],
+  "invariantIds": ["INV-DELETE-VISIBILITY"],
   "sequence": [
     {
       "op": "insert",

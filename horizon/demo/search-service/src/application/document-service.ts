@@ -1,10 +1,10 @@
 import {
-	DEFAULT_LIMIT,
-	MAX_LIMIT,
-	type DocumentRecord,
-	type InsertRequest,
-	type SearchRequest,
-	type UpdateRequest,
+  DEFAULT_LIMIT,
+  MAX_LIMIT,
+  type DocumentRecord,
+  type InsertRequest,
+  type SearchRequest,
+  type UpdateRequest,
 } from "../domain/contracts.ts";
 import { SearchEngine } from "../search/search-engine.ts";
 import { DocumentStore } from "../storage/document-store.ts";
@@ -16,44 +16,44 @@ import { DocumentStore } from "../storage/document-store.ts";
  * check (`horizon features check`) exists to catch.
  */
 export class DocumentService {
-	private readonly store: DocumentStore;
-	private readonly engine: SearchEngine;
+  private readonly store: DocumentStore;
+  private readonly engine: SearchEngine;
 
-	constructor(store = new DocumentStore(), engine?: SearchEngine) {
-		this.store = store;
-		this.engine = engine ?? new SearchEngine(store);
-	}
+  constructor(store = new DocumentStore(), engine?: SearchEngine) {
+    this.store = store;
+    this.engine = engine ?? new SearchEngine(store);
+  }
 
-	get documentCount(): number {
-		return this.store.size;
-	}
+  get documentCount(): number {
+    return this.store.size;
+  }
 
-	insert(request: InsertRequest): DocumentRecord {
-		const record = this.store.insert(request.id, request.title, request.body);
-		this.engine.invalidate();
-		return record;
-	}
+  insert(request: InsertRequest): DocumentRecord {
+    const record = this.store.insert(request.id, request.title, request.body);
+    this.engine.invalidate();
+    return record;
+  }
 
-	update(id: string, request: UpdateRequest): DocumentRecord {
-		const record = this.store.update(id, request);
-		this.engine.invalidate();
-		return record;
-	}
+  update(id: string, request: UpdateRequest): DocumentRecord {
+    const record = this.store.update(id, request);
+    this.engine.invalidate();
+    return record;
+  }
 
-	delete(id: string): boolean {
-		const removed = this.store.delete(id);
-		if (removed) {
-			this.engine.invalidate();
-		}
-		return removed;
-	}
+  delete(id: string): boolean {
+    const removed = this.store.delete(id);
+    if (removed) {
+      this.engine.invalidate();
+    }
+    return removed;
+  }
 
-	get(id: string): DocumentRecord | undefined {
-		return this.store.get(id);
-	}
+  get(id: string): DocumentRecord | undefined {
+    return this.store.get(id);
+  }
 
-	search(request: SearchRequest): string[] {
-		const limit = Math.min(Math.max(request.limit ?? DEFAULT_LIMIT, 0), MAX_LIMIT);
-		return this.engine.search(request.q, limit);
-	}
+  search(request: SearchRequest): string[] {
+    const limit = Math.min(Math.max(request.limit ?? DEFAULT_LIMIT, 0), MAX_LIMIT);
+    return this.engine.search(request.q, limit);
+  }
 }

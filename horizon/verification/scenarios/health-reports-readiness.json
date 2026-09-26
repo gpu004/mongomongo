@@ -3,9 +3,7 @@
   "scenarioId": "health-reports-readiness",
   "suite": "smoke",
   "description": "Health endpoint responds and reports the document count; it does not claim correctness.",
-  "invariantIds": [
-    "INV-HEALTH"
-  ],
+  "invariantIds": ["INV-HEALTH"],
   "sequence": [
     {
       "op": "health"

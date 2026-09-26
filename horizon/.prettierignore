@@ -1,0 +1,2 @@
+# These files are intentionally broken inputs for verification tests.
+verification/fixtures/**/overlay/**

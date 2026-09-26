@@ -3,9 +3,7 @@
   "scenarioId": "empty-query-returns-nothing",
   "suite": "correctness",
   "description": "An empty or whitespace-only query returns no results.",
-  "invariantIds": [
-    "INV-EMPTY-QUERY"
-  ],
+  "invariantIds": ["INV-EMPTY-QUERY"],
   "sequence": [
     {
       "op": "insert",

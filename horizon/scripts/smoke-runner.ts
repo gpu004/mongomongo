@@ -1,4 +1,5 @@
 // Dev smoke: run the fixed suites against the seed and the stale-cache fixture.
+// Exits nonzero when a suite result differs from the expected outcome below, so it can gate CI.
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,20 +11,69 @@ const store = new ArtifactStore(join(root, "artifacts"));
 const seed = store.importSeed();
 const { artifact: stale } = store.importFixture("stale-cache", seed.hash);
 const { artifact: bypass } = store.importFixture("bypass-mutation-path", seed.hash);
-const evidence = { write: (kind: string, payload: unknown) => `ev-${kind}-${JSON.stringify(payload).length}` };
-const workload = { corpusSize: 300, seed: 7, warmupRequests: 20, measuredRequests: 100, repetitions: 2, mutationRatio: 0.1 };
+const evidence = {
+  write: (kind: string, payload: unknown) => `ev-${kind}-${JSON.stringify(payload).length}`,
+};
+const workload = {
+  corpusSize: 300,
+  seed: 7,
+  warmupRequests: 20,
+  measuredRequests: 100,
+  repetitions: 2,
+  mutationRatio: 0.1,
+};
 
-for (const [name, artifact] of [["seed", seed], ["stale-cache", stale], ["bypass", bypass]] as const) {
-	for (const suite of ["smoke", "correctness", "performance"] as const) {
-		const report = await runSuite(
-			{
-				missionId: "m", experimentId: "x", artifactHash: artifact.hash, evaluatorHash: computeEvaluatorHash(),
-				environmentHash: computeEnvironmentHash("subprocess", ""), snapshotDir: artifact.path, isolation: "subprocess", containerImage: "",
-				startupTimeoutMs: 10000, requestTimeoutMs: 5000, memoryLimitBytes: 512 * 1024 * 1024, workload, holdoutWorkload: workload, evidence,
-			},
-			suite,
-		);
-		const failed = report.assertions.filter((a) => !a.passed).map((a) => `${a.id}: ${a.detail ?? ""}`);
-		console.log(name, suite, report.status, JSON.stringify(report.metrics), failed.join(" | "), report.infraMessage ?? "");
-	}
+// Defining outcome per artifact/suite; unlisted results are recorded but not gated.
+const EXPECTED: Record<string, Record<string, string>> = {
+  seed: { smoke: "passed", correctness: "passed", performance: "passed" },
+  "stale-cache": { smoke: "passed", correctness: "failed" },
+  bypass: { smoke: "failed" },
+};
+
+let mismatches = 0;
+for (const [name, artifact] of [
+  ["seed", seed],
+  ["stale-cache", stale],
+  ["bypass", bypass],
+] as const) {
+  for (const suite of ["smoke", "correctness", "performance"] as const) {
+    const report = await runSuite(
+      {
+        missionId: "m",
+        experimentId: "x",
+        artifactHash: artifact.hash,
+        evaluatorHash: computeEvaluatorHash(),
+        environmentHash: computeEnvironmentHash("subprocess", ""),
+        snapshotDir: artifact.path,
+        isolation: "subprocess",
+        containerImage: "",
+        startupTimeoutMs: 10000,
+        requestTimeoutMs: 5000,
+        memoryLimitBytes: 512 * 1024 * 1024,
+        workload,
+        holdoutWorkload: workload,
+        evidence,
+      },
+      suite,
+    );
+    const failed = report.assertions
+      .filter((a) => !a.passed)
+      .map((a) => `${a.id}: ${a.detail ?? ""}`);
+    const expected = EXPECTED[name]?.[suite];
+    const ok = expected === undefined || report.status === expected;
+    if (!ok) mismatches += 1;
+    console.log(
+      name,
+      suite,
+      report.status,
+      expected !== undefined ? `(expected ${expected}${ok ? "" : " — MISMATCH"})` : "",
+      JSON.stringify(report.metrics),
+      failed.join(" | "),
+      report.infraMessage ?? "",
+    );
+  }
+}
+if (mismatches > 0) {
+  console.error(`smoke: ${mismatches} suite result(s) differed from expected`);
+  process.exit(1);
 }

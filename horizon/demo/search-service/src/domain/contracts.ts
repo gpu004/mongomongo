@@ -13,39 +13,39 @@
 export const CONTRACT_VERSION = 1;
 
 export interface DocumentRecord {
-	id: string;
-	title: string;
-	body: string;
-	sequence: number;
+  id: string;
+  title: string;
+  body: string;
+  sequence: number;
 }
 
 export interface InsertRequest {
-	id: string;
-	title: string;
-	body: string;
+  id: string;
+  title: string;
+  body: string;
 }
 
 export interface UpdateRequest {
-	title?: string;
-	body?: string;
+  title?: string;
+  body?: string;
 }
 
 export interface SearchRequest {
-	q: string;
-	limit?: number;
+  q: string;
+  limit?: number;
 }
 
 export interface SearchResponse {
-	ids: string[];
+  ids: string[];
 }
 
 export interface HealthResponse {
-	ok: true;
-	documents: number;
+  ok: true;
+  documents: number;
 }
 
 export interface ErrorResponse {
-	error: string;
+  error: string;
 }
 
 export const DEFAULT_LIMIT = 50;

@@ -3,10 +3,7 @@
   "scenarioId": "update-adds-new-match",
   "suite": "correctness",
   "description": "After an update, new content matches and the document keeps its insertion position.",
-  "invariantIds": [
-    "INV-UPDATE-VISIBILITY",
-    "INV-RESULT-ORDER"
-  ],
+  "invariantIds": ["INV-UPDATE-VISIBILITY", "INV-RESULT-ORDER"],
   "sequence": [
     {
       "op": "insert",

@@ -13,63 +13,37 @@
     {
       "id": "F-HEALTH",
       "name": "Health endpoint",
-      "invariants": [
-        "INV-HEALTH"
-      ],
-      "scenarios": [
-        "health-reports-readiness"
-      ]
+      "invariants": ["INV-HEALTH"],
+      "scenarios": ["health-reports-readiness"]
     },
     {
       "id": "F-NORMALIZE",
       "name": "Unicode NFC + lowercase normalization",
-      "invariants": [
-        "INV-NORMALIZATION"
-      ],
-      "scenarios": [
-        "normalization-mixed-case-and-nfc"
-      ]
+      "invariants": ["INV-NORMALIZATION"],
+      "scenarios": ["normalization-mixed-case-and-nfc"]
     },
     {
       "id": "F-EMPTY",
       "name": "Empty query returns nothing",
-      "invariants": [
-        "INV-EMPTY-QUERY"
-      ],
-      "scenarios": [
-        "empty-query-returns-nothing"
-      ]
+      "invariants": ["INV-EMPTY-QUERY"],
+      "scenarios": ["empty-query-returns-nothing"]
     },
     {
       "id": "F-MATCH",
       "name": "Substring, all-terms matching",
-      "invariants": [
-        "INV-SUBSTRING-MATCH",
-        "INV-MULTI-TERM"
-      ],
-      "scenarios": [
-        "multi-term-substring-match"
-      ]
+      "invariants": ["INV-SUBSTRING-MATCH", "INV-MULTI-TERM"],
+      "scenarios": ["multi-term-substring-match"]
     },
     {
       "id": "F-ORDER",
       "name": "Insertion order and limit",
-      "invariants": [
-        "INV-RESULT-ORDER",
-        "INV-LIMIT"
-      ],
-      "scenarios": [
-        "insertion-order-and-limit"
-      ]
+      "invariants": ["INV-RESULT-ORDER", "INV-LIMIT"],
+      "scenarios": ["insertion-order-and-limit"]
     },
     {
       "id": "F-MUTATION",
       "name": "Mutation visibility",
-      "invariants": [
-        "INV-INSERT-VISIBILITY",
-        "INV-UPDATE-VISIBILITY",
-        "INV-DELETE-VISIBILITY"
-      ],
+      "invariants": ["INV-INSERT-VISIBILITY", "INV-UPDATE-VISIBILITY", "INV-DELETE-VISIBILITY"],
       "scenarios": [
         "insert-visible-immediately",
         "update-removes-old-match",
@@ -80,9 +54,7 @@
     {
       "id": "F-ARCH",
       "name": "Mutations routed through DocumentService",
-      "invariants": [
-        "STRUCT-IMPORT-BOUNDARY"
-      ],
+      "invariants": ["STRUCT-IMPORT-BOUNDARY"],
       "scenarios": []
     }
   ],
@@ -99,13 +71,7 @@
     "INV-DELETE-VISIBILITY": "A deleted document never appears in results",
     "STRUCT-IMPORT-BOUNDARY": "src/http never imports src/storage or src/search; mutations go through DocumentService"
   },
-  "verificationOrder": [
-    "structural",
-    "smoke",
-    "correctness",
-    "learned",
-    "performance"
-  ],
+  "verificationOrder": ["structural", "smoke", "correctness", "learned", "performance"],
   "performance": {
     "metric": "median of per-repetition p95 latency (ms) after warmup, fixed workload, same schedule for baseline and candidate",
     "acceptance": "correctness and learned pass, p95 improves over current best by at least the acceptance margin, and enough paired repetitions improve"
