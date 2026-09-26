@@ -546,16 +546,16 @@ export class MissionController {
           await this.finish("succeeded");
           break;
         }
-        if (task.taskId === "baseline") {
-          await this.runBaseline();
-          continue;
-        }
-        if (task.taskId === "holdout") {
-          await this.runHoldout();
-          continue;
-        }
-        cycles += 1;
         try {
+          if (task.taskId === "baseline") {
+            await this.runBaseline();
+            continue;
+          }
+          if (task.taskId === "holdout") {
+            await this.runHoldout();
+            continue;
+          }
+          cycles += 1;
           if (active) {
             await this.evaluateExperiment(active, recovery);
             this.cyclesInSegment += 1;
@@ -732,6 +732,24 @@ export class MissionController {
     });
     this.log(`mission waiting: ${error.message}; resume at or after ${nextWakeAt}`);
     return "waiting";
+  }
+
+  private async interruptExperiment(experimentId: string, cause: unknown): Promise<void> {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    await this.transaction(async (tx) => {
+      await tx.updateExperiment(experimentId, {
+        status: "interrupted",
+        verdict: `worker aborted on ${this.stopRequest!.intent} request: ${message}`,
+        finishedAt: new Date().toISOString(),
+      });
+      await tx.appendEvent(
+        `${experimentId}:interrupted:${this.stopRequest!.intent}`,
+        "experiment.interrupted",
+        experimentId,
+        { previousStatus: "editing", reason: this.stopRequest!.source, detail: message },
+      );
+    });
+    this.log(`  ${experimentId} interrupted: worker aborted (${message})`);
   }
 
   private async finish(status: MissionStatus, detail = ""): Promise<void> {
@@ -1001,6 +1019,11 @@ export class MissionController {
       broker.terminateChildren();
       if (error instanceof WorkerUnavailableError)
         return this.parkOnWorkerFault(error, experimentId);
+      if (this.stopRequest) {
+        // The abort we asked for surfaced as the worker's failure; the edit is discarded, the experiment closed.
+        await this.interruptExperiment(experimentId, error);
+        throw new MissionInterrupted(null);
+      }
       throw error;
     } finally {
       this.activeBroker = undefined;

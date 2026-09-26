@@ -271,3 +271,114 @@ test("operator stop: a stop written during a cycle is honoured after it, rests t
   assert.notEqual((await next.run()).status, "interrupted");
   await next.close();
 });
+
+/** Pi whose in-flight prompt rejects when aborted (as `session.prompt()` does), and fails outright otherwise. */
+class AbortRejectingWorker implements Worker {
+  readonly mode = "pi" as const;
+  private reject: ((error: Error) => void) | undefined;
+  /** Resolves once `runCycle` is in flight. */
+  readonly prompting: Promise<void>;
+  private markPrompting!: () => void;
+  constructor() {
+    this.prompting = new Promise((resolve) => {
+      this.markPrompting = resolve;
+    });
+  }
+  async openSegment() {
+    return { sessionPath: null, sessionId: "abort-rejecting" };
+  }
+  runCycle(_input: WorkerCycleInput): Promise<WorkerCycleResult> {
+    return new Promise((_resolve, reject) => {
+      this.reject = reject;
+      this.markPrompting();
+    });
+  }
+  async closeSegment() {}
+  async abort() {
+    this.reject?.(new Error("prompt aborted"));
+  }
+}
+
+test("SIGTERM while Pi is mid-prompt: the abort rejection becomes an interruption checkpoint, not a crash", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "sd-abort-reject";
+  const worker = new AbortRejectingWorker();
+  const controller = controllerFor(missionId, runs, { worker });
+  await controller.initialize();
+  const running = controller.run();
+  await worker.prompting;
+  await controller.requestStop({ intent: "stop", source: "signal", reason: "SIGTERM" });
+  const row = await running;
+  assert.equal(row.status, "interrupted");
+  const experiments = (await controller.ledger.listExperiments(missionId)).filter(
+    (e) => e.taskId === "optimize-search",
+  );
+  assert.equal(experiments.length, 1);
+  assert.equal(experiments[0]!.status, "interrupted");
+  assert.match(experiments[0]!.verdict ?? "", /prompt aborted/);
+  const events = await controller.ledger.eventsSince(0);
+  assert.ok(events.find((e) => e.type === "experiment.interrupted"));
+  const interrupted = events.find((e) => e.type === "mission.interrupted");
+  assert.ok(interrupted);
+  assert.equal((interrupted.payload as { reason: string }).reason, "signal");
+  const checkpoint = await controller.ledger.latestCheckpoint(missionId);
+  assert.equal(checkpoint?.missionStatus, "interrupted");
+  assert.equal(checkpoint?.activeExperimentId, null);
+  assert.equal(controller.lease, undefined, "lease released");
+  await controller.close();
+});
+
+test("a worker failure with no stop pending still propagates", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "sd-real-failure";
+  const worker = new AbortRejectingWorker();
+  const controller = controllerFor(missionId, runs, { worker });
+  await controller.initialize();
+  const running = controller.run();
+  await worker.prompting;
+  await worker.abort();
+  await assert.rejects(running, /prompt aborted/);
+  assert.equal(controller.stopRequested, undefined);
+  await controller.close();
+});
+
+test("SIGTERM during the baseline phase: interruption is checkpointed between suites and the lease released", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "sd-baseline";
+  const controller = controllerFor(missionId, runs);
+  await controller.initialize();
+  const running = controller.run();
+  // Stop as soon as the baseline experiment is being evaluated (i.e. its first suite is running).
+  const untilEvaluating = new Promise<void>((resolve) => {
+    const tick = setInterval(() => {
+      void controller.ledger.listExperiments(missionId).then((rows) => {
+        if (rows.some((e) => e.taskId === "baseline" && e.status === "evaluating")) {
+          clearInterval(tick);
+          resolve();
+        }
+      });
+    }, 10);
+  });
+  await untilEvaluating;
+  await controller.requestStop({ intent: "stop", source: "signal", reason: "SIGTERM" });
+  const row = await running;
+  assert.equal(row.status, "interrupted");
+  assert.equal(row.spentExperiments, 0);
+  const events = await controller.ledger.eventsSince(0);
+  const interrupted = events.find((e) => e.type === "mission.interrupted");
+  assert.ok(interrupted, "mission.interrupted written even though no optimize cycle ran");
+  const checkpoint = await controller.ledger.latestCheckpoint(missionId);
+  assert.equal(checkpoint?.missionStatus, "interrupted");
+  assert.equal(controller.lease, undefined, "lease released");
+  await controller.close();
+
+  // Resume finishes the baseline and moves on without a second baseline experiment.
+  const resumed = controllerFor(missionId, runs, { maxCycles: 1 });
+  const done = await resumed.run();
+  assert.notEqual(done.status, "interrupted");
+  const baselines = (await resumed.ledger.listExperiments(missionId)).filter(
+    (e) => e.taskId === "baseline",
+  );
+  assert.equal(baselines.length, 1);
+  await resumed.close();
+});
