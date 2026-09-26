@@ -1187,7 +1187,7 @@ export class Ledger {
     return (
       this.db
         .prepare(
-          "SELECT * FROM container WHERE mission_id = ? AND state = 'launching' ORDER BY created_at, container_name",
+          "SELECT * FROM container WHERE mission_id = ? AND state = 'launching' ORDER BY rowid",
         )
         .all(missionId) as Row[]
     ).map(toContainer);
@@ -1196,7 +1196,7 @@ export class Ledger {
   listContainers(missionId: string): ContainerRow[] {
     return (
       this.db
-        .prepare("SELECT * FROM container WHERE mission_id = ? ORDER BY created_at, container_name")
+        .prepare("SELECT * FROM container WHERE mission_id = ? ORDER BY rowid")
         .all(missionId) as Row[]
     ).map(toContainer);
   }
