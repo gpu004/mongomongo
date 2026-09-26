@@ -8,8 +8,6 @@ on:
 permissions:
   contents: read
 
-# Provider/service keys are deliberately not exposed: every job must pass with the
-# scripted worker, the local memory adapter and (for `verify`) the sqlite ledger only.
 env:
   CI: "true"
 
@@ -54,11 +52,11 @@ jobs:
       MONGODB_DB: horizon_ci
     steps:
       - uses: actions/checkout@v4
-      # The ledger uses transactions, which need a replica set; `services:` cannot pass
-      # `--replSet`, so the single-node set is started and initiated by hand.
-      - name: Start a single-node MongoDB replica set
+      - name: Start a single-node MongoDB replica set (mongo:7.0.43, digest-pinned)
         run: |
-          docker run -d --name mongodb -p 27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+          docker run -d --name mongodb -p 27017:27017 \
+            mongo@sha256:9854f7139445d766a9523571d6f047530c45547460ffcf8259eb2bf4264632ca \
+            --replSet rs0 --bind_ip_all
           for i in $(seq 1 30); do
             if docker exec mongodb mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]}).ok' >/dev/null 2>&1; then break; fi
             sleep 2
