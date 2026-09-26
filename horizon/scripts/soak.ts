@@ -53,6 +53,8 @@ const maxRuns = positiveInteger(values["max-runs"], 8, "max-runs");
 const faultEvery = positiveInteger(values["fault-every"], 2, "fault-every");
 const base = loadMissionConfig(configPath);
 if (base.worker !== "scripted") throw new Error("soak requires a scripted worker config");
+if (existsSync(join(out, "samples.jsonl")) || existsSync(join(out, "report.json")))
+  throw new Error(`soak output already exists at ${out}`);
 mkdirSync(out, { recursive: true });
 const runsRoot = join(out, "missions");
 mkdirSync(runsRoot, { recursive: true });
@@ -196,10 +198,10 @@ const report = {
   elapsedMs: Date.now() - startedAt,
   injectedFaults: samples.filter((sample) => sample.faultInjected).length,
   replayedFaults: samples.filter((sample) => sample.replayedFault).length,
-  maxPacketTokens: Math.max(0, ...samples.flatMap((sample) => sample.packetTokens)),
-  maxLedgerBytes: Math.max(0, ...samples.map((sample) => sample.ledgerBytes)),
-  maxSessionBytes: Math.max(0, ...samples.map((sample) => sample.sessionBytes)),
-  maxArtifactBytes: Math.max(0, ...samples.map((sample) => sample.artifactBytes)),
+  maxPacketTokens: samples.reduce((max, sample) => Math.max(max, ...sample.packetTokens), 0),
+  maxLedgerBytes: samples.reduce((max, sample) => Math.max(max, sample.ledgerBytes), 0),
+  maxSessionBytes: samples.reduce((max, sample) => Math.max(max, sample.sessionBytes), 0),
+  maxArtifactBytes: samples.reduce((max, sample) => Math.max(max, sample.artifactBytes), 0),
   samples: samples.length,
 };
 writeFileSync(join(out, "samples.json"), JSON.stringify(samples, null, 2));
