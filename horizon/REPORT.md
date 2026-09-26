@@ -8,7 +8,7 @@ Inspected repositories: `pi/` (Pi coding agent SDK) and `supermemory/` (memory A
 
 | Concern                                    | Where it lives                                                                                                       | How Horizon uses it                                                                                                                            | Measured?                                                                                                                               |
 | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Request assembly / system prompt / tools   | `pi` SDK `createAgentSession`; Horizon `src/pi-worker.ts`, `src/context-packet.ts`, `src/tool-broker.ts`             | Built-in tools disabled; broker tools only; packet injected as the segment's user turn                                                         | Packet size measured (`packet.built` events). Live model turns **not run** (no LLM key).                                                |
+| Request assembly / system prompt / tools   | `pi` SDK `createAgentSession`; Horizon `src/pi-worker.ts`, `src/context-packet.ts`, `src/tool-broker.ts`             | Built-in tools disabled; broker tools only; packet injected as the segment's user turn                                                         | Packet size measured (`packet.built` events). A live-model request was rejected by the provider before producing tokens (§5).           |
 | Session persistence / compaction / history | Pi JSONL sessions under `runs/<mission>/sessions/`; Horizon segments in the ledger                                   | Segment rotation checkpoints canonical state first, then opens a new Pi session with a pointer to the previous one                             | Rotation measured in tests and the comparison run. Pi compaction **assumed** from SDK code.                                             |
 | Memory ingestion / retrieval / delays      | `src/memory-adapter.ts`, `src/memory-outbox.ts`                                                                      | Outbox with stable `customId`; "accepted" vs "document ready" vs "memory ready" distinguished; local adapter when `SUPERMEMORY_API_KEY` absent | Local adapter measured up to 100k episodes; hosted Supermemory measured with `scripts/supermemory-probe.ts` (12 and 20 episodes, §5.8). |
 | Execution boundary / restart               | `verification/runner.ts` (subprocess or Docker), `src/recovery.ts`, `src/ledger.ts` (SQLite WAL, `synchronous=FULL`) | Every controller launch reconciles intent/outcome before acting                                                                                | Measured: 6 recovery tests, comparison crash schedule, Docker run.                                                                      |
@@ -17,7 +17,7 @@ Inspected repositories: `pi/` (Pi coding agent SDK) and `supermemory/` (memory A
 
 Seed baseline (mission.example.json workload, subprocess): p95 ≈ 1.63–1.83 ms across runs on this VM; Docker: 2.57 ms. Wall time for one complete scripted mission (baseline, 2–3 experiments, holdout): 9–12 s. Token counts are **estimated** (`usageUncertain` flag) because the scripted worker has no provider usage report.
 
-Baseline measurements the prompt asks for that are **not** available: cost in currency, live-model token usage (no `ANTHROPIC_API_KEY`), hosted-memory behaviour beyond 20 episodes.
+Baseline measurements the prompt asks for that are **not** available: cost in currency, successful live-model token usage, hosted-memory behaviour beyond 20 episodes.
 
 ## 2. Architecture and ownership
 
@@ -69,9 +69,18 @@ node src/cli.ts memory-bench --episodes 1000,10000,100000           # §5.7
 node scripts/supermemory-probe.ts --episodes 12|20                  # §5.8 (hosted, SUPERMEMORY_API_KEY)
 ```
 
-Not run: Pi worker against a live model (no `ANTHROPIC_API_KEY`); any workload larger than 5000 documents or 3 repetitions.
+Not completed: Pi worker against a live model (the Google API rejected the supplied key); any workload larger than 5000 documents or 3 repetitions.
 
 ## 5. Results
+
+### Live Pi attempt (Google Gemini 2.5 Flash-Lite)
+
+The bounded `mission.pi.example.json` completed the seed baseline (smoke, correctness,
+learned, performance passed; p95 1.72 ms). Its first Pi request reached Google's API,
+which returned `API_KEY_INVALID`; the session recorded zero input/output tokens. The
+worker originally treated this as an inconclusive identical candidate. Pi now raises an
+error on an assistant message with `stopReason: "error"`, and the same credential produces
+a failing CLI exit instead. No live-model optimization or holdout result was obtained.
 
 ### Before/after (single mission, subprocess)
 
@@ -160,7 +169,7 @@ Every report under `runs/<mission>/reports/` carries `missionId`, `experimentId`
 
 ## 7. Remaining failures, unmeasured claims, limits, next experiment
 
-- **Unmeasured**: live LLM worker behaviour (the whole "model repeats mistakes" story is exercised only through the scripted worker; no `ANTHROPIC_API_KEY`); hosted Supermemory beyond 20 episodes; `compare` against the hosted adapter (it uses the local adapter); token cost (estimated only). Largest tested history: 100k episodes / 15.3M archived tokens (synthetic, local). No billion-token or multi-hour claim is made.
+- **Unmeasured**: successful live LLM worker behaviour (the whole "model repeats mistakes" story is exercised only through the scripted worker; the supplied Google key was rejected); hosted Supermemory beyond 20 episodes; `compare` against the hosted adapter (it uses the local adapter); token cost (estimated only). Largest tested history: 100k episodes / 15.3M archived tokens (synthetic, local). No billion-token or multi-hour claim is made.
 - **Skill eval**: the scripted worker does not read the failing assertion evidence before moving on (9/10); a live worker should be graded with `horizon skill-eval --config <pi mission>`.
 - **Addressed weakness**: the 30% p95 target was previously near the noise floor because the scripted candidate's full index rebuild landed in the top 5% of samples (one of three comparison runs missed it with a correct, faster candidate). That is fixed in the candidate (change 16); the residual risk is shared-hardware noise, which the baseline spread warning (change 10) exposes: lengthen `measuredRequests`/`repetitions` when it fires.
 - **Isolation**: `subprocess` mode is cooperative; only `container` mode enforces limits, and it was run manually, not in tests.

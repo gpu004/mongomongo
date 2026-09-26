@@ -170,6 +170,11 @@ export class PiWorker implements Worker {
         .filter((line): line is string => line !== null)
         .join("\n");
       await this.session.prompt(prompt, { expandPromptTemplates: false });
+      const finalMessage = this.session.messages.at(-1);
+      if (finalMessage?.role === "assistant" && finalMessage.stopReason === "error")
+        throw new Error(
+          `Pi model request failed (${this.options.provider}/${this.options.modelId}); inspect the Pi session for details`,
+        );
     } finally {
       clearTimeout(timer);
       unsubscribe();
