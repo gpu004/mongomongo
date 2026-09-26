@@ -200,10 +200,89 @@ export interface RetrievalSelection {
   injected: {
     episodeId: string;
     text: string;
-    source: "remote" | "local_cache" | "local_pending";
+    source: "remote" | "local_cache" | "local_pending" | "cross_mission";
+    /** Set for cross-mission items: where the episode came from, so the packet and the event can cite it. */
+    provenance?: { missionId: string; containerTag: string };
   }[];
   filteredOut: { episodeId: string | null; reason: string }[];
   degraded: boolean;
+}
+
+/**
+ * Read-only retrieval from the shared codebase tier. This mission never writes
+ * there, and no local ledger rows exist for foreign episodes, so the post-filter
+ * is stricter than the mission tier: only verified, unseeded episodes from other
+ * missions on the same contract version pass, and each one is labelled with its
+ * origin mission and tag. Failures degrade to "nothing retrieved", never to the
+ * local index, which is mission-scoped by construction.
+ */
+export async function retrieveCrossMissionEpisodes(
+  adapter: MemoryAdapter,
+  scope: { missionId: string; readTags: string[]; contractVersion: number },
+  query: string,
+  candidateLimit = 10,
+  select = 2,
+  onOperation: () => void | Promise<void> = () => {},
+): Promise<RetrievalSelection> {
+  const selection: RetrievalSelection = { injected: [], filteredOut: [], degraded: false };
+  const seen = new Set<string>();
+  for (const containerTag of scope.readTags) {
+    let hits: MemoryHit[] = [];
+    try {
+      await onOperation();
+      hits = await adapter.search(containerTag, query, candidateLimit);
+    } catch {
+      selection.degraded = true;
+      continue;
+    }
+    for (const hit of hits) {
+      if (selection.injected.length >= select) break;
+      const meta = hit.metadata;
+      const episodeId = episodeIdOf(hit);
+      const origin = typeof meta.missionId === "string" ? meta.missionId : null;
+      if (!episodeId || !origin) {
+        selection.filteredOut.push({ episodeId, reason: "cross-mission: no provenance" });
+        continue;
+      }
+      if (origin === scope.missionId) {
+        selection.filteredOut.push({
+          episodeId,
+          reason: "cross-mission: own mission (served by mission tier)",
+        });
+        continue;
+      }
+      if (
+        typeof meta.contractVersion !== "number" ||
+        meta.contractVersion !== scope.contractVersion
+      ) {
+        selection.filteredOut.push({
+          episodeId,
+          reason: `cross-mission: contract version ${String(meta.contractVersion)} not applicable`,
+        });
+        continue;
+      }
+      if (meta.interpretation !== "verified") {
+        selection.filteredOut.push({ episodeId, reason: "cross-mission: not verifier-backed" });
+        continue;
+      }
+      if (typeof meta.seededFixture === "string" && meta.seededFixture !== "") {
+        selection.filteredOut.push({
+          episodeId,
+          reason: "cross-mission: seeded fault-injection fixture",
+        });
+        continue;
+      }
+      if (seen.has(episodeId)) continue;
+      seen.add(episodeId);
+      selection.injected.push({
+        episodeId,
+        text: `[cross-mission prior from ${origin} via ${containerTag}; its evidence is not available locally, treat as a lead, not proof]\n${hit.content}`,
+        source: "cross_mission",
+        provenance: { missionId: origin, containerTag },
+      });
+    }
+  }
+  return selection;
 }
 
 /**

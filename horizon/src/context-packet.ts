@@ -27,6 +27,8 @@ export interface PacketInput {
   featureMap: string;
   recent: string;
   retrieved: RetrievedEpisode[];
+  /** Ranked structured lessons; shares the retrieval allowance and is placed ahead of raw episodes. */
+  lessons?: string;
   next: string;
 }
 
@@ -35,8 +37,13 @@ export interface ContextPacket {
   tokens: number;
   injectedEpisodeIds: string[];
   droppedEpisodeIds: string[];
-  sections: Record<keyof Omit<PacketInput, "retrieved"> | "retrieved", number>;
+  sections: Record<keyof Omit<PacketInput, "retrieved" | "lessons"> | "retrieved", number> & {
+    lessons: number;
+  };
 }
+
+/** Share of the retrieval allowance that ranked lessons may occupy before raw episodes are considered. */
+export const LESSONS_SHARE_OF_RETRIEVAL = 0.4;
 
 export class PacketConfigurationError extends Error {}
 
@@ -66,13 +73,18 @@ export function buildPacket(
   const recent = trimTo(input.recent, budget.recent);
   const next = trimTo(input.next, budget.next);
 
+  const lessons = input.lessons
+    ? trimTo(input.lessons, Math.floor(budget.retrieved * LESSONS_SHARE_OF_RETRIEVAL))
+    : "";
+  const lessonTokens = lessons ? estimateTokens(lessons) : 0;
+
   const injected: string[] = [];
   const dropped: string[] = [];
   const retrievedParts: string[] = [];
   let retrievedTokens = 0;
   for (const episode of input.retrieved) {
     const cost = estimateTokens(episode.text) + 2;
-    if (retrievedTokens + cost <= budget.retrieved) {
+    if (lessonTokens + retrievedTokens + cost <= budget.retrieved) {
       retrievedParts.push(episode.text);
       retrievedTokens += cost;
       injected.push(episode.episodeId);
@@ -88,6 +100,7 @@ export function buildPacket(
     featureMap,
     "## Recent results and hypothesis",
     recent,
+    ...(lessons ? ["## Performance lessons (ranked, measured, with evidence)", lessons] : []),
     "## Retrieved episodes (historical, scoped to this mission)",
     retrievedParts.length > 0 ? retrievedParts.join("\n\n") : "(none)",
     "## Evidence pointers and next action",
@@ -109,6 +122,7 @@ export function buildPacket(
       featureMap: estimateTokens(featureMap),
       recent: estimateTokens(recent),
       retrieved: retrievedTokens,
+      lessons: lessonTokens,
       next: estimateTokens(next),
     },
   };

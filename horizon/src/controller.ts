@@ -37,8 +37,26 @@ import {
   renderEpisode,
   SupermemoryAdapter,
 } from "./memory-adapter.ts";
-import { composeRetrievalQuery, MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
+import {
+  composeRetrievalQuery,
+  MemoryOutbox,
+  retrieveCrossMissionEpisodes,
+  retrieveEpisodes,
+} from "./memory-outbox.ts";
 import { contractHash, type MissionConfig } from "./mission-contract.ts";
+import {
+  decidePerformancePolicy,
+  decodePerformanceLesson,
+  deltaFraction,
+  encodePerformanceLesson,
+  type PerformanceLesson,
+  type PerformanceLessonKind,
+  performanceLessonId,
+  type PerformancePolicy,
+  rankPerformanceLessons,
+  recordPerformanceObservation,
+  renderPerformanceLessons,
+} from "./performance-lesson.ts";
 import {
   ensureMissionDirs,
   FileEvidenceStore,
@@ -91,7 +109,11 @@ interface Story {
   claim: string;
   seededFixture: string | null;
   claimIssues?: string[];
+  /** Whether the worker ran profile_candidate before editing in this cycle. */
+  profiled?: boolean;
 }
+
+const DEFAULT_PERFORMANCE_REJECTION_LIMIT = 2;
 
 /** Per-field character limits for worker prose kept in events, episodes and packets; full text goes to evidence. */
 const WORKER_TEXT_LIMITS = { hypothesis: 400, whatChanged: 800, claim: 800 } as const;
@@ -817,7 +839,24 @@ export class MissionController {
         `  stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}); requiring a new mechanism or a profiling step`,
       );
     }
-    const packet = await this.buildPacket(mission, experimentId, stagnation);
+    const policy = await this.performancePolicy();
+    if (policy.blockedMechanisms.length > 0) {
+      await this.ledger.appendEvent(
+        `${experimentId}:performance-policy`,
+        "policy.performance",
+        experimentId,
+        {
+          limit: policy.limit,
+          blocked: policy.blockedMechanisms,
+          preferred: policy.preferredMechanisms,
+          focusFeatureIds: policy.focusFeatureIds,
+        },
+      );
+      this.log(
+        `  performance policy: ${policy.blockedMechanisms.length} mechanism(s) blocked after >= ${policy.limit} measured rejections; requiring a profile or a different mechanism`,
+      );
+    }
+    const packet = await this.buildPacket(mission, experimentId, stagnation, policy);
     this.cycleDeadline = Date.now() + this.config.budget.cycleTimeoutMs;
     const broker = new ToolBroker(
       this.paths.candidate,
@@ -882,6 +921,37 @@ export class MissionController {
       );
       return "continue";
     }
+    const blocked = policy.blockedMechanisms.find(
+      (b) => b.mechanism === normalizeHypothesis(result.hypothesis),
+    );
+    if (blocked && broker.profiles.length === 0) {
+      await this.ledger.appendEvent(
+        `${experimentId}:performance-policy:enforced`,
+        "policy.performance.enforced",
+        experimentId,
+        {
+          lessonId: blocked.lessonId,
+          mechanism: blocked.mechanism,
+          rejections: blocked.rejections,
+        },
+      );
+      await this.conclude(
+        (await this.ledger.getExperiment(experimentId))!,
+        "rejected",
+        `performance policy: mechanism "${blocked.mechanism}" was rejected on measurement ${blocked.rejections} time(s) (lesson ${blocked.lessonId}); repeating it without a profiling step is refused`,
+        [],
+        {
+          hypothesis: text.hypothesis,
+          whatChanged: text.whatChanged,
+          claim: text.claim,
+          seededFixture: result.seededFixture,
+          claimIssues: audit.issues,
+          profiled: false,
+        },
+        mission,
+      );
+      return "continue";
+    }
 
     const snapshot = this.artifacts.snapshot(this.paths.candidate, parent);
     await this.transaction(async (tx) => {
@@ -905,6 +975,7 @@ export class MissionController {
         seededFixture: result.seededFixture,
         aborted: result.aborted,
         claimIssues: audit.issues,
+        profiled: broker.profiles.length > 0,
       });
       await this.checkpoint(tx, "running", "optimize-search", experimentId, "snapshot_ready");
     });
@@ -916,6 +987,7 @@ export class MissionController {
       claim: text.claim,
       seededFixture: result.seededFixture,
       claimIssues: audit.issues,
+      profiled: broker.profiles.length > 0,
     });
     this.cyclesInSegment += 1;
     return "continue";
@@ -997,17 +1069,28 @@ export class MissionController {
     const [perf] = await this.runSuites(experiment.experimentId, hash, ["performance"]);
     if (!perf || perf.status !== "passed") {
       const kind = perf?.status === "failed" ? "rejected" : "inconclusive";
+      const reason = `performance ${perf?.status ?? "missing"}: ${
+        perf?.infraMessage ??
+        perf?.assertions
+          .filter((a) => !a.passed)
+          .map((a) => a.id)
+          .join(", ") ??
+        ""
+      }`;
+      if (kind === "rejected")
+        await this.observePerformanceLesson(
+          experiment,
+          "performance_negative",
+          story,
+          [...gate, perf!],
+          perf!.metrics.p95LatencyMs ?? null,
+          mission.bestP95Ms,
+          reason,
+        );
       return this.conclude(
         experiment,
         kind,
-        `performance ${perf?.status ?? "missing"}: ${
-          perf?.infraMessage ??
-          perf?.assertions
-            .filter((a) => !a.passed)
-            .map((a) => a.id)
-            .join(", ") ??
-          ""
-        }`,
+        reason,
         [...gate, ...(perf ? [perf] : [])],
         story,
         mission,
@@ -1031,7 +1114,17 @@ export class MissionController {
       decision = rerun.decision;
       if (rerun.candidate) accepted = rerun.candidate;
     }
-    if (decision.kind !== "accept")
+    if (decision.kind !== "accept") {
+      if (decision.kind === "reject")
+        await this.observePerformanceLesson(
+          experiment,
+          "performance_negative",
+          story,
+          reports,
+          accepted.metrics.p95LatencyMs ?? null,
+          mission.bestP95Ms,
+          decision.reason,
+        );
       return this.conclude(
         experiment,
         decision.kind === "reject" ? "rejected" : "inconclusive",
@@ -1040,7 +1133,17 @@ export class MissionController {
         story,
         mission,
       );
+    }
     const p95 = accepted.metrics.p95LatencyMs ?? null;
+    await this.observePerformanceLesson(
+      experiment,
+      "performance_positive",
+      story,
+      reports,
+      p95,
+      mission.bestP95Ms,
+      decision.reason,
+    );
     await this.transaction(async (tx) => {
       await tx.updateMission(this.config.missionId, { bestArtifactHash: hash, bestP95Ms: p95 });
       await tx.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, {
@@ -1227,7 +1330,7 @@ export class MissionController {
   private nextActionAfter(verdict: Verdict, reason: string, mission: MissionRow): string {
     if (verdict === "accepted")
       return "profile the new best artifact and look for the next bottleneck";
-    if (reason.startsWith("stagnation"))
+    if (reason.startsWith("stagnation") || reason.startsWith("performance policy"))
       return "profile the current best artifact before editing, or try a mechanism not yet attempted";
     if (verdict === "inconclusive" && reason.includes("timing"))
       return "the timing difference was within measurement noise; look for a mechanism with a larger effect or profile to confirm the bottleneck";
@@ -1398,6 +1501,75 @@ export class MissionController {
     }
   }
 
+  private async performanceLessons(): Promise<PerformanceLesson[]> {
+    return (await this.ledger.listLessons(this.config.missionId))
+      .map(decodePerformanceLesson)
+      .filter((l): l is PerformanceLesson => l !== undefined);
+  }
+
+  /** Metric-driven policy derived from durable lessons, so the decision survives restarts and backends alike. */
+  async performancePolicy(): Promise<PerformancePolicy> {
+    return decidePerformancePolicy(
+      await this.performanceLessons(),
+      this.config.performanceRejectionLimit ?? DEFAULT_PERFORMANCE_REJECTION_LIMIT,
+    );
+  }
+
+  /**
+   * Records a measured performance outcome as a durable lesson keyed by mechanism.
+   * Every observation cites the performance report(s) and evidence IDs that produced
+   * the numbers; the lesson never stores the worker's claim as fact.
+   */
+  private async observePerformanceLesson(
+    experiment: ExperimentRow,
+    kind: PerformanceLessonKind,
+    story: Story,
+    reports: VerificationReport[],
+    candidateP95Ms: number | null,
+    comparedP95Ms: number | null,
+    reason: string,
+  ): Promise<void> {
+    const mechanism = normalizeHypothesis(story.hypothesis);
+    if (!mechanism) return;
+    const lessonId = performanceLessonId(kind, mechanism);
+    const existing = (await this.performanceLessons()).find((l) => l.lessonId === lessonId);
+    const perfReports = reports.filter((r) => r.suite === "performance");
+    const lesson = recordPerformanceObservation(existing, {
+      kind,
+      mechanism,
+      hypothesis: story.hypothesis,
+      featureIds: this.featuresFor(reports),
+      observation: {
+        experimentId: experiment.experimentId,
+        episodeId: `ep-${experiment.experimentId}-v1`,
+        candidateP95Ms,
+        comparedP95Ms,
+        deltaFraction: deltaFraction(candidateP95Ms, comparedP95Ms),
+        reportIds: perfReports.map((r) => r.reportId),
+        evidenceIds: perfReports.flatMap((r) => r.evidenceIds).slice(0, 8),
+        profiled: story.profiled ?? false,
+        reason,
+        at: new Date().toISOString(),
+      },
+    });
+    if (lesson === existing) return;
+    await this.ledger.upsertLesson(encodePerformanceLesson(this.config.missionId, lesson));
+    await this.ledger.appendEvent(
+      `${experiment.experimentId}:lesson:${lessonId}`,
+      "lesson.performance",
+      lessonId,
+      {
+        kind,
+        mechanism,
+        observations: lesson.observations.length,
+        candidateP95Ms,
+        comparedP95Ms,
+        deltaFraction: deltaFraction(candidateP95Ms, comparedP95Ms),
+        evidenceIds: lesson.observations.at(-1)!.evidenceIds,
+      },
+    );
+  }
+
   private async handleProposal(
     experimentId: string,
     proposal: RegressionProposal,
@@ -1557,6 +1729,7 @@ export class MissionController {
   private async retrievalQuery(
     experiments: ExperimentRow[],
     experimentId: string,
+    focusFeatureIds: string[] = [],
   ): Promise<string> {
     const task = (await this.ledger.listTasks(this.config.missionId)).find(
       (t) => t.taskId === "optimize-search",
@@ -1568,7 +1741,8 @@ export class MissionController {
     return composeRetrievalQuery({
       taskId: "optimize-search",
       hypothesis: last?.hypothesis ?? task?.hypothesis ?? null,
-      featureIds: episode?.featureIds ?? [],
+      // Features touched by accepted mechanisms come first so ranking leans toward episodes that share them.
+      featureIds: [...new Set([...focusFeatureIds, ...(episode?.featureIds ?? [])])],
       invariantIds: episode?.invariantIds ?? [],
       lastVerdict: last?.verdict ?? null,
       lastFailureSignature: last?.failureSignature ?? null,
@@ -1579,6 +1753,7 @@ export class MissionController {
     mission: MissionRow,
     experimentId: string,
     stagnation: StagnationState,
+    policy: PerformancePolicy,
   ): Promise<ContextPacket> {
     const experiments = (await this.ledger.listExperiments(this.config.missionId)).filter(
       (e) => e.taskId === "optimize-search",
@@ -1597,7 +1772,8 @@ export class MissionController {
     const recent = recentLines.join("\n\n");
     const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
     const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
-    const query = await this.retrievalQuery(experiments, experimentId);
+    const query = await this.retrievalQuery(experiments, experimentId, policy.focusFeatureIds);
+    const lessons = rankPerformanceLessons(await this.performanceLessons());
     const nextAction =
       (await this.ledger.listTasks(this.config.missionId)).find(
         (t) => t.taskId === "optimize-search",
@@ -1618,6 +1794,24 @@ export class MissionController {
           () => this.spendMemoryOperation(),
         )
       : { injected: [], filteredOut: [], degraded: false };
+    const crossTags = this.config.memory.crossMission?.readTags ?? [];
+    const cross =
+      this.config.memory.enabled && crossTags.length > 0
+        ? await retrieveCrossMissionEpisodes(
+            this.memory,
+            {
+              missionId: this.config.missionId,
+              readTags: crossTags,
+              contractVersion: this.config.contractVersion,
+            },
+            query,
+            10,
+            2,
+            () => this.spendMemoryOperation(),
+          )
+        : { injected: [], filteredOut: [], degraded: false };
+    const retrievedAll = [...retrieval.injected, ...cross.injected];
+    const filteredOut = [...retrieval.filteredOut, ...cross.filteredOut];
     const lastVerdict = experiments.at(-1)?.verdict ?? "no experiments yet";
     const pinned = [
       `Mission ${mission.missionId} (contract v${mission.contractVersion}, hash ${mission.contractHash.slice(0, 12)}). Objective: ${this.config.objective}`,
@@ -1635,12 +1829,21 @@ export class MissionController {
         pinned,
         featureMap: `${features}\n\n${skill}`,
         recent: recent || "No experiments yet.",
-        retrieved: retrieval.injected.map((r) => ({ episodeId: r.episodeId, text: r.text })),
+        retrieved: retrievedAll.map((r) => ({ episodeId: r.episodeId, text: r.text })),
+        ...(lessons.length > 0 ? { lessons: renderPerformanceLessons(lessons, policy) } : {}),
         next: `Last verdict: ${lastVerdict}\nNext action: ${nextAction}\n${
           stagnation.stagnated
             ? `Stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}). This cycle must call profile_candidate before editing or try a mechanism other than: ${stagnation.triedHypotheses.join(" | ")}. Repeating one of those without profiling is rejected without verification.\n`
             : ""
-        }Filtered from retrieval: ${retrieval.filteredOut.map((f) => `${f.episodeId ?? "?"} (${f.reason})`).join("; ") || "none"}`,
+        }${
+          policy.blockedMechanisms.length > 0
+            ? `Performance policy: the following mechanisms were rejected on measurement at least ${policy.limit} times and are blocked unless this cycle calls profile_candidate first: ${policy.blockedMechanisms.map((b) => `"${b.mechanism}" (${b.rejections}x, evidence ${b.evidenceIds.slice(0, 2).join(", ") || "-"})`).join(" | ")}. Choose a different mechanism or profile a different target.\n`
+            : ""
+        }${
+          policy.preferredMechanisms.length > 0
+            ? `Accepted mechanisms so far: ${policy.preferredMechanisms.map((p) => `"${p.mechanism}"`).join(" | ")}; retrieval is weighted toward features ${policy.focusFeatureIds.join(", ") || "-"}.\n`
+            : ""
+        }Filtered from retrieval: ${filteredOut.map((f) => `${f.episodeId ?? "?"} (${f.reason})`).join("; ") || "none"}`,
       },
       DEFAULT_PACKET_BUDGET,
     );
@@ -1650,8 +1853,23 @@ export class MissionController {
       sections: packet.sections,
       injected: packet.injectedEpisodeIds,
       dropped: packet.droppedEpisodeIds,
-      filteredOut: retrieval.filteredOut,
+      filteredOut,
       degraded: retrieval.degraded,
+      crossMission: {
+        readTags: crossTags,
+        degraded: cross.degraded,
+        injected: cross.injected.map((r) => ({ episodeId: r.episodeId, ...r.provenance! })),
+      },
+      lessons: lessons.map((l) => ({
+        lessonId: l.lessonId,
+        kind: l.kind,
+        observations: l.observations.length,
+      })),
+      policy: {
+        blocked: policy.blockedMechanisms.map((b) => b.lessonId),
+        preferred: policy.preferredMechanisms.map((p) => p.lessonId),
+        focusFeatureIds: policy.focusFeatureIds,
+      },
     });
     return packet;
   }
