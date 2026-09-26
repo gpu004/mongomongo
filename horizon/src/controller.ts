@@ -8,6 +8,7 @@ import {
   validateReport,
   type VerificationReport,
 } from "../verification/reports.ts";
+import type { ContainerRegistry } from "../verification/candidate-process.ts";
 import { computeEnvironmentHash, computeEvaluatorHash, runSuite } from "../verification/runner.ts";
 import { loadScenarios, type Scenario } from "../verification/scenarios/index.ts";
 import { ArtifactStore } from "./artifact-store.ts";
@@ -36,7 +37,7 @@ import {
   renderEpisode,
   SupermemoryAdapter,
 } from "./memory-adapter.ts";
-import { MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
+import { composeRetrievalQuery, MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
 import { contractHash, type MissionConfig } from "./mission-contract.ts";
 import {
   ensureMissionDirs,
@@ -44,7 +45,7 @@ import {
   type MissionPaths,
   writeJsonAtomic,
 } from "./mission-paths.ts";
-import { recover, type RecoveryOutcome } from "./recovery.ts";
+import { type ContainerRuntime, recover, type RecoveryOutcome } from "./recovery.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
 import { cleanupOrphanContainers } from "./sandbox.ts";
 import { type BrokerHooks, ToolBroker } from "./tool-broker.ts";
@@ -70,6 +71,8 @@ export interface ControllerOptions {
   crashAt?: string;
   /** Stop after this many cycles regardless of budget (CLI --cycles). */
   maxCycles?: number;
+  /** Test hook: container runtime used by resume to remove orphaned candidate containers. */
+  containerRuntime?: ContainerRuntime;
   /** Test hook: how `run()` waits for a persisted `nextWakeAt` (default: real sleep). */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -133,6 +136,7 @@ export class MissionController {
   private readonly log: (line: string) => void;
   private readonly crashAt: string | undefined;
   private readonly maxCycles: number;
+  private readonly containerRuntime: ContainerRuntime | undefined;
   private readonly sleep: (ms: number) => Promise<void>;
   readonly evaluatorHash: string;
   readonly environmentHash: string;
@@ -168,6 +172,7 @@ export class MissionController {
     this.log = options.log ?? (() => {});
     this.crashAt = options.crashAt;
     this.maxCycles = options.maxCycles ?? Number.POSITIVE_INFINITY;
+    this.containerRuntime = options.containerRuntime;
     this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.evaluatorHash = computeEvaluatorHash();
     this.environmentHash = computeEnvironmentHash(config.isolation, config.containerImage);
@@ -250,6 +255,26 @@ export class MissionController {
     return this.mission();
   }
 
+  /** Ledger-backed registry: container names are durable before `docker run` and closed after stop. */
+  containerRegistry(experimentId: string): ContainerRegistry {
+    const missionId = this.config.missionId;
+    return {
+      register: (name) =>
+        this.ledger.transaction(async () => {
+          await this.ledger.registerContainer(name, missionId, experimentId);
+          await this.ledger.appendEvent(
+            `container:${name}:launched`,
+            "container.launched",
+            experimentId,
+            {
+              containerName: name,
+            },
+          );
+        }),
+      release: (name) => this.ledger.releaseContainer(name),
+    };
+  }
+
   async mission(): Promise<MissionRow> {
     const row = await this.ledger.getMission(this.config.missionId);
     if (!row)
@@ -278,6 +303,7 @@ export class MissionController {
           environmentHash: this.environmentHash,
           contractHash: this.contractHash,
         },
+        this.containerRuntime,
       );
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
@@ -1134,6 +1160,7 @@ export class MissionController {
         learnedScenariosDir: this.paths.learnedScenarios,
         learnedSuiteVersion: mission.learnedSuiteVersion,
         evidence: this.evidence,
+        containerRegistry: this.containerRegistry(experimentId),
       },
       suite,
     );
@@ -1297,6 +1324,7 @@ export class MissionController {
           holdoutWorkload: this.config.holdoutWorkload,
           learnedScenariosDir: scenarioDir,
           evidence: this.evidence,
+          containerRegistry: this.containerRegistry(`lesson-${lessonId}-${experimentId}`),
         },
         "learned",
       );
@@ -1363,6 +1391,28 @@ export class MissionController {
 
   // ---- packet, hooks, segments, budget, memory ---------------------------------------
 
+  /** Cycle-start retrieval query composed from the active task, its hypothesis, and the last finished experiment's features, invariants and verdict. */
+  private async retrievalQuery(
+    experiments: ExperimentRow[],
+    experimentId: string,
+  ): Promise<string> {
+    const task = (await this.ledger.listTasks(this.config.missionId)).find(
+      (t) => t.taskId === "optimize-search",
+    );
+    const last = experiments
+      .filter((e) => e.experimentId !== experimentId && e.verdict !== null)
+      .at(-1);
+    const episode = last ? await this.ledger.getEpisode(`ep-${last.experimentId}-v1`) : undefined;
+    return composeRetrievalQuery({
+      taskId: "optimize-search",
+      hypothesis: last?.hypothesis ?? task?.hypothesis ?? null,
+      featureIds: episode?.featureIds ?? [],
+      invariantIds: episode?.invariantIds ?? [],
+      lastVerdict: last?.verdict ?? null,
+      lastFailureSignature: last?.failureSignature ?? null,
+    });
+  }
+
   private async buildPacket(mission: MissionRow, experimentId: string): Promise<ContextPacket> {
     const experiments = (await this.ledger.listExperiments(this.config.missionId)).filter(
       (e) => e.taskId === "optimize-search",
@@ -1381,10 +1431,7 @@ export class MissionController {
     const recent = recentLines.join("\n\n");
     const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
     const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
-    const query =
-      experiments.length > 0
-        ? "search engine cache invalidation normalization p95"
-        : "baseline read path";
+    const query = await this.retrievalQuery(experiments, experimentId);
     const retrieval = this.config.memory.enabled
       ? await retrieveEpisodes(
           this.memory,
@@ -1427,6 +1474,7 @@ export class MissionController {
       DEFAULT_PACKET_BUDGET,
     );
     await this.ledger.appendEvent(`${experimentId}:packet`, "packet.built", experimentId, {
+      query,
       tokens: packet.tokens,
       sections: packet.sections,
       injected: packet.injectedEpisodeIds,

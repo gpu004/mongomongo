@@ -19,6 +19,8 @@ import {
 import type {
   ArtifactRow,
   CheckpointRow,
+  ContainerRow,
+  ContainerState,
   EpisodeRow,
   EventRow,
   ExperimentRow,
@@ -252,6 +254,8 @@ export class MongoLedger implements Ledger {
       this.col("segments").createIndex({ missionId: 1, ordinal: 1 }, unique),
       this.col("events").createIndex({ missionId: 1, eventKey: 1 }, unique),
       this.col("events").createIndex({ missionId: 1, seq: 1 }, unique),
+      this.col("containers").createIndex({ containerName: 1 }, unique),
+      this.col("containers").createIndex({ missionId: 1, state: 1, createdAt: 1 }),
     ]);
   }
 
@@ -968,6 +972,57 @@ export class MongoLedger implements Ledger {
       );
       return result.deletedCount;
     });
+  }
+
+  // ---- execution environments -------------------------------------------
+
+  async registerContainer(
+    containerName: string,
+    missionId: string,
+    experimentId: string,
+  ): Promise<void> {
+    this.assertMission(missionId);
+    const doc: ContainerRow = {
+      containerName,
+      missionId,
+      experimentId,
+      state: "launching",
+      createdAt: now(),
+      releasedAt: null,
+    };
+    await this.write(() =>
+      this.col<Doc>("containers").updateOne(
+        { containerName },
+        { $setOnInsert: { ...doc } },
+        { upsert: true, ...this.opts },
+      ),
+    );
+  }
+
+  async releaseContainer(containerName: string, state: ContainerState = "released"): Promise<void> {
+    await this.write(() =>
+      this.col<Doc>("containers").updateOne(
+        { containerName, missionId: this.missionId, state: "launching" },
+        { $set: { state, releasedAt: now() } },
+        this.opts,
+      ),
+    );
+  }
+
+  async listLiveContainers(missionId: string): Promise<ContainerRow[]> {
+    const rows = await this.col<Doc>("containers")
+      .find({ missionId, state: "launching" }, this.opts)
+      .sort({ createdAt: 1, containerName: 1 })
+      .toArray();
+    return rows.map((r) => strip<ContainerRow>(r));
+  }
+
+  async listContainers(missionId: string): Promise<ContainerRow[]> {
+    const rows = await this.col<Doc>("containers")
+      .find({ missionId }, this.opts)
+      .sort({ createdAt: 1, containerName: 1 })
+      .toArray();
+    return rows.map((r) => strip<ContainerRow>(r));
   }
 
   async enqueueOutbox(episodeId: string, payload: unknown): Promise<string> {

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   CandidateStartupError,
   launchCandidate,
+  type ContainerRegistry,
   type IsolationMode,
   type RunningCandidate,
 } from "./candidate-process.ts";
@@ -45,6 +46,8 @@ export interface RunnerConfig {
   evidence: EvidenceSink;
   /** Scenario directory override (tests). */
   scenariosDir?: string;
+  /** Records container names durably so resume can remove orphans (container mode). */
+  containerRegistry?: ContainerRegistry;
 }
 
 const VERIFICATION_DIR = new URL("./", import.meta.url).pathname;
@@ -200,6 +203,7 @@ export async function runSuite(config: RunnerConfig, suite: Suite): Promise<Veri
       missionId: config.missionId,
       startupTimeoutMs: config.startupTimeoutMs,
       memoryLimitBytes: config.memoryLimitBytes,
+      containerRegistry: config.containerRegistry,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -278,6 +282,7 @@ async function relaunch(
     missionId: config.missionId,
     startupTimeoutMs: config.startupTimeoutMs,
     memoryLimitBytes: config.memoryLimitBytes,
+    containerRegistry: config.containerRegistry,
   });
 }
 
