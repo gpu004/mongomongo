@@ -17,6 +17,8 @@ import { compareConfigurations, renderComparison } from "./compare.ts";
 import { BaselineError, MissionController, RESOURCES_DIR, SimulatedCrash } from "./controller.ts";
 import { loadFeatureMap, validateFeatureMap } from "./feature-map.ts";
 import { Ledger } from "./ledger.ts";
+import { readMongoEnv } from "./mongo-env.ts";
+import { probeMongo, renderMongoProbe } from "./mongo-probe.ts";
 import { evaluateLiveGate, exportLiveGate, renderLiveGate } from "./live-gate.ts";
 import { renderMemoryBench, runMemoryBench, type MemoryBenchResult } from "./memory-bench.ts";
 import { loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
@@ -29,7 +31,7 @@ import { providerApiKeyEnv, type Worker } from "./worker.ts";
 
 const USAGE = `horizon <command> [options]
 
-  doctor [--config mission.json]           check node, sqlite, docker, seed, evaluator hash, provider API key
+  doctor [--config mission.json]           check node, sqlite, mongodb, docker, seed, evaluator hash, provider API key
   mission create --config mission.json     freeze identities and import the seed
   run --mission M [--cycles N]             run (or resume) the mission loop
   resume --mission M                       alias of run
@@ -117,6 +119,13 @@ async function main(): Promise<number> {
             return `unavailable: ${String(e)}`;
           }
         })(),
+      ]);
+      const mongoEnv = readMongoEnv();
+      checks.push([
+        "mongodb",
+        mongoEnv
+          ? renderMongoProbe(await probeMongo(mongoEnv))
+          : "no MONGODB_URI (sqlite ledger only; see .env.example)",
       ]);
       checks.push([
         "docker",
