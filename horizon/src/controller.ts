@@ -46,9 +46,11 @@ import { ScriptedWorker } from "./scripted-worker.ts";
 import { type BrokerHooks, ToolBroker } from "./tool-broker.ts";
 import {
   firstComparison,
+  freezeAcceptanceMargin,
   repetitionSpread,
   rerunComparison,
   type TimingDecision,
+  type TimingPolicy,
 } from "./timing-policy.ts";
 import type { Worker, WorkerCycleResult } from "./worker.ts";
 
@@ -374,6 +376,36 @@ export class MissionController {
       throw new BaselineError("baseline not established");
     }
     const noise = repetitionSpread(perf.metrics.repetitionP95Ms);
+    const floor = freezeAcceptanceMargin(
+      this.config.acceptanceMargin,
+      noise,
+      this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
+    );
+    if (floor.kind === "repair") {
+      this.ledger.transaction(() => {
+        this.ledger.updateExperiment(experimentId, {
+          status: "inconclusive",
+          verdict: `baseline p95 ${perf.metrics.p95LatencyMs}ms; ${floor.reason}`,
+          finishedAt: new Date().toISOString(),
+        });
+        this.ledger.appendEvent(
+          `target:${this.config.missionId}:noise-floor:${perf.reportId}`,
+          "target.noise_floor_exceeded",
+          this.config.missionId,
+          {
+            repetitionSpread: noise,
+            acceptanceMargin: this.config.acceptanceMargin,
+            maxRepetitionSpread: this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
+            reportId: perf.reportId,
+          },
+        );
+      });
+      this.log(
+        `baseline p95 ${perf.metrics.p95LatencyMs}ms; repetition spread ${(noise * 100).toFixed(1)}% too large to distinguish useful changes`,
+      );
+      this.finish("blocked", floor.reason);
+      throw new BaselineError("baseline noise exceeds the measurable range");
+    }
     this.ledger.transaction(() => {
       this.ledger.updateExperiment(experimentId, {
         status: "accepted",
@@ -382,6 +414,7 @@ export class MissionController {
       });
       this.ledger.updateMission(this.config.missionId, {
         baselineP95Ms: perf.metrics.p95LatencyMs ?? null,
+        frozenAcceptanceMargin: floor.acceptanceMargin,
         bestP95Ms: perf.metrics.p95LatencyMs ?? null,
         bestArtifactHash: seed,
       });
@@ -399,8 +432,10 @@ export class MissionController {
         {
           repetitionSpread: noise,
           acceptanceMargin: this.config.acceptanceMargin,
+          frozenAcceptanceMargin: floor.acceptanceMargin,
+          marginRaised: floor.raised,
           targetP95Reduction: this.config.targetP95Reduction,
-          marginCoversNoise: this.config.acceptanceMargin >= noise,
+          marginCoversNoise: floor.acceptanceMargin >= noise,
         },
       );
       this.checkpoint("running", "optimize-search", null, "baseline-complete");
@@ -408,10 +443,19 @@ export class MissionController {
     this.log(
       `baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms; repetition spread ${(noise * 100).toFixed(1)}%)`,
     );
-    if (this.config.acceptanceMargin < noise)
+    if (floor.raised)
       this.log(
-        `  warning: acceptance margin ${this.config.acceptanceMargin} is below the measured repetition spread ${noise.toFixed(3)}; expect ambiguous timing verdicts`,
+        `  acceptance margin frozen at ${floor.acceptanceMargin} (configured ${this.config.acceptanceMargin} is below the measured repetition spread ${noise.toFixed(3)})`,
       );
+    else this.log(`  acceptance margin frozen at ${floor.acceptanceMargin}`);
+  }
+
+  /** Margin frozen after the baseline measured its noise; the configured value before that. */
+  private timingPolicy(mission: MissionRow): TimingPolicy {
+    return {
+      acceptanceMargin: mission.frozenAcceptanceMargin ?? this.config.acceptanceMargin,
+      requiredImprovedRepetitions: this.config.requiredImprovedRepetitions,
+    };
   }
 
   private async runHoldout(): Promise<void> {
@@ -661,7 +705,7 @@ export class MissionController {
       perf.metrics,
       mission.bestP95Ms,
       bestReps,
-      this.config,
+      this.timingPolicy(mission),
     );
     let accepted = perf;
     if (decision.kind === "ambiguous") {
@@ -752,7 +796,7 @@ export class MissionController {
         firstBestReps,
         candidate.metrics,
         bestReport.metrics,
-        this.config,
+        this.timingPolicy(mission),
       ),
       candidate,
     };
@@ -1201,7 +1245,7 @@ export class MissionController {
     const lastVerdict = experiments.at(-1)?.verdict ?? "no experiments yet";
     const pinned = [
       `Mission ${mission.missionId} (contract v${mission.contractVersion}, hash ${mission.contractHash.slice(0, 12)}). Objective: ${this.config.objective}`,
-      `Baseline p95 ${mission.baselineP95Ms ?? "unmeasured"}ms; current best ${mission.bestP95Ms ?? "n/a"}ms (artifact ${(mission.bestArtifactHash ?? "").slice(0, 12)}); target <= ${mission.baselineP95Ms !== null ? (mission.baselineP95Ms * (1 - this.config.targetP95Reduction)).toFixed(2) : "?"}ms; acceptance margin ${this.config.acceptanceMargin}.`,
+      `Baseline p95 ${mission.baselineP95Ms ?? "unmeasured"}ms; current best ${mission.bestP95Ms ?? "n/a"}ms (artifact ${(mission.bestArtifactHash ?? "").slice(0, 12)}); target <= ${mission.baselineP95Ms !== null ? (mission.baselineP95Ms * (1 - this.config.targetP95Reduction)).toFixed(2) : "?"}ms; acceptance margin ${this.timingPolicy(mission).acceptanceMargin}.`,
       `Budget: experiments ${mission.spentExperiments}/${this.config.budget.maxExperiments}; tokens in ${mission.spentInputTokens}/${this.config.budget.maxInputTokens}, out ${mission.spentOutputTokens}/${this.config.budget.maxOutputTokens}; cycle limit ${this.config.budget.cycleTimeoutMs}ms.`,
       `Constraints: edits only under src/; mutations via DocumentService; contract invariants are fixed; the verifier is the only source of truth. Experiment ${experimentId}.`,
       retrieval.degraded
