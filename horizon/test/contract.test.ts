@@ -89,6 +89,24 @@ test("contract: counts are positive integers", () => {
   assert.doesNotThrow(() => validateMissionConfig(withField("requiredImprovedRepetitions", 1)));
 });
 
+test("contract: retention limits are optional and must be positive integers when present", () => {
+  const retention = {
+    keepRecentCandidates: 8,
+    keepRecentSegments: 2,
+    compactEventsAfter: 1000,
+  };
+  assert.doesNotThrow(() => validateMissionConfig(withField("retention", undefined)));
+  assert.deepEqual(validateMissionConfig(withField("retention", retention)).retention, retention);
+  for (const field of Object.keys(retention) as (keyof typeof retention)[]) {
+    for (const bad of [undefined, ...NON_POSITIVE, 1.5]) {
+      assert.throws(
+        () => validateMissionConfig(withField("retention", { ...retention, [field]: bad })),
+        new RegExp(`retention\\.${field}`),
+      );
+    }
+  }
+});
+
 test("contract: timeouts are finite and > 0", () => {
   for (const field of ["startupTimeoutMs", "requestTimeoutMs"] as const) {
     const rx = new RegExp(field);
