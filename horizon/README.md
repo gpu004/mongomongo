@@ -39,6 +39,12 @@ npm run horizon -- memory-bench --episodes 1000,10000      # synthetic history b
 node scripts/supermemory-probe.ts --episodes 12            # hosted memory: indexing lag, latency, scoped correctness
 ```
 
+The baseline measures repetition spread and freezes the acceptance margin used for every later
+verdict: the configured `acceptanceMargin` when it already covers the spread, otherwise the spread
+itself (rounded up to 0.1%). Spread at or above `maxRepetitionSpread` (default `targetP95Reduction`)
+blocks the mission before optimization so the workload or environment can be repaired. The frozen
+value is stored on the mission row and in the `target.assessed` event.
+
 Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artifacts/<hash>/`
 (immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`.
 
