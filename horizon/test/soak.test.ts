@@ -20,7 +20,7 @@ test("scripted soak resumes an injected crash without resending the experiment a
       "--out",
       out,
       "--missions",
-      "1",
+      "5",
       "--experiments",
       "2",
       "--max-runs",
@@ -30,6 +30,7 @@ test("scripted soak resumes an injected crash without resending the experiment a
   );
   assert.equal(run.status, 0, run.stderr || run.stdout);
   const report = JSON.parse(readFileSync(join(out, "report.json"), "utf8")) as {
+    missions: number;
     experiments: number;
     injectedFaults: number;
     replayedFaults: number;
@@ -43,6 +44,7 @@ test("scripted soak resumes an injected crash without resending the experiment a
     artifactBytes: number;
   }[];
   assert.equal(report.injectedFaults, 1);
+  assert.equal(report.missions, 1);
   assert.equal(report.experiments, 2);
   assert.equal(report.replayedFaults, 1);
   assert.equal(samples[0]?.exitCode, 3);
