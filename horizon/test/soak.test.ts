@@ -54,6 +54,7 @@ test("scripted soak resumes an injected crash without resending the experiment a
   assert.equal(samples.at(-1)?.spentExperiments, 2);
   assert.ok(samples.some((sample) => sample.segments >= 2));
   assert.ok(samples.some((sample) => sample.packetTokens.length > 0));
+  assert.ok(samples.every((sample) => sample.packetTokens.length <= 1));
   assert.ok(
     samples.some((sample) => sample.retrievalMs.length > 0) &&
       samples.every((sample) => sample.retrievalMs.every((ms) => Number.isFinite(ms) && ms >= 0)),

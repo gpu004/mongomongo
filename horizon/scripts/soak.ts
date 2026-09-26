@@ -137,7 +137,7 @@ for (let i = 0; i < missionCount; i++) {
         "--runs-root",
         runsRoot,
         "--cycles",
-        "2",
+        "1",
         ...(faultInjected ? ["--crash-at", "snapshot_ready"] : []),
       ],
       faultInjected ? [3] : [0, 2],

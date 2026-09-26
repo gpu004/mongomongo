@@ -154,6 +154,7 @@ export class MissionController {
   readonly contractHash: string;
   private segmentOrdinal = 0;
   private cyclesInSegment = 0;
+  private openedSegmentOrdinal = 0;
   private cycleDeadline = 0;
   /** Wall time since this mark has not yet been added to mission.spentWallMs. */
   private wallMark = Date.now();
@@ -318,6 +319,12 @@ export class MissionController {
       );
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
+      this.cyclesInSegment = this.ledger
+        .listExperiments(this.config.missionId)
+        .filter(
+          (experiment) =>
+            experiment.segmentOrdinal === this.segmentOrdinal && experiment.finishedAt !== null,
+        ).length;
       await this.honourWakeTime();
       this.ledger.updateMission(this.config.missionId, { status: "running", nextWakeAt: null });
       await this.drainOutbox();
@@ -362,6 +369,7 @@ export class MissionController {
       return this.mission();
     } finally {
       await this.worker.closeSegment().catch(() => {});
+      this.openedSegmentOrdinal = 0;
       this.ledger.releaseLock();
     }
   }
@@ -1582,23 +1590,18 @@ export class MissionController {
     const active = this.ledger.activeSegment(this.config.missionId);
     const needsRotation =
       active !== undefined && this.cyclesInSegment >= this.config.segmentRotationCycles;
-    if (
-      active &&
-      !needsRotation &&
-      this.segmentOrdinal === active.ordinal &&
-      this.cyclesInSegment > 0
-    )
-      return;
+    if (active && !needsRotation && this.openedSegmentOrdinal === active.ordinal) return;
     const previous = active
       ? { sessionPath: active.sessionPath, sessionId: active.sessionId ?? "" }
       : null;
     if (active && !needsRotation) {
       await this.worker.openSegment(active.ordinal, previous);
       this.segmentOrdinal = active.ordinal;
-      this.cyclesInSegment = 0;
+      this.openedSegmentOrdinal = active.ordinal;
       return;
     }
     const ordinal = (active?.ordinal ?? this.segmentOrdinal) + 1;
+    if (this.openedSegmentOrdinal) await this.worker.closeSegment();
     // A new segment is a fresh bounded context; `previous` is only for resuming a committed segment.
     const handle = await this.worker.openSegment(ordinal, null);
     this.ledger.transaction(() => {
@@ -1617,6 +1620,7 @@ export class MissionController {
       });
     });
     this.segmentOrdinal = ordinal;
+    this.openedSegmentOrdinal = ordinal;
     this.cyclesInSegment = 0;
     this.log(`segment ${ordinal} open${active ? ` (rotated from ${active.ordinal})` : ""}`);
   }
