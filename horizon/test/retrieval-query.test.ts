@@ -29,7 +29,6 @@ test("retrieval query is composed from task, hypothesis, features, invariants an
   ]) {
     assert.ok(query.split(" ").includes(term), `query "${query}" should contain "${term}"`);
   }
-  // Terms are deduplicated and lower-cased; single characters are dropped.
   assert.equal(new Set(query.split(" ")).size, query.split(" ").length);
   assert.equal(query, query.toLowerCase());
   assert.ok(!query.split(" ").includes("a"));

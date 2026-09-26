@@ -192,8 +192,6 @@ export class MissionController {
     this.ledger.close();
   }
 
-  // ---- mission lifecycle ----------------------------------------------------
-
   /** `horizon mission create`: freeze identities, import the seed, write the manifest. Idempotent. */
   initialize(): MissionRow {
     const existing = this.ledger.getMission(this.config.missionId);
@@ -454,8 +452,6 @@ export class MissionController {
     this.log(`mission ${status}${detail ? `: ${detail}` : ""}`);
   }
 
-  // ---- baseline and holdout ---------------------------------------------------
-
   private async runBaseline(): Promise<void> {
     const mission = this.mission();
     const seed = mission.seedArtifactHash;
@@ -620,8 +616,6 @@ export class MissionController {
     });
     if (!passed) this.finish("blocked", `holdout ${report?.status ?? "missing"} on best artifact`);
   }
-
-  // ---- one experiment cycle ---------------------------------------------------
 
   private async runCycle(
     cycle: number,
@@ -1105,8 +1099,6 @@ export class MissionController {
       .map((f) => f.id);
   }
 
-  // ---- verification through the fixed runner ------------------------------------
-
   private async runSuites(
     experimentId: string,
     hash: string,
@@ -1218,8 +1210,6 @@ export class MissionController {
     if (!row || !existsSync(row.path)) return undefined;
     return JSON.parse(readFileSync(row.path, "utf8")) as VerificationReport;
   }
-
-  // ---- lessons ------------------------------------------------------------------
 
   private observeLesson(experiment: ExperimentRow, failing: VerificationReport[]): void {
     for (const report of failing) {
@@ -1380,8 +1370,6 @@ export class MissionController {
     this.log(`  lesson ${lessonId} materialized as learned scenario ${scenario.scenarioId}`);
     return { accepted: true, reason: validation.reason, lessonId };
   }
-
-  // ---- packet, hooks, segments, budget, memory ---------------------------------------
 
   /** Consecutive concluded optimize-search experiments since the last accepted one; none of them improved the best. */
   stagnation(): StagnationState {
@@ -1595,7 +1583,6 @@ export class MissionController {
       ? { sessionPath: active.sessionPath, sessionId: active.sessionId ?? "" }
       : null;
     if (active && !needsRotation) {
-      // Resuming an existing committed segment after restart.
       await this.worker.openSegment(active.ordinal, previous);
       this.segmentOrdinal = active.ordinal;
       this.cyclesInSegment = 0;

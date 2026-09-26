@@ -93,7 +93,6 @@ test("retrieval only injects episodes from this mission's scope with local evide
     ...episodeMetadata(payload("ep-foreign")),
     missionId: "other-mission",
   });
-  // Other contract version.
   adapter.injectForeign(
     TAG,
     "ep-old",

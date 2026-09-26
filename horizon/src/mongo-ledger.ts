@@ -291,8 +291,6 @@ export class MongoLedger implements AsyncLedger {
       throw new LeaseError(`mission ${lease.missionId} lease lost by ${lease.owner}`, current);
   }
 
-  // ---- lease --------------------------------------------------------------
-
   async claimLease(
     missionId: string,
     owner: string,
@@ -355,8 +353,6 @@ export class MongoLedger implements AsyncLedger {
     return doc ? toLease(doc) : undefined;
   }
 
-  // ---- events -------------------------------------------------------------
-
   async appendEvent(eventKey: string, type: string, entityId: string, payload: unknown) {
     return this.atomically(async (tx) => {
       await tx.assertLease();
@@ -400,8 +396,6 @@ export class MongoLedger implements AsyncLedger {
     return this.currentSeq("event");
   }
 
-  // ---- mission ------------------------------------------------------------
-
   async createMission(row: NewMissionRow): Promise<void> {
     await this.assertLease();
     const doc: Doc<MissionRow> = {
@@ -433,8 +427,6 @@ export class MongoLedger implements AsyncLedger {
     await this.col(COLLECTIONS.missions).updateOne({ _id: missionId }, { $set }, this.opts);
   }
 
-  // ---- tasks --------------------------------------------------------------
-
   async upsertTask(task: TaskRow): Promise<void> {
     await this.assertLease();
     const { taskId, status, hypothesis, nextAction, ...rest } = task;
@@ -454,8 +446,6 @@ export class MongoLedger implements AsyncLedger {
       .toArray();
     return docs.map((d) => strip<TaskRow>(d)!);
   }
-
-  // ---- experiments --------------------------------------------------------
 
   async insertExperiment(e: NewExperimentRow): Promise<void> {
     await this.assertLease();
@@ -492,8 +482,6 @@ export class MongoLedger implements AsyncLedger {
       .toArray();
     return docs.map((d) => strip<ExperimentRow>(d)!);
   }
-
-  // ---- artifacts / verification ------------------------------------------
 
   async insertArtifact(a: ArtifactRow): Promise<void> {
     await this.assertLease();
@@ -551,8 +539,6 @@ export class MongoLedger implements AsyncLedger {
       .toArray();
     return docs.map((d) => strip<VerificationRow>(d)!);
   }
-
-  // ---- episodes / lessons -------------------------------------------------
 
   async insertEpisode(e: EpisodeRow): Promise<void> {
     await this.assertLease();
@@ -728,8 +714,6 @@ export class MongoLedger implements AsyncLedger {
     }));
   }
 
-  // ---- execution environments -------------------------------------------
-
   async registerContainer(
     containerName: string,
     missionId: string,
@@ -773,8 +757,6 @@ export class MongoLedger implements AsyncLedger {
       .toArray();
     return docs.map(toContainer);
   }
-
-  // ---- checkpoints / segments / outbox -----------------------------------
 
   async writeCheckpoint(c: NewCheckpointRow): Promise<CheckpointRow> {
     return this.atomically(async (tx) => {
