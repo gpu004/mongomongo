@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -77,6 +78,17 @@ export class ArtifactStore {
 
   pathFor(hash: string): string {
     return join(this.root, hash);
+  }
+
+  pruneExcept(keep: ReadonlySet<string>): string[] {
+    const removed: string[] = [];
+    for (const entry of readdirSync(this.root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name) || keep.has(entry.name))
+        continue;
+      rmSync(join(this.root, entry.name), { recursive: true });
+      removed.push(entry.name);
+    }
+    return removed;
   }
 
   /** Materialize the seed service as the parent of all experiments. */
