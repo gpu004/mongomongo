@@ -103,7 +103,7 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
       let crashes = 0;
       log(`== ${missionId}`);
       for (const step of options.interruptions) {
-        const controller = new MissionController(config, paths, {
+        const controller = await MissionController.open(config, paths, {
           worker,
           memory,
           log: (l) => log(`   ${l}`),
@@ -111,29 +111,33 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
           ...(step.maxCycles !== undefined ? { maxCycles: step.maxCycles } : {}),
         });
         try {
-          controller.initialize();
+          await controller.initialize();
           await controller.run();
         } catch (error) {
           if (!(error instanceof SimulatedCrash)) throw error;
           crashes += 1;
           log(`   ${error.message}`);
         } finally {
-          controller.close();
+          await controller.close();
         }
       }
-      const controller = new MissionController(config, paths, { worker, memory, log: () => {} });
+      const controller = await MissionController.open(config, paths, {
+        worker,
+        memory,
+        log: () => {},
+      });
       try {
-        const mission = controller.mission();
+        const mission = await controller.mission();
         seedHash = mission.seedArtifactHash;
         evaluatorHash = mission.evaluatorHash;
-        const experiments = controller.ledger
-          .listExperiments(missionId)
-          .filter((e) => e.taskId === "optimize-search");
+        const experiments = (await controller.ledger.listExperiments(missionId)).filter(
+          (e) => e.taskId === "optimize-search",
+        );
         const signatures = experiments
           .map((e) => e.failureSignature)
           .filter((s): s is string => s !== null);
         const repeatedFailures = signatures.length - new Set(signatures).size;
-        const events = controller.ledger.eventsSince(0, 100000);
+        const events = await controller.ledger.eventsSince(0, 100000);
         const packets = events
           .filter((e) => e.type === "packet.built")
           .map((e) => e.payload as { tokens: number; injected: string[]; filteredOut: unknown[] });
@@ -162,11 +166,11 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
           inputTokens: mission.spentInputTokens,
           outputTokens: mission.spentOutputTokens,
           usageUncertain: mission.usageUncertain !== 0,
-          materializedChecks: controller.ledger.listLearnedScenarios(missionId).length,
+          materializedChecks: (await controller.ledger.listLearnedScenarios(missionId)).length,
           wallMs: Date.now() - started,
         });
       } finally {
-        controller.close();
+        await controller.close();
       }
     }
   }

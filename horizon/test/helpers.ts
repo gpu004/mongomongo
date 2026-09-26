@@ -50,10 +50,10 @@ export function controllerFor(
   runsRoot: string,
   options: ControllerOptions = {},
   overrides: Partial<MissionConfig> = {},
-): MissionController {
+): Promise<MissionController> {
   const config = testConfig(missionId, overrides);
   // Hermetic by default: a SUPERMEMORY_API_KEY in the environment must not route tests to the hosted service.
-  return new MissionController(config, missionPaths(missionId, runsRoot), {
+  return MissionController.open(config, missionPaths(missionId, runsRoot), {
     memory: new LocalMemoryAdapter(),
     ...options,
   });

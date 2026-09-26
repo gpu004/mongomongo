@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { FIXTURES_DIR } from "../src/artifact-store.ts";
 import { SimulatedCrash } from "../src/controller.ts";
-import { Ledger } from "../src/ledger.ts";
+import { SqliteLedger } from "../src/ledger.ts";
 import { LocalMemoryAdapter } from "../src/memory-adapter.ts";
 import { missionPaths } from "../src/mission-paths.ts";
 import { ScriptedWorker } from "../src/scripted-worker.ts";
@@ -40,15 +40,15 @@ class RepeatingWorker implements Worker {
 
 test("repeated identical failing artifact reuses the committed failure; overclaims and oversized prose are contained", async () => {
   const runs = tempRunsRoot();
-  const controller = controllerFor("fi-repeat", runs, {
+  const controller = await controllerFor("fi-repeat", runs, {
     worker: new RepeatingWorker(),
     maxCycles: 2,
   });
-  controller.initialize();
+  await controller.initialize();
   await controller.run();
-  const experiments = controller.ledger
-    .listExperiments("fi-repeat")
-    .filter((e) => e.taskId === "optimize-search");
+  const experiments = (await controller.ledger.listExperiments("fi-repeat")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
   assert.equal(experiments.length, 2);
   assert.equal(experiments[0]!.candidateArtifactHash, experiments[1]!.candidateArtifactHash);
   assert.deepEqual(
@@ -57,12 +57,12 @@ test("repeated identical failing artifact reuses the committed failure; overclai
   );
   assert.equal(experiments[0]!.failureSignature, experiments[1]!.failureSignature);
 
-  const verifications = controller.ledger.listVerifications("fi-repeat");
+  const verifications = await controller.ledger.listVerifications("fi-repeat");
   const firstCorrectness = verifications.find(
     (v) => v.experimentId === experiments[0]!.experimentId && v.suite === "correctness",
   )!;
   assert.ok(
-    controller.ledger.findEvent(
+    await controller.ledger.findEvent(
       `reuse:${experiments[1]!.experimentId}:correctness:${firstCorrectness.reportId}`,
     ),
     "second experiment reused the committed correctness failure",
@@ -75,7 +75,7 @@ test("repeated identical failing artifact reuses the committed failure; overclai
     "correctness ran once for the identical artifact",
   );
 
-  const audit = controller.ledger.findEvent(`${experiments[0]!.experimentId}:claim-audit`)!
+  const audit = (await controller.ledger.findEvent(`${experiments[0]!.experimentId}:claim-audit`))!
     .payload as { supported: boolean; issues: string[] };
   assert.equal(audit.supported, false);
   assert.ok(
@@ -87,32 +87,32 @@ test("repeated identical failing artifact reuses the committed failure; overclai
     audit.issues.join("; "),
   );
 
-  const snapshot = controller.ledger.findEvent(`${experiments[0]!.experimentId}:snapshot`)!
+  const snapshot = (await controller.ledger.findEvent(`${experiments[0]!.experimentId}:snapshot`))!
     .payload as { whatChanged: string };
   assert.ok(snapshot.whatChanged.length < 1000);
   assert.match(snapshot.whatChanged, /truncated; full text in ev-worker-output-/);
-  const episode = controller.ledger
-    .listEpisodes("fi-repeat")
-    .find((e) => e.experimentId === experiments[0]!.experimentId)!;
+  const episode = (await controller.ledger.listEpisodes("fi-repeat")).find(
+    (e) => e.experimentId === experiments[0]!.experimentId,
+  )!;
   assert.match(episode.summary, /claim disagrees with verifier/);
   assert.ok(episode.summary.length < 4000);
-  controller.close();
+  await controller.close();
 });
 
 test("wall-clock budget survives a crash: elapsed time is persisted at checkpoints, not only at finish", async () => {
   const runs = tempRunsRoot();
-  const first = controllerFor("fi-wall", runs, { crashAt: "snapshot_ready", maxCycles: 1 });
-  first.initialize();
+  const first = await controllerFor("fi-wall", runs, { crashAt: "snapshot_ready", maxCycles: 1 });
+  await first.initialize();
   await assert.rejects(first.run(), SimulatedCrash);
-  first.close();
-  const ledger = new Ledger(missionPaths("fi-wall", runs).db);
-  const spent = ledger.getMission("fi-wall")!.spentWallMs;
-  ledger.close();
+  await first.close();
+  const ledger = new SqliteLedger(missionPaths("fi-wall", runs).db);
+  const spent = (await ledger.getMission("fi-wall"))!.spentWallMs;
+  await ledger.close();
   assert.ok(spent > 0, `spentWallMs ${spent}`);
 
-  const second = controllerFor("fi-wall", runs, { maxCycles: 1 });
+  const second = await controllerFor("fi-wall", runs, { maxCycles: 1 });
   const row = await second.run();
-  second.close();
+  await second.close();
   assert.ok(row.spentWallMs >= spent);
 });
 
@@ -120,15 +120,16 @@ test("memory outage during a run degrades to the local index and deliveries retr
   const runs = tempRunsRoot();
   const memory = new LocalMemoryAdapter();
   memory.unavailable = true;
-  const controller = controllerFor("fi-outage", runs, { memory, maxCycles: 2 });
-  controller.initialize();
+  const controller = await controllerFor("fi-outage", runs, { memory, maxCycles: 2 });
+  await controller.initialize();
   await controller.run();
-  const pending = controller.ledger.listOutbox(["pending", "failed"]);
+  const pending = await controller.ledger.listOutbox(["pending", "failed"]);
   assert.ok(pending.length > 0, "episodes queued while memory is down");
-  const experiments = controller.ledger
-    .listExperiments("fi-outage")
-    .filter((e) => e.taskId === "optimize-search");
-  const packet = controller.ledger.findEvent(`${experiments[1]!.experimentId}:packet`)!.payload as {
+  const experiments = (await controller.ledger.listExperiments("fi-outage")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
+  const packet = (await controller.ledger.findEvent(`${experiments[1]!.experimentId}:packet`))!
+    .payload as {
     degraded: boolean;
     injected: string[];
   };
@@ -136,35 +137,41 @@ test("memory outage during a run degrades to the local index and deliveries retr
   assert.ok(packet.injected.length > 0, "local index still supplied history");
   // Let the recorded backoff elapse instead of sleeping for it.
   for (const row of pending)
-    controller.ledger.updateOutbox(row.idempotencyKey, {
+    await controller.ledger.updateOutbox(row.idempotencyKey, {
       nextAttemptAt: new Date(0).toISOString(),
     });
-  controller.close();
+  await controller.close();
 
   memory.unavailable = false;
-  const resumed = controllerFor("fi-outage", runs, { memory, maxCycles: 1 });
+  const resumed = await controllerFor("fi-outage", runs, { memory, maxCycles: 1 });
   await resumed.run();
-  assert.equal(resumed.ledger.listOutbox(["pending", "failed"]).length, 0);
-  resumed.close();
+  assert.equal((await resumed.ledger.listOutbox(["pending", "failed"])).length, 0);
+  await resumed.close();
 });
 
 test("a fresh worker after restart continues from durable state instead of repeating the failed approach", async () => {
   const runs = tempRunsRoot();
-  const first = controllerFor("fi-fresh", runs, { worker: new ScriptedWorker(), maxCycles: 1 });
-  first.initialize();
+  const first = await controllerFor("fi-fresh", runs, {
+    worker: new ScriptedWorker(),
+    maxCycles: 1,
+  });
+  await first.initialize();
   await first.run();
-  const [exp1] = first.ledger
-    .listExperiments("fi-fresh")
-    .filter((e) => e.taskId === "optimize-search");
-  first.close();
+  const [exp1] = (await first.ledger.listExperiments("fi-fresh")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
+  await first.close();
   assert.equal(exp1!.status, "rejected");
 
-  const second = controllerFor("fi-fresh", runs, { worker: new ScriptedWorker(), maxCycles: 1 });
+  const second = await controllerFor("fi-fresh", runs, {
+    worker: new ScriptedWorker(),
+    maxCycles: 1,
+  });
   await second.run();
-  const experiments = second.ledger
-    .listExperiments("fi-fresh")
-    .filter((e) => e.taskId === "optimize-search");
-  second.close();
+  const experiments = (await second.ledger.listExperiments("fi-fresh")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
+  await second.close();
   assert.equal(experiments.length, 2);
   assert.notEqual(experiments[1]!.candidateArtifactHash, exp1!.candidateArtifactHash);
   assert.notEqual(experiments[1]!.hypothesis, exp1!.hypothesis);

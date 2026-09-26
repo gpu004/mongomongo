@@ -8,7 +8,7 @@ import { SEED_DIR } from "../src/artifact-store.ts";
 import { auditClaim } from "../src/claim-audit.ts";
 import { RESOURCES_DIR } from "../src/controller.ts";
 import { loadFeatureMap, validateFeatureMap } from "../src/feature-map.ts";
-import { Ledger } from "../src/ledger.ts";
+import { SqliteLedger } from "../src/ledger.ts";
 import { type EpisodePayload, LocalMemoryAdapter, renderEpisode } from "../src/memory-adapter.ts";
 import { runMemoryBench } from "../src/memory-bench.ts";
 import { MemoryOutbox, retrieveEpisodes } from "../src/memory-outbox.ts";
@@ -143,7 +143,7 @@ test("feature map: shipped map resolves; drifted references are reported", () =>
 
 function memoryFixture() {
   const dir = mkdtempSync(join(tmpdir(), "horizon-lag-"));
-  const ledger = new Ledger(join(dir, "state.sqlite"));
+  const ledger = new SqliteLedger(join(dir, "state.sqlite"));
   const evidence = new FileEvidenceStore(join(dir, "evidence"));
   const adapter = new LocalMemoryAdapter();
   const payloads = new Map<string, EpisodePayload>();
@@ -154,9 +154,9 @@ function memoryFixture() {
     (id) => payloads.get(id),
     () => {},
   );
-  const add = (p: EpisodePayload) => {
+  const add = async (p: EpisodePayload) => {
     payloads.set(p.episodeId, p);
-    ledger.insertEpisode({
+    await ledger.insertEpisode({
       episodeId: p.episodeId,
       missionId: p.missionId,
       experimentId: p.experimentId,
@@ -171,7 +171,7 @@ function memoryFixture() {
       summary: renderEpisode(p),
       createdAt: new Date().toISOString(),
     });
-    outbox.enqueue(p);
+    await outbox.enqueue(p);
   };
   return { ledger, evidence, adapter, outbox, add };
 }
@@ -212,9 +212,9 @@ test("indexing lag: accepted-but-unindexed episodes are merged from the local in
   const { ledger, evidence, adapter, outbox, add } = memoryFixture();
   const scope = { missionId: "lag", containerTag: "horizon-lag", contractVersion: 1 };
   adapter.deferReadiness = true;
-  add(episode("ep-lagged", "rejected: posting index loses updates"));
+  await add(episode("ep-lagged", "rejected: posting index loses updates"));
   await outbox.drain(Date.now() + 60_000);
-  assert.equal(ledger.listOutbox(["submitted"]).length, 1, "accepted remotely, not ready");
+  assert.equal((await ledger.listOutbox(["submitted"])).length, 1, "accepted remotely, not ready");
   adapter.injectForeign("horizon-lag", "ep-lagged", "Mission other; posting index loses updates", {
     missionId: "other",
     episodeId: "ep-lagged",
@@ -250,7 +250,7 @@ test("indexing lag: accepted-but-unindexed episodes are merged from the local in
 test("supersession: a remote hit on an old version is replaced by the current version, even before it is indexed", async () => {
   const { ledger, evidence, adapter, outbox, add } = memoryFixture();
   const scope = { missionId: "lag", containerTag: "horizon-lag", contractVersion: 1 };
-  add(episode("ep-x-v1", "verdict rsk1 before re-measurement"));
+  await add(episode("ep-x-v1", "verdict rsk1 before re-measurement"));
   await outbox.drain(Date.now() + 60_000);
   await outbox.drain(Date.now() + 60_000);
   adapter.deferReadiness = true;

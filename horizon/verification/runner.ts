@@ -197,6 +197,7 @@ export async function runSuite(config: RunnerConfig, suite: Suite): Promise<Veri
       snapshotDir: config.snapshotDir,
       isolation: config.isolation,
       containerImage: config.containerImage,
+      missionId: config.missionId,
       startupTimeoutMs: config.startupTimeoutMs,
       memoryLimitBytes: config.memoryLimitBytes,
     });
@@ -274,6 +275,7 @@ async function relaunch(
     snapshotDir: config.snapshotDir,
     isolation: config.isolation,
     containerImage: config.containerImage,
+    missionId: config.missionId,
     startupTimeoutMs: config.startupTimeoutMs,
     memoryLimitBytes: config.memoryLimitBytes,
   });

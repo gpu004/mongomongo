@@ -16,7 +16,9 @@ import { ArtifactStore, SEED_DIR } from "./artifact-store.ts";
 import { compareConfigurations, renderComparison } from "./compare.ts";
 import { BaselineError, MissionController, RESOURCES_DIR, SimulatedCrash } from "./controller.ts";
 import { loadFeatureMap, validateFeatureMap } from "./feature-map.ts";
-import { Ledger } from "./ledger.ts";
+import { SqliteLedger } from "./ledger.ts";
+import { openLedger } from "./ledger-factory.ts";
+import { describeMongoSettings } from "./mongo-ledger.ts";
 import { renderMemoryBench, runMemoryBench, type MemoryBenchResult } from "./memory-bench.ts";
 import { loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
 import { FileEvidenceStore, missionPaths, RUNS_ROOT } from "./mission-paths.ts";
@@ -103,15 +105,18 @@ async function main(): Promise<number> {
       checks.push(["node", process.version]);
       checks.push([
         "node:sqlite",
-        (() => {
+        await (async () => {
           try {
-            new Ledger(join(mkdtempSync(join(tmpdir(), "horizon-doctor-")), "t.sqlite")).close();
+            await new SqliteLedger(
+              join(mkdtempSync(join(tmpdir(), "horizon-doctor-")), "t.sqlite"),
+            ).close();
             return "ok";
           } catch (e) {
             return `unavailable: ${String(e)}`;
           }
         })(),
       ]);
+      checks.push(["mongodb", await describeMongoSettings(process.env)]);
       checks.push([
         "docker",
         (() => {
@@ -154,23 +159,25 @@ async function main(): Promise<number> {
       if (sub !== "create") throw new Error(USAGE);
       if (!values.config) throw new Error("--config is required");
       const config = loadMissionConfig(resolve(values.config));
-      const controller = new MissionController(config, missionPaths(config.missionId, runsRoot), {
-        log,
-      });
+      const controller = await MissionController.open(
+        config,
+        missionPaths(config.missionId, runsRoot),
+        { log },
+      );
       try {
-        const row = controller.initialize();
+        const row = await controller.initialize();
         log(
           `mission ${row.missionId} ready: contract ${row.contractHash.slice(0, 12)} evaluator ${row.evaluatorHash.slice(0, 12)} env ${row.environmentHash.slice(0, 12)} seed ${row.seedArtifactHash?.slice(0, 12)}`,
         );
       } finally {
-        controller.close();
+        await controller.close();
       }
       return 0;
     }
     case "run":
     case "resume": {
       const { config, paths } = loadMission();
-      const controller = new MissionController(config, paths, {
+      const controller = await MissionController.open(config, paths, {
         log,
         worker: makeWorker(config, paths),
         ...(values.cycles ? { maxCycles: Number(values.cycles) } : {}),
@@ -179,7 +186,7 @@ async function main(): Promise<number> {
       try {
         const row = await controller.run();
         log("");
-        log(renderProgress(summarize(controller.ledger, config)));
+        log(renderProgress(await summarize(controller.ledger, config)));
         return row.status === "succeeded" ? 0 : 2;
       } catch (error) {
         if (error instanceof SimulatedCrash) {
@@ -189,7 +196,7 @@ async function main(): Promise<number> {
         if (error instanceof BaselineError) return 2;
         throw error;
       } finally {
-        controller.close();
+        await controller.close();
       }
     }
     case "verify":
@@ -197,9 +204,9 @@ async function main(): Promise<number> {
       const { config, paths } = loadMission();
       const suite: Suite = command === "profile" ? "performance" : (values.suite as Suite);
       if (!suite) throw new Error("--suite is required");
-      const ledger = new Ledger(paths.db);
+      const ledger = await openLedger(config, paths);
       try {
-        const mission = ledger.getMission(config.missionId);
+        const mission = await ledger.getMission(config.missionId);
         const artifacts = new ArtifactStore(paths.artifacts);
         const hash = values.artifact ?? mission?.bestArtifactHash;
         if (!hash || !artifacts.verify(hash))
@@ -242,7 +249,7 @@ async function main(): Promise<number> {
         );
         return report.status === "passed" ? 0 : 2;
       } finally {
-        ledger.close();
+        await ledger.close();
       }
     }
     case "features": {
@@ -330,22 +337,22 @@ async function main(): Promise<number> {
     }
     case "inspect": {
       const { config, paths } = loadMission();
-      const ledger = new Ledger(paths.db);
+      const ledger = await openLedger(config, paths);
       try {
-        log(renderProgress(summarize(ledger, config)));
+        log(renderProgress(await summarize(ledger, config)));
       } finally {
-        ledger.close();
+        await ledger.close();
       }
       return 0;
     }
     case "export": {
       const { config, paths } = loadMission();
-      const ledger = new Ledger(paths.db);
+      const ledger = await openLedger(config, paths);
       try {
-        const out = exportMission(ledger, config, paths);
+        const out = await exportMission(ledger, config, paths);
         log(`${out.json}\n${out.markdown}`);
       } finally {
-        ledger.close();
+        await ledger.close();
       }
       return 0;
     }

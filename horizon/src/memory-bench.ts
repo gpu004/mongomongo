@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, statSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildPacket, DEFAULT_PACKET_BUDGET, estimateTokens } from "./context-packet.ts";
-import { Ledger } from "./ledger.ts";
+import { SqliteLedger } from "./ledger.ts";
 import { type EpisodePayload, LocalMemoryAdapter, renderEpisode } from "./memory-adapter.ts";
 import { MemoryOutbox, retrieveEpisodes, type RetrievalSelection } from "./memory-outbox.ts";
 import { FileEvidenceStore } from "./mission-paths.ts";
@@ -86,7 +86,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
   const dir = options.keepDir ?? mkdtempSync(join(tmpdir(), "horizon-membench-"));
   const missionId = "bench";
   const containerTag = `horizon-${missionId}`;
-  const ledger = new Ledger(join(dir, "mission.sqlite"));
+  const ledger = new SqliteLedger(join(dir, "mission.sqlite"));
   const evidence = new FileEvidenceStore(join(dir, "evidence"));
   const evidencePool = Array.from({ length: 20 }, (_, i) => evidence.write("bench", { i }));
   const adapter = new LocalMemoryAdapter();
@@ -134,7 +134,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
   const base = Date.parse("2026-01-01T00:00:00Z");
   const BATCH = 2000;
   for (let start = 0; start < timeline.length; start += BATCH) {
-    ledger.transaction(() => {
+    await ledger.transaction(async () => {
       for (let i = start; i < Math.min(timeline.length, start + BATCH); i += 1) {
         const { experiment, version } = timeline[i]!;
         const id = expId(experiment);
@@ -176,7 +176,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
         const summary = renderEpisode(payload);
         archivedTokens += estimateTokens(summary);
         payloads.set(episodeId, payload);
-        ledger.insertEpisode({
+        await ledger.insertEpisode({
           episodeId,
           missionId,
           experimentId: id,
@@ -218,7 +218,9 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
   await outbox.drain(Date.now() + 60_000);
   const deliveryMs = Date.now() - deliveryStarted;
   const unindexed = new Set(
-    ledger.listOutbox(["submitted", "document_ready", "pending", "failed"]).map((r) => r.episodeId),
+    (await ledger.listOutbox(["submitted", "document_ready", "pending", "failed"])).map(
+      (r) => r.episodeId,
+    ),
   );
 
   const scope = { missionId, containerTag, contractVersion: 1 };
@@ -308,7 +310,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
     const source = selection.injected.find((r) => r.text.includes(`episode ep-${id}-v`));
     const m = source ? /fixes regression introduced by (exp-\d+)/.exec(source.text) : null;
     // Second hop through canonical state: the referenced experiment must exist locally.
-    const referenced = m ? ledger.getEpisode(`ep-${m[1]}-v1`) : undefined;
+    const referenced = m ? await ledger.getEpisode(`ep-${m[1]}-v1`) : undefined;
     if (referenced && m![1] === expId(dependsOn.get(e)!)) dependency.correct += 1;
     else dependency.missed += 1;
   }
@@ -358,7 +360,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
   const storageBytes = [dbPath, `${dbPath}-wal`]
     .filter(existsSync)
     .reduce((n, p) => n + statSync(p).size, 0);
-  ledger.close();
+  await ledger.close();
   const result: MemoryBenchResult = {
     episodes: timeline.length,
     experiments,

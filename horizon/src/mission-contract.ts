@@ -45,6 +45,13 @@ export interface MissionConfig {
     containerTag: string;
     materializeCorrections: boolean;
   };
+  /**
+   * Durable-state backend. Omitted means the local SQLite file under the
+   * mission directory. "mongodb" reads the connection string from MONGODB_URI
+   * (never from the config, which is hashed and exported) and stores every
+   * mission's collections in `database` (default "horizon").
+   */
+  ledger?: { backend: "sqlite" | "mongodb"; database?: string };
 }
 
 export function loadMissionConfig(path: string): MissionConfig {
@@ -108,9 +115,21 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     fail("memory config incomplete");
   if (c.memory!.containerTag !== `horizon-${c.missionId}`)
     fail("memory.containerTag must be horizon-<missionId> (mission-scoped)");
+  if (c.ledger !== undefined) {
+    if (c.ledger.backend !== "sqlite" && c.ledger.backend !== "mongodb")
+      fail("ledger.backend must be sqlite|mongodb");
+    if (c.ledger.database !== undefined && !/^[A-Za-z0-9_-]{1,63}$/.test(c.ledger.database))
+      fail("ledger.database must be a short identifier");
+  }
   return c as MissionConfig;
 }
 
+/**
+ * Identity of what the mission measures and accepts. Where the state is stored
+ * is deliberately excluded: moving a mission between SQLite and MongoDB must
+ * not read as a contract change.
+ */
 export function contractHash(config: MissionConfig): string {
-  return sha256(canonicalJson(config));
+  const { ledger: _ledger, ...contract } = config;
+  return sha256(canonicalJson(contract));
 }

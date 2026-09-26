@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -14,6 +15,15 @@ import type { Operation } from "../verification/reference-model.ts";
 import type { Suite, VerificationReport } from "../verification/reports.ts";
 import type { ObservedVerification } from "./claim-audit.ts";
 import type { FileEvidenceStore } from "./mission-paths.ts";
+import { dockerRunArgs, killContainer } from "./sandbox.ts";
+
+/** When set, worker commands run in a throwaway container instead of on the host. */
+export interface ExecSandbox {
+  image: string;
+  missionId: string;
+}
+
+const WORKER_EXEC_MEMORY_BYTES = 256 * 1024 * 1024;
 
 export interface RecallResult {
   episodeId: string;
@@ -65,7 +75,8 @@ export class ToolBroker {
   readonly evidence: FileEvidenceStore;
   readonly hooks: BrokerHooks;
   private readonly deadline: () => number;
-  private readonly children = new Set<ReturnType<typeof spawn>>();
+  private readonly sandbox: ExecSandbox | undefined;
+  private readonly children = new Map<ReturnType<typeof spawn>, string | undefined>();
   /** Every verifier result the worker saw this cycle, in order; used to audit its claim. */
   readonly verifications: ObservedVerification[] = [];
   private realWorkspaceRoot: string | undefined;
@@ -75,11 +86,13 @@ export class ToolBroker {
     evidence: FileEvidenceStore,
     hooks: BrokerHooks,
     deadline: () => number,
+    sandbox?: ExecSandbox,
   ) {
     this.workspaceDir = resolve(workspaceDir);
     this.evidence = evidence;
     this.hooks = hooks;
     this.deadline = deadline;
+    this.sandbox = sandbox;
   }
 
   /** Real path of the workspace root, resolved once (the root itself may sit under a symlinked TMPDIR). */
@@ -210,7 +223,11 @@ export class ToolBroker {
     return { path, bytes: Buffer.byteLength(next) };
   }
 
-  /** Bounded read-only command in the candidate workspace. Small allowlist; no shell; no interpreters. */
+  /**
+   * Bounded read-only command in the candidate workspace. Small allowlist; no shell; no
+   * interpreters. Under container isolation the command runs as an unprivileged user in a
+   * container with no network and the workspace mounted read-only.
+   */
   workspaceExec(command: string, args: string[], timeoutMs: number): Promise<ExecResult> {
     this.checkDeadline();
     if (!ALLOWED_EXEC.has(command))
@@ -226,13 +243,30 @@ export class ToolBroker {
       return Promise.reject(err);
     }
     const remaining = Math.max(1000, Math.min(timeoutMs, this.deadline() - Date.now()));
+    const containerName = this.sandbox ? `horizon-exec-${randomUUID().slice(0, 12)}` : undefined;
     return new Promise((resolvePromise) => {
-      const child = spawn(command, args, {
-        cwd: this.workspaceDir,
-        env: { PATH: process.env.PATH ?? "" },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      this.children.add(child);
+      const child = this.sandbox
+        ? spawn(
+            "docker",
+            dockerRunArgs({
+              missionId: this.sandbox.missionId,
+              role: "worker-exec",
+              name: containerName!,
+              image: this.sandbox.image,
+              hostDir: this.realRoot(),
+              mountPath: "/workspace",
+              memoryLimitBytes: WORKER_EXEC_MEMORY_BYTES,
+              network: "none",
+              command: [command, ...args],
+            }),
+            { env: { PATH: process.env.PATH ?? "" }, stdio: ["ignore", "pipe", "pipe"] },
+          )
+        : spawn(command, args, {
+            cwd: this.workspaceDir,
+            env: { PATH: process.env.PATH ?? "" },
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+      this.children.set(child, containerName);
       let stdout = "";
       let stderr = "";
       let timedOut = false;
@@ -240,6 +274,7 @@ export class ToolBroker {
       child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
       const timer = setTimeout(() => {
         timedOut = true;
+        if (containerName) killContainer(containerName);
         child.kill("SIGKILL");
       }, remaining);
       child.on("close", (exitCode) => {
@@ -336,7 +371,10 @@ export class ToolBroker {
 
   /** Deadline or abort: kill anything the worker started. */
   terminateChildren(): void {
-    for (const child of this.children) child.kill("SIGKILL");
+    for (const [child, container] of this.children) {
+      if (container) killContainer(container);
+      child.kill("SIGKILL");
+    }
     this.children.clear();
   }
 }

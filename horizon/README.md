@@ -10,6 +10,8 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 - Node >= 24 (uses `node:sqlite` and type-stripped `.ts` execution)
 - Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
+- `MONGODB_URI` (optional) for `"ledger": { "backend": "mongodb" }`; SQLite is the default
+  and needs nothing extra. See `.env.example`.
 - An LLM API key for the Pi worker (`"worker": "pi"`); the `scripted` worker needs none
 
 ## Setup and checks
@@ -17,7 +19,7 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ```sh
 npm install
 npm run check          # tsc --noEmit
-npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget
+npm test               # recovery, fault injection, policies, report validation, memory scope, ledger contract (sqlite + mongodb), sandbox
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
 
@@ -41,6 +43,33 @@ node scripts/supermemory-probe.ts --episodes 12            # hosted memory: inde
 
 Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artifacts/<hash>/`
 (immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`.
+
+## Ledger backends
+
+One backend per mission, chosen at `mission create` and never switched silently:
+
+- `sqlite` (default): `runs/<mission>/state.sqlite`, WAL + `synchronous=FULL`, single-controller
+  PID lock. Fast, hermetic, no services.
+- `mongodb`: `"ledger": { "backend": "mongodb", "database": "horizon" }` in the mission config plus
+  `MONGODB_URI` (Atlas development cluster or any replica set). Every durable transition is a
+  multi-document transaction with majority write concern; identities are enforced by unique
+  indexes; the controller holds a per-mission lease with a fencing token, so a paused controller
+  whose lease expired cannot commit after a successor takes over (`LeaseLostError`). Snapshots,
+  transcripts and raw evidence stay on the controller's disk; the ledger stores their hashes.
+
+`test/ledger-contract.test.ts` runs the same contract against both backends. MongoDB cases start
+a throwaway single-node replica set in Docker (`mongo:8.0`) unless `HORIZON_TEST_MONGODB_URI`
+points at a cluster; they are skipped when neither is available.
+
+## Isolation
+
+- `subprocess`: cooperative fallback; candidate and worker commands run on the host as the
+  controller user. Reports record this mode.
+- `container`: candidate services and worker `workspace_exec` commands run in throwaway
+  containers as an unprivileged user with a read-only root, no capabilities, bounded
+  memory/cpu/pids, and the workspace bind-mounted read-only. Worker commands get
+  `--network none`; the candidate gets one published loopback port. Containers are labelled
+  `horizon.mission=<id>` and orphans from a crashed controller are removed on `run`/`resume`.
 
 ## Layout
 

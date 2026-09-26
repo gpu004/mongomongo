@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { Ledger, type EpisodeRow } from "../src/ledger.ts";
+import { type EpisodeRow, SqliteLedger } from "../src/ledger.ts";
 import {
   type EpisodePayload,
   LocalMemoryAdapter,
@@ -65,7 +65,7 @@ function row(p: EpisodePayload, evidenceIds: string[] = []): EpisodeRow {
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "horizon-mem-"));
-  const ledger = new Ledger(join(dir, "state.sqlite"));
+  const ledger = new SqliteLedger(join(dir, "state.sqlite"));
   const evidence = new FileEvidenceStore(join(dir, "evidence"));
   const adapter = new LocalMemoryAdapter();
   const payloads = new Map<string, EpisodePayload>();
@@ -83,8 +83,8 @@ test("retrieval only injects episodes from this mission's scope with local evide
   const { ledger, evidence, adapter, payloads, outbox } = fixture();
   const ours = payload("ep-1", { evidenceIds: [evidence.write("timing", { p95: 1 })] });
   payloads.set(ours.episodeId, ours);
-  ledger.insertEpisode(row(ours, ours.evidenceIds));
-  outbox.enqueue(ours);
+  await ledger.insertEpisode(row(ours, ours.evidenceIds));
+  await outbox.enqueue(ours);
   await outbox.drain();
   await outbox.drain();
 
@@ -132,7 +132,7 @@ test("retrieval only injects episodes from this mission's scope with local evide
   assert.match(reasons["ep-old"]!, /contract version 0/);
   assert.match(reasons["ep-ghost"]!, /no local episode record/);
   assert.equal("ep-other-tag" in reasons, false);
-  ledger.close();
+  await ledger.close();
 });
 
 test("superseded episodes and episodes whose evidence is gone are filtered out", async () => {
@@ -142,8 +142,8 @@ test("superseded episodes and episodes whose evidence is gone are filtered out",
   const missing = payload("ep-missing", { evidenceIds: ["ev-timing-0123456789abcdef"] });
   for (const p of [v1, v2, missing]) {
     payloads.set(p.episodeId, p);
-    ledger.insertEpisode(row(p, p.evidenceIds));
-    outbox.enqueue(p);
+    await ledger.insertEpisode(row(p, p.evidenceIds));
+    await outbox.enqueue(p);
   }
   await outbox.drain();
   const selection = await retrieveEpisodes(
@@ -160,23 +160,23 @@ test("superseded episodes and episodes whose evidence is gone are filtered out",
   const reasons = Object.fromEntries(selection.filteredOut.map((f) => [f.episodeId, f.reason]));
   assert.match(reasons["ep-v1"]!, /superseded/);
   assert.match(reasons["ep-missing"]!, /evidence missing/);
-  ledger.close();
+  await ledger.close();
 });
 
 test("outbox: acceptance is not readiness; retries reuse the same customId; outage falls back to local cache", async () => {
   const { ledger, evidence, adapter, payloads, outbox } = fixture();
   const p = payload("ep-retry");
   payloads.set(p.episodeId, p);
-  ledger.insertEpisode(row(p));
-  const key = outbox.enqueue(p);
-  assert.equal(outbox.enqueue(p), key, "re-enqueue of the same payload is idempotent");
-  assert.equal(ledger.listOutbox().length, 1);
+  await ledger.insertEpisode(row(p));
+  const key = await outbox.enqueue(p);
+  assert.equal(await outbox.enqueue(p), key, "re-enqueue of the same payload is idempotent");
+  assert.equal((await ledger.listOutbox()).length, 1);
 
   adapter.unavailable = true;
   let result = await outbox.drain();
   assert.equal(result.failed, 1);
-  assert.equal(ledger.listOutbox(["failed"])[0]?.retries, 1);
-  assert.match(ledger.listOutbox(["failed"])[0]?.lastError ?? "", /unavailable/);
+  assert.equal((await ledger.listOutbox(["failed"]))[0]?.retries, 1);
+  assert.match((await ledger.listOutbox(["failed"]))[0]?.lastError ?? "", /unavailable/);
 
   // Degraded retrieval uses the local ledger cache and says so.
   const degraded = await retrieveEpisodes(
@@ -198,24 +198,24 @@ test("outbox: acceptance is not readiness; retries reuse the same customId; outa
   result = await outbox.drain(future);
   assert.equal(result.submitted, 1);
   assert.equal(
-    ledger.listOutbox(["submitted"]).length,
+    (await ledger.listOutbox(["submitted"])).length,
     1,
     "API acceptance leaves the row submitted, not ready",
   );
 
   result = await outbox.drain(future);
   assert.equal(result.ready, 0);
-  assert.equal(ledger.listOutbox(["document_ready"]).length, 1);
+  assert.equal((await ledger.listOutbox(["document_ready"])).length, 1);
   assert.equal((await adapter.search(TAG, "cache", 5)).length, 0, "not searchable until processed");
 
   adapter.settle();
   result = await outbox.drain(future + 60 * 60 * 1000);
   assert.equal(result.ready, 1);
-  assert.equal(ledger.listOutbox(["memory_ready"]).length, 1);
+  assert.equal((await ledger.listOutbox(["memory_ready"])).length, 1);
   const hits = await adapter.search(TAG, "cache", 5);
   assert.equal(hits.length, 1);
   assert.equal(hits[0]?.customId, "ep-retry");
-  ledger.close();
+  await ledger.close();
 });
 
 test("rendered episodes carry no raw evidence, only IDs, and label seeded fixtures", () => {

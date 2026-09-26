@@ -29,13 +29,13 @@ class RecordingWorker implements Worker {
 test("segment rotation opens a fresh bounded context, not the previous session", async () => {
   const runs = tempRunsRoot();
   const worker = new RecordingWorker();
-  const controller = controllerFor(
+  const controller = await controllerFor(
     "seg-rotate",
     runs,
     { worker, maxCycles: 3 },
     { segmentRotationCycles: 1 },
   );
-  controller.initialize();
+  await controller.initialize();
   await controller.run();
 
   assert.ok(worker.opened.length >= 3, `expected >=3 segment opens, got ${worker.opened.length}`);
@@ -45,10 +45,10 @@ test("segment rotation opens a fresh bounded context, not the previous session",
     `rotation must not carry the previous session: ${JSON.stringify(worker.opened)}`,
   );
 
-  const segments = controller.ledger
-    .listSegments("seg-rotate")
-    .sort((a, b) => a.ordinal - b.ordinal);
+  const segments = (await controller.ledger.listSegments("seg-rotate")).sort(
+    (a, b) => a.ordinal - b.ordinal,
+  );
   const sessionIds = new Set(segments.map((s) => s.sessionId));
-  controller.close();
+  await controller.close();
   assert.equal(sessionIds.size, segments.length, "every segment recorded a distinct session id");
 });

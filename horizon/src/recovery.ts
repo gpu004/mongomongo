@@ -32,15 +32,15 @@ export interface RecoveryOutcome {
  * Never re-accepts an already accepted artifact; never trusts a file that was
  * not atomically published.
  */
-export function recover(
+export async function recover(
   ledger: Ledger,
   artifacts: ArtifactStore,
   missionId: string,
   reportsDir: string,
   expected: { evaluatorHash: string; environmentHash: string; contractHash: string },
-): RecoveryOutcome {
+): Promise<RecoveryOutcome> {
   const actions: RecoveryAction[] = [];
-  const mission = ledger.getMission(missionId);
+  const mission = await ledger.getMission(missionId);
   if (!mission)
     return {
       checkpoint: undefined,
@@ -62,19 +62,19 @@ export function recover(
       "environment hash drift: node/platform/isolation differs from the frozen mission environment",
     );
 
-  const checkpoint = ledger.latestCheckpoint(missionId);
+  const checkpoint = await ledger.latestCheckpoint(missionId);
   const replayed = checkpoint
-    ? ledger.eventsSince(checkpoint.lastEventSeq).length
-    : ledger.lastEventSeq();
+    ? (await ledger.eventsSince(checkpoint.lastEventSeq)).length
+    : await ledger.lastEventSeq();
 
-  const discarded = ledger.discardUncommittedSegments(missionId);
+  const discarded = await ledger.discardUncommittedSegments(missionId);
   if (discarded > 0)
     actions.push({
       kind: "discarded_uncommitted_segment",
       detail: `${discarded} uncommitted replacement segment(s) discarded; last committed segment stays active`,
     });
 
-  const pendingOutbox = ledger.listOutbox(["pending", "submitted", "failed"]).length;
+  const pendingOutbox = (await ledger.listOutbox(["pending", "submitted", "failed"])).length;
   if (pendingOutbox > 0)
     actions.push({
       kind: "drain_outbox",
@@ -82,20 +82,20 @@ export function recover(
     });
 
   let active: ExperimentRow | undefined;
-  const open = ledger
-    .listExperiments(missionId)
-    .filter((e) => ["planned", "editing", "snapshot_ready", "evaluating"].includes(e.status));
+  const open = (await ledger.listExperiments(missionId)).filter((e) =>
+    ["planned", "editing", "snapshot_ready", "evaluating"].includes(e.status),
+  );
   for (const experiment of open) {
     switch (experiment.status) {
       case "planned":
       case "editing": {
-        ledger.transaction(() => {
-          ledger.updateExperiment(experiment.experimentId, {
+        await ledger.transaction(async () => {
+          await ledger.updateExperiment(experiment.experimentId, {
             status: "interrupted",
             verdict: "interrupted during candidate edits",
             finishedAt: new Date().toISOString(),
           });
-          ledger.appendEvent(
+          await ledger.appendEvent(
             `recovery:${experiment.experimentId}:interrupted`,
             "experiment.interrupted",
             experiment.experimentId,
@@ -121,13 +121,13 @@ export function recover(
           });
           active = experiment;
         } else {
-          ledger.transaction(() => {
-            ledger.updateExperiment(experiment.experimentId, {
+          await ledger.transaction(async () => {
+            await ledger.updateExperiment(experiment.experimentId, {
               status: "interrupted",
               verdict: "snapshot missing or corrupt",
               finishedAt: new Date().toISOString(),
             });
-            ledger.appendEvent(
+            await ledger.appendEvent(
               `recovery:${experiment.experimentId}:bad-snapshot`,
               "experiment.interrupted",
               experiment.experimentId,
@@ -144,12 +144,12 @@ export function recover(
       }
       case "evaluating": {
         const found = experiment.candidateArtifactHash
-          ? findFinalizedReports(ledger, experiment, reportsDir)
+          ? await findFinalizedReports(ledger, experiment, reportsDir)
           : [];
         if (found.length > 0) {
-          ledger.transaction(() => {
+          await ledger.transaction(async () => {
             for (const report of found)
-              ledger.insertVerification(
+              await ledger.insertVerification(
                 report,
                 join(
                   reportsDir,
@@ -169,12 +169,12 @@ export function recover(
             experimentId: experiment.experimentId,
             detail: `no finalized matching report; rerun under attempt ${experiment.attempt + 1}`,
           });
-          ledger.updateExperiment(experiment.experimentId, {
+          await ledger.updateExperiment(experiment.experimentId, {
             attempt: experiment.attempt + 1,
             status: "snapshot_ready",
           });
         }
-        active = ledger.getExperiment(experiment.experimentId);
+        active = await ledger.getExperiment(experiment.experimentId);
         break;
       }
     }
@@ -185,11 +185,16 @@ export function recover(
       kind: "resume_idle",
       detail: checkpoint ? `resuming from ${checkpoint.checkpointId}` : "no checkpoint yet",
     });
-  ledger.appendEvent(`recovery:${Date.now()}:${process.pid}`, "controller.recovered", missionId, {
-    checkpointId: checkpoint?.checkpointId ?? null,
-    replayed,
-    actions,
-  });
+  await ledger.appendEvent(
+    `recovery:${Date.now()}:${process.pid}`,
+    "controller.recovered",
+    missionId,
+    {
+      checkpointId: checkpoint?.checkpointId ?? null,
+      replayed,
+      actions,
+    },
+  );
   return { checkpoint, replayedEvents: replayed, actions, activeExperiment: active };
 }
 
@@ -199,12 +204,12 @@ export function recover(
  * Partial `.tmp-*` files are ignored, and each report must validate against
  * the frozen identities before it counts.
  */
-export function findFinalizedReports(
+export async function findFinalizedReports(
   ledger: Ledger,
   experiment: ExperimentRow,
   reportsDir: string,
-): VerificationReport[] {
-  const mission = ledger.getMission(experiment.missionId);
+): Promise<VerificationReport[]> {
+  const mission = await ledger.getMission(experiment.missionId);
   if (!mission || !experiment.candidateArtifactHash) return [];
   const dir = join(reportsDir, experiment.experimentId);
   if (!existsSync(dir)) return [];

@@ -1,6 +1,7 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { dockerRunArgs } from "../src/sandbox.ts";
 
 export type IsolationMode = "container" | "subprocess";
 
@@ -9,6 +10,8 @@ export interface LaunchOptions {
   isolation: IsolationMode;
   /** Pinned image used in container mode. */
   containerImage: string;
+  /** Labels the container so orphans can be reclaimed by mission on resume. */
+  missionId: string;
   startupTimeoutMs: number;
   memoryLimitBytes: number;
 }
@@ -65,38 +68,22 @@ function launchSubprocess(options: LaunchOptions, entry: string): Promise<Runnin
 
 function launchInContainer(options: LaunchOptions): Promise<RunningCandidate> {
   const name = `horizon-cand-${randomUUID().slice(0, 12)}`;
-  const args = [
-    "run",
-    "--rm",
-    "--name",
+  // The candidate needs exactly one inbound path (the published loopback port); it gets no
+  // credentials and no writable mount, so egress has nothing to exfiltrate but is still possible
+  // on the default bridge. `--network none` would remove the published port as well.
+  const args = dockerRunArgs({
+    missionId: options.missionId,
+    role: "candidate",
     name,
-    "--read-only",
-    "--tmpfs",
-    "/tmp",
-    "--memory",
-    String(options.memoryLimitBytes),
-    "--cpus",
-    "1",
-    "--pids-limit",
-    "128",
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges",
-    "-v",
-    `${options.snapshotDir}:/candidate:ro`,
-    "-w",
-    "/candidate",
-    "-e",
-    "HOST=0.0.0.0",
-    "-e",
-    "PORT=8080",
-    "-p",
-    "127.0.0.1::8080",
-    options.containerImage,
-    "node",
-    "src/http/server.ts",
-  ];
+    image: options.containerImage,
+    hostDir: options.snapshotDir,
+    mountPath: "/candidate",
+    memoryLimitBytes: options.memoryLimitBytes,
+    network: "bridge",
+    env: { HOST: "0.0.0.0", PORT: "8080" },
+    publishPort: 8080,
+    command: ["node", "src/http/server.ts"],
+  });
   const child = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
   return waitForListening(
     child,

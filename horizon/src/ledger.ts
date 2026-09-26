@@ -273,15 +273,160 @@ type Cell = string | number | null | undefined;
 type Row = Record<string, Cell>;
 
 /**
+ * Canonical durable mission state. Every backend must provide atomic
+ * multi-write transactions, idempotent inserts on the natural keys (event key,
+ * report identity, episode id, outbox idempotency key) and a single-writer
+ * controller lock. Backends: `SqliteLedger` (local file), `MongoLedger`
+ * (Atlas or any replica set; see mongo-ledger.ts).
+ */
+export interface Ledger {
+  readonly backend: "sqlite" | "mongodb";
+  /** Human-readable location without credentials (file path or host/db). */
+  readonly location: string;
+  acquireLock(): Promise<void>;
+  releaseLock(): Promise<void>;
+  close(): Promise<void>;
+  /** Runs `fn` atomically; must not be nested. Backends may retry `fn` on transient conflicts, so it should only issue ledger writes. */
+  transaction<T>(fn: () => Promise<T> | T): Promise<T>;
+
+  appendEvent(eventKey: string, type: string, entityId: string, payload: unknown): Promise<number>;
+  eventsSince(seq: number, limit?: number): Promise<EventRow[]>;
+  findEvent(eventKey: string): Promise<EventRow | undefined>;
+  lastEventSeq(): Promise<number>;
+
+  createMission(row: NewMissionRow): Promise<void>;
+  getMission(missionId: string): Promise<MissionRow | undefined>;
+  updateMission(missionId: string, patch: MissionPatch): Promise<void>;
+
+  upsertTask(task: TaskRow): Promise<void>;
+  listTasks(missionId: string): Promise<TaskRow[]>;
+
+  insertExperiment(e: NewExperimentRow): Promise<void>;
+  updateExperiment(experimentId: string, patch: ExperimentPatch): Promise<void>;
+  getExperiment(experimentId: string): Promise<ExperimentRow | undefined>;
+  listExperiments(missionId: string): Promise<ExperimentRow[]>;
+
+  insertArtifact(a: ArtifactRow): Promise<void>;
+  getArtifact(hash: string): Promise<ArtifactRow | undefined>;
+  insertVerification(report: VerificationReport, path: string): Promise<void>;
+  findVerification(
+    experimentId: string,
+    artifactHash: string,
+    suite: string,
+  ): Promise<VerificationRow | undefined>;
+  listVerifications(missionId: string): Promise<VerificationRow[]>;
+
+  insertEpisode(e: EpisodeRow): Promise<void>;
+  isIndexed(episodeId: string): Promise<boolean>;
+  isSuperseded(episodeId: string): Promise<boolean>;
+  currentVersionOf(episodeId: string): Promise<EpisodeRow | undefined>;
+  searchEpisodes(
+    missionId: string,
+    query: string,
+    limit: number,
+    options?: { unindexedOnly?: boolean },
+  ): Promise<EpisodeRow[]>;
+  termWeights(terms: string[]): Promise<Map<string, number>>;
+  getEpisode(episodeId: string): Promise<EpisodeRow | undefined>;
+  listEpisodes(missionId: string): Promise<EpisodeRow[]>;
+
+  upsertLesson(l: LessonRow): Promise<void>;
+  listLessons(missionId: string): Promise<LessonRow[]>;
+  insertLearnedScenario(
+    scenarioId: string,
+    missionId: string,
+    lessonId: string,
+    suiteVersion: number,
+    path: string,
+  ): Promise<void>;
+  listLearnedScenarios(missionId: string): Promise<LearnedScenarioRow[]>;
+
+  writeCheckpoint(c: NewCheckpoint): Promise<CheckpointRow>;
+  latestCheckpoint(missionId: string): Promise<CheckpointRow | undefined>;
+  countCheckpoints(missionId: string): Promise<number>;
+
+  openSegment(
+    missionId: string,
+    ordinal: number,
+    sessionPath: string | null,
+    sessionId: string | null,
+  ): Promise<void>;
+  commitSegment(missionId: string, ordinal: number, checkpointId: string): Promise<void>;
+  closeSegment(missionId: string, ordinal: number, archiveHash: string | null): Promise<void>;
+  activeSegment(missionId: string): Promise<SegmentRow | undefined>;
+  listSegments(missionId: string): Promise<SegmentRow[]>;
+  discardUncommittedSegments(missionId: string): Promise<number>;
+
+  enqueueOutbox(episodeId: string, payload: unknown): Promise<string>;
+  outboxPayloadForEpisode(episodeId: string): Promise<unknown>;
+  outboxPayload(key: string): Promise<unknown>;
+  updateOutbox(key: string, patch: OutboxPatch): Promise<void>;
+  listOutbox(states?: OutboxState[]): Promise<OutboxRow[]>;
+}
+
+export type NewMissionRow = Omit<
+  MissionRow,
+  | "createdAt"
+  | "spentExperiments"
+  | "spentInputTokens"
+  | "spentOutputTokens"
+  | "spentMemoryOperations"
+  | "spentWallMs"
+  | "usageUncertain"
+  | "learnedSuiteVersion"
+>;
+export type MissionPatch = Partial<Omit<MissionRow, "missionId" | "createdAt">>;
+export type NewExperimentRow = Omit<
+  ExperimentRow,
+  | "createdAt"
+  | "finishedAt"
+  | "reportIds"
+  | "verdict"
+  | "failureSignature"
+  | "candidateArtifactHash"
+>;
+export type ExperimentPatch = Partial<
+  Pick<
+    ExperimentRow,
+    | "status"
+    | "verdict"
+    | "candidateArtifactHash"
+    | "failureSignature"
+    | "reportIds"
+    | "finishedAt"
+    | "attempt"
+    | "hypothesis"
+  >
+>;
+export interface LearnedScenarioRow {
+  scenarioId: string;
+  lessonId: string;
+  suiteVersion: number;
+  path: string;
+}
+export type NewCheckpoint = Omit<
+  CheckpointRow,
+  "checkpointId" | "seq" | "createdAt" | "lastEventSeq"
+>;
+export type OutboxPatch = Partial<
+  Pick<OutboxRow, "state" | "remoteDocumentId" | "retries" | "nextAttemptAt" | "lastError">
+>;
+
+/**
  * Single-writer SQLite mission ledger. WAL + synchronous=FULL. Every write that
  * must be atomic with another goes through `transaction()`. Events are
  * idempotent on `event_key`.
  */
-export class Ledger {
+export class SqliteLedger implements Ledger {
+  readonly backend = "sqlite" as const;
   readonly db: DatabaseSync;
   readonly path: string;
+  get location(): string {
+    return this.path;
+  }
   private lockFd: number | null = null;
   private lockPath: string;
+  private inTransaction = false;
 
   constructor(path: string) {
     this.path = path;
@@ -295,8 +440,14 @@ export class Ledger {
     this.lockPath = join(dirname(path), "controller.lock");
   }
 
-  /** Single-controller lock: fails if another live controller holds it. Stale locks from dead pids are reclaimed. */
-  acquireLock(): void {
+  /**
+   * Single-controller lock: fails if another live controller holds it, in this
+   * process or another. Stale locks from dead pids are reclaimed.
+   */
+  async acquireLock(): Promise<void> {
+    if (this.lockFd !== null) return;
+    if (HELD_LOCKS.has(this.lockPath))
+      throw new Error(`another controller in this process holds ${this.lockPath}`);
     if (existsSync(this.lockPath)) {
       const pid = Number(readFileSync(this.lockPath, "utf8").trim());
       if (Number.isInteger(pid) && pid !== process.pid && isAlive(pid)) {
@@ -306,37 +457,49 @@ export class Ledger {
     }
     this.lockFd = openSync(this.lockPath, "wx");
     writeFileSync(this.lockFd, String(process.pid));
+    HELD_LOCKS.add(this.lockPath);
   }
 
-  releaseLock(): void {
+  async releaseLock(): Promise<void> {
     if (this.lockFd !== null) {
       closeSync(this.lockFd);
       this.lockFd = null;
+      HELD_LOCKS.delete(this.lockPath);
       if (existsSync(this.lockPath)) unlinkSync(this.lockPath);
     }
   }
 
-  close(): void {
-    this.releaseLock();
+  async close(): Promise<void> {
+    await this.releaseLock();
     this.db.close();
   }
 
-  transaction<T>(fn: () => T): T {
+  async transaction<T>(fn: () => Promise<T> | T): Promise<T> {
+    if (this.inTransaction)
+      throw new Error("ledger transactions cannot nest or run concurrently on one connection");
+    this.inTransaction = true;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const result = fn();
+      const result = await fn();
       this.db.exec("COMMIT");
       return result;
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.inTransaction = false;
     }
   }
 
   // ---- events -------------------------------------------------------------
 
   /** Append an event; a duplicate key is harmless and returns the existing seq. */
-  appendEvent(eventKey: string, type: string, entityId: string, payload: unknown): number {
+  async appendEvent(
+    eventKey: string,
+    type: string,
+    entityId: string,
+    payload: unknown,
+  ): Promise<number> {
     const existing = this.db.prepare("SELECT seq FROM event WHERE event_key = ?").get(eventKey) as
       | { seq: number }
       | undefined;
@@ -347,7 +510,7 @@ export class Ledger {
     return Number(result.lastInsertRowid);
   }
 
-  eventsSince(seq: number, limit = 1000): EventRow[] {
+  async eventsSince(seq: number, limit = 1000): Promise<EventRow[]> {
     const rows = this.db
       .prepare("SELECT * FROM event WHERE seq > ? ORDER BY seq LIMIT ?")
       .all(seq, limit) as Row[];
@@ -361,7 +524,7 @@ export class Ledger {
     }));
   }
 
-  findEvent(eventKey: string): EventRow | undefined {
+  async findEvent(eventKey: string): Promise<EventRow | undefined> {
     const r = this.db.prepare("SELECT * FROM event WHERE event_key = ?").get(eventKey) as
       | Row
       | undefined;
@@ -377,7 +540,11 @@ export class Ledger {
       : undefined;
   }
 
-  lastEventSeq(): number {
+  async lastEventSeq(): Promise<number> {
+    return this.lastEventSeqSync();
+  }
+
+  private lastEventSeqSync(): number {
     const row = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM event").get() as {
       seq: number;
     };
@@ -386,7 +553,7 @@ export class Ledger {
 
   // ---- mission ------------------------------------------------------------
 
-  createMission(
+  async createMission(
     row: Omit<
       MissionRow,
       | "createdAt"
@@ -398,7 +565,7 @@ export class Ledger {
       | "usageUncertain"
       | "learnedSuiteVersion"
     >,
-  ): void {
+  ): Promise<void> {
     this.db
       .prepare(
         `INSERT INTO mission (mission_id, contract_version, contract_hash, evaluator_hash, environment_hash, status, seed_artifact_hash,
@@ -422,7 +589,7 @@ export class Ledger {
       );
   }
 
-  getMission(missionId: string): MissionRow | undefined {
+  async getMission(missionId: string): Promise<MissionRow | undefined> {
     const r = this.db.prepare("SELECT * FROM mission WHERE mission_id = ?").get(missionId) as
       | Row
       | undefined;
@@ -451,10 +618,10 @@ export class Ledger {
     };
   }
 
-  updateMission(
+  async updateMission(
     missionId: string,
     patch: Partial<Omit<MissionRow, "missionId" | "createdAt">>,
-  ): void {
+  ): Promise<void> {
     const columns: Record<string, string> = {
       status: "status",
       seedArtifactHash: "seed_artifact_hash",
@@ -490,7 +657,7 @@ export class Ledger {
 
   // ---- tasks --------------------------------------------------------------
 
-  upsertTask(task: TaskRow): void {
+  async upsertTask(task: TaskRow): Promise<void> {
     this.db
       .prepare(
         `INSERT INTO task (task_id, mission_id, ordinal, depends_on, status, hypothesis, completion_criteria, next_action)
@@ -509,7 +676,7 @@ export class Ledger {
       );
   }
 
-  listTasks(missionId: string): TaskRow[] {
+  async listTasks(missionId: string): Promise<TaskRow[]> {
     const rows = this.db
       .prepare("SELECT * FROM task WHERE mission_id = ? ORDER BY ordinal")
       .all(missionId) as Row[];
@@ -527,7 +694,7 @@ export class Ledger {
 
   // ---- experiments --------------------------------------------------------
 
-  insertExperiment(
+  async insertExperiment(
     e: Omit<
       ExperimentRow,
       | "createdAt"
@@ -537,7 +704,7 @@ export class Ledger {
       | "failureSignature"
       | "candidateArtifactHash"
     >,
-  ): void {
+  ): Promise<void> {
     this.db
       .prepare(
         `INSERT INTO experiment (experiment_id, mission_id, task_id, parent_artifact_hash, strategy, hypothesis, status, attempt, segment_ordinal, created_at)
@@ -557,7 +724,7 @@ export class Ledger {
       );
   }
 
-  updateExperiment(
+  async updateExperiment(
     experimentId: string,
     patch: Partial<
       Pick<
@@ -572,7 +739,7 @@ export class Ledger {
         | "hypothesis"
       >
     >,
-  ): void {
+  ): Promise<void> {
     const sets: string[] = [];
     const values: (string | number | null)[] = [];
     if (patch.hypothesis !== undefined) {
@@ -614,14 +781,14 @@ export class Ledger {
       .run(...values);
   }
 
-  getExperiment(experimentId: string): ExperimentRow | undefined {
+  async getExperiment(experimentId: string): Promise<ExperimentRow | undefined> {
     const r = this.db
       .prepare("SELECT * FROM experiment WHERE experiment_id = ?")
       .get(experimentId) as Row | undefined;
     return r ? toExperiment(r) : undefined;
   }
 
-  listExperiments(missionId: string): ExperimentRow[] {
+  async listExperiments(missionId: string): Promise<ExperimentRow[]> {
     return (
       this.db
         .prepare("SELECT * FROM experiment WHERE mission_id = ? ORDER BY created_at, experiment_id")
@@ -631,7 +798,7 @@ export class Ledger {
 
   // ---- artifacts / verification ------------------------------------------
 
-  insertArtifact(a: ArtifactRow): void {
+  async insertArtifact(a: ArtifactRow): Promise<void> {
     this.db
       .prepare(
         "INSERT OR IGNORE INTO artifact (hash, path, parent_hash, manifest_hash, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -639,7 +806,7 @@ export class Ledger {
       .run(a.hash, a.path, a.parentHash, a.manifestHash, a.createdAt);
   }
 
-  getArtifact(hash: string): ArtifactRow | undefined {
+  async getArtifact(hash: string): Promise<ArtifactRow | undefined> {
     const r = this.db.prepare("SELECT * FROM artifact WHERE hash = ?").get(hash) as Row | undefined;
     return r
       ? {
@@ -652,7 +819,7 @@ export class Ledger {
       : undefined;
   }
 
-  insertVerification(report: VerificationReport, path: string): void {
+  async insertVerification(report: VerificationReport, path: string): Promise<void> {
     this.db
       .prepare(
         `INSERT OR IGNORE INTO verification (report_id, report_hash, mission_id, experiment_id, artifact_hash, suite, status, evaluator_hash, workload_hash, environment_hash, p95_latency_ms, path)
@@ -674,11 +841,11 @@ export class Ledger {
       );
   }
 
-  findVerification(
+  async findVerification(
     experimentId: string,
     artifactHash: string,
     suite: string,
-  ): VerificationRow | undefined {
+  ): Promise<VerificationRow | undefined> {
     const r = this.db
       .prepare(
         "SELECT * FROM verification WHERE experiment_id = ? AND artifact_hash = ? AND suite = ?",
@@ -687,7 +854,7 @@ export class Ledger {
     return r ? toVerification(r) : undefined;
   }
 
-  listVerifications(missionId: string): VerificationRow[] {
+  async listVerifications(missionId: string): Promise<VerificationRow[]> {
     return (
       this.db
         .prepare("SELECT * FROM verification WHERE mission_id = ? ORDER BY rowid")
@@ -697,7 +864,7 @@ export class Ledger {
 
   // ---- episodes / lessons -------------------------------------------------
 
-  insertEpisode(e: EpisodeRow): void {
+  async insertEpisode(e: EpisodeRow): Promise<void> {
     const inserted = this.db
       .prepare(
         `INSERT OR IGNORE INTO episode (episode_id, mission_id, experiment_id, version, supersedes, feature_ids, invariant_ids, artifact_hash, parent_artifact_hash, interpretation, evidence_ids, summary, created_at)
@@ -738,7 +905,7 @@ export class Ledger {
   }
 
   /** True once the remote memory service reported this episode's document as ready. */
-  isIndexed(episodeId: string): boolean {
+  async isIndexed(episodeId: string): Promise<boolean> {
     return (
       this.db
         .prepare("SELECT 1 FROM outbox WHERE episode_id = ? AND state = 'memory_ready' LIMIT 1")
@@ -746,7 +913,7 @@ export class Ledger {
     );
   }
 
-  isSuperseded(episodeId: string): boolean {
+  async isSuperseded(episodeId: string): Promise<boolean> {
     return (
       this.db.prepare("SELECT 1 FROM episode WHERE supersedes = ? LIMIT 1").get(episodeId) !==
       undefined
@@ -754,8 +921,8 @@ export class Ledger {
   }
 
   /** Follows the supersession chain from `episodeId` to its newest version. */
-  currentVersionOf(episodeId: string): EpisodeRow | undefined {
-    let current = this.getEpisode(episodeId);
+  async currentVersionOf(episodeId: string): Promise<EpisodeRow | undefined> {
+    let current = await this.getEpisode(episodeId);
     for (let hops = 0; current && hops < 64; hops += 1) {
       const next = this.db
         .prepare("SELECT * FROM episode WHERE supersedes = ? ORDER BY version DESC LIMIT 1")
@@ -770,12 +937,12 @@ export class Ledger {
    * Local full-text search over this mission's episode summaries. With
    * `unindexedOnly`, only episodes whose memory delivery is not yet ready.
    */
-  searchEpisodes(
+  async searchEpisodes(
     missionId: string,
     query: string,
     limit: number,
     options: { unindexedOnly?: boolean } = {},
-  ): EpisodeRow[] {
+  ): Promise<EpisodeRow[]> {
     const terms = this.selectiveTerms([
       ...new Set(
         query
@@ -798,7 +965,7 @@ export class Ledger {
   }
 
   /** Inverse document frequency of each term over this ledger's episodes. */
-  termWeights(terms: string[]): Map<string, number> {
+  async termWeights(terms: string[]): Promise<Map<string, number>> {
     const total = Number(
       (this.db.prepare("SELECT COUNT(*) AS n FROM episode").get() as { n: number }).n,
     );
@@ -831,14 +998,14 @@ export class Ledger {
     return rare.length > 0 ? rare : terms;
   }
 
-  getEpisode(episodeId: string): EpisodeRow | undefined {
+  async getEpisode(episodeId: string): Promise<EpisodeRow | undefined> {
     const r = this.db.prepare("SELECT * FROM episode WHERE episode_id = ?").get(episodeId) as
       | Row
       | undefined;
     return r ? toEpisode(r) : undefined;
   }
 
-  listEpisodes(missionId: string): EpisodeRow[] {
+  async listEpisodes(missionId: string): Promise<EpisodeRow[]> {
     return (
       this.db
         .prepare("SELECT * FROM episode WHERE mission_id = ? ORDER BY created_at")
@@ -846,7 +1013,7 @@ export class Ledger {
     ).map(toEpisode);
   }
 
-  upsertLesson(l: LessonRow): void {
+  async upsertLesson(l: LessonRow): Promise<void> {
     this.db
       .prepare(
         `INSERT INTO lesson (lesson_id, mission_id, source_episode_ids, invariant_id, state, proposal, positive_evidence_id, negative_evidence_id, materialized_scenario_id, transitions)
@@ -868,7 +1035,7 @@ export class Ledger {
       );
   }
 
-  listLessons(missionId: string): LessonRow[] {
+  async listLessons(missionId: string): Promise<LessonRow[]> {
     const rows = this.db
       .prepare("SELECT * FROM lesson WHERE mission_id = ? ORDER BY rowid")
       .all(missionId) as Row[];
@@ -886,13 +1053,13 @@ export class Ledger {
     }));
   }
 
-  insertLearnedScenario(
+  async insertLearnedScenario(
     scenarioId: string,
     missionId: string,
     lessonId: string,
     suiteVersion: number,
     path: string,
-  ): void {
+  ): Promise<void> {
     this.db
       .prepare(
         "INSERT INTO learned_scenario (scenario_id, mission_id, lesson_id, suite_version, path) VALUES (?, ?, ?, ?, ?)",
@@ -900,9 +1067,9 @@ export class Ledger {
       .run(scenarioId, missionId, lessonId, suiteVersion, path);
   }
 
-  listLearnedScenarios(
+  async listLearnedScenarios(
     missionId: string,
-  ): { scenarioId: string; lessonId: string; suiteVersion: number; path: string }[] {
+  ): Promise<{ scenarioId: string; lessonId: string; suiteVersion: number; path: string }[]> {
     const rows = this.db
       .prepare("SELECT * FROM learned_scenario WHERE mission_id = ? ORDER BY suite_version")
       .all(missionId) as Row[];
@@ -916,15 +1083,15 @@ export class Ledger {
 
   // ---- checkpoints / segments / outbox -----------------------------------
 
-  writeCheckpoint(
+  async writeCheckpoint(
     c: Omit<CheckpointRow, "checkpointId" | "seq" | "createdAt" | "lastEventSeq">,
-  ): CheckpointRow {
+  ): Promise<CheckpointRow> {
     const seqRow = this.db
       .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM checkpoint")
       .get() as { seq: number };
     const seq = Number(seqRow.seq);
     const checkpointId = `ckpt-${c.missionId}-${String(seq).padStart(6, "0")}`;
-    const lastEventSeq = this.lastEventSeq();
+    const lastEventSeq = this.lastEventSeqSync();
     const createdAt = now();
     this.db
       .prepare(
@@ -947,7 +1114,7 @@ export class Ledger {
     return { ...c, checkpointId, seq, lastEventSeq, createdAt };
   }
 
-  latestCheckpoint(missionId: string): CheckpointRow | undefined {
+  async latestCheckpoint(missionId: string): Promise<CheckpointRow | undefined> {
     const r = this.db
       .prepare("SELECT * FROM checkpoint WHERE mission_id = ? ORDER BY seq DESC LIMIT 1")
       .get(missionId) as Row | undefined;
@@ -967,7 +1134,7 @@ export class Ledger {
     };
   }
 
-  countCheckpoints(missionId: string): number {
+  async countCheckpoints(missionId: string): Promise<number> {
     return Number(
       (
         this.db
@@ -977,20 +1144,20 @@ export class Ledger {
     );
   }
 
-  openSegment(
+  async openSegment(
     missionId: string,
     ordinal: number,
     sessionPath: string | null,
     sessionId: string | null,
-  ): void {
+  ): Promise<void> {
     this.db
       .prepare(
         "INSERT OR REPLACE INTO segment (mission_id, ordinal, session_path, session_id, checkpoint_id, started_at, first_event_seq, committed) VALUES (?, ?, ?, ?, NULL, ?, ?, 0)",
       )
-      .run(missionId, ordinal, sessionPath, sessionId, now(), this.lastEventSeq());
+      .run(missionId, ordinal, sessionPath, sessionId, now(), this.lastEventSeqSync());
   }
 
-  commitSegment(missionId: string, ordinal: number, checkpointId: string): void {
+  async commitSegment(missionId: string, ordinal: number, checkpointId: string): Promise<void> {
     this.db
       .prepare(
         "UPDATE segment SET committed = 1, checkpoint_id = ? WHERE mission_id = ? AND ordinal = ?",
@@ -998,15 +1165,19 @@ export class Ledger {
       .run(checkpointId, missionId, ordinal);
   }
 
-  closeSegment(missionId: string, ordinal: number, archiveHash: string | null): void {
+  async closeSegment(
+    missionId: string,
+    ordinal: number,
+    archiveHash: string | null,
+  ): Promise<void> {
     this.db
       .prepare(
         "UPDATE segment SET closed_at = ?, last_event_seq = ?, archive_hash = ? WHERE mission_id = ? AND ordinal = ?",
       )
-      .run(now(), this.lastEventSeq(), archiveHash, missionId, ordinal);
+      .run(now(), this.lastEventSeqSync(), archiveHash, missionId, ordinal);
   }
 
-  activeSegment(missionId: string): SegmentRow | undefined {
+  async activeSegment(missionId: string): Promise<SegmentRow | undefined> {
     const r = this.db
       .prepare(
         "SELECT * FROM segment WHERE mission_id = ? AND committed = 1 AND closed_at IS NULL ORDER BY ordinal DESC LIMIT 1",
@@ -1015,7 +1186,7 @@ export class Ledger {
     return r ? toSegment(r) : undefined;
   }
 
-  listSegments(missionId: string): SegmentRow[] {
+  async listSegments(missionId: string): Promise<SegmentRow[]> {
     return (
       this.db
         .prepare("SELECT * FROM segment WHERE mission_id = ? ORDER BY ordinal")
@@ -1023,14 +1194,14 @@ export class Ledger {
     ).map(toSegment);
   }
 
-  discardUncommittedSegments(missionId: string): number {
+  async discardUncommittedSegments(missionId: string): Promise<number> {
     return Number(
       this.db.prepare("DELETE FROM segment WHERE mission_id = ? AND committed = 0").run(missionId)
         .changes,
     );
   }
 
-  enqueueOutbox(episodeId: string, payload: unknown): string {
+  async enqueueOutbox(episodeId: string, payload: unknown): Promise<string> {
     const payloadHash = sha256(canonicalJson(payload));
     const idempotencyKey = `${episodeId}:${payloadHash.slice(0, 16)}`;
     this.db
@@ -1041,26 +1212,26 @@ export class Ledger {
     return idempotencyKey;
   }
 
-  outboxPayloadForEpisode(episodeId: string): unknown {
+  async outboxPayloadForEpisode(episodeId: string): Promise<unknown> {
     const r = this.db
       .prepare("SELECT payload FROM outbox WHERE episode_id = ? ORDER BY rowid DESC LIMIT 1")
       .get(episodeId) as { payload: string } | undefined;
     return r ? JSON.parse(r.payload) : undefined;
   }
 
-  outboxPayload(key: string): unknown {
+  async outboxPayload(key: string): Promise<unknown> {
     const r = this.db.prepare("SELECT payload FROM outbox WHERE idempotency_key = ?").get(key) as
       | { payload: string }
       | undefined;
     return r ? JSON.parse(r.payload) : undefined;
   }
 
-  updateOutbox(
+  async updateOutbox(
     key: string,
     patch: Partial<
       Pick<OutboxRow, "state" | "remoteDocumentId" | "retries" | "nextAttemptAt" | "lastError">
     >,
-  ): void {
+  ): Promise<void> {
     const sets = ["updated_at = ?"];
     const values: (string | number | null)[] = [now()];
     if (patch.state !== undefined) {
@@ -1089,7 +1260,7 @@ export class Ledger {
       .run(...values);
   }
 
-  listOutbox(states?: OutboxState[]): OutboxRow[] {
+  async listOutbox(states?: OutboxState[]): Promise<OutboxRow[]> {
     const rows = (
       states
         ? this.db
@@ -1112,6 +1283,9 @@ export class Ledger {
     }));
   }
 }
+
+/** Lock files held by ledgers in this process; the pid check alone cannot tell them apart. */
+const HELD_LOCKS = new Set<string>();
 
 function isAlive(pid: number): boolean {
   try {
