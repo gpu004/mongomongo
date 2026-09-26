@@ -44,7 +44,7 @@ node scripts/supermemory-probe.ts --episodes 12            # hosted memory: inde
 Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artifacts/<hash>/`
 (immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`.
 
-To exercise the live Pi worker with the low-cost `google/gemini-2.5-flash-lite` model,
+To exercise the live Pi worker with the low-cost `google/gemini-3.1-flash-lite` model,
 provide `GOOGLE_API_KEY` in the environment and use the bounded mission example:
 
 ```sh
