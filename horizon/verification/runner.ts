@@ -71,16 +71,38 @@ export function computeEvaluatorHash(root = VERIFICATION_DIR): string {
   return sha256(parts.join("\n---\n"));
 }
 
+/** The runtime facts the environment hash is computed from. */
+export interface EnvironmentFingerprint {
+  node: string;
+  platform: string;
+  arch: string;
+  isolation: IsolationMode;
+  containerImage: string | null;
+}
+
+export type HostRuntime = Pick<EnvironmentFingerprint, "node" | "platform" | "arch">;
+
+/** Host runtime facts for this process; `host` lets tests and resume compare against another runtime. */
+export function environmentFingerprint(
+  isolation: IsolationMode,
+  containerImage: string,
+  host: HostRuntime = { node: process.version, platform: process.platform, arch: process.arch },
+): EnvironmentFingerprint {
+  return {
+    node: host.node,
+    platform: host.platform,
+    arch: host.arch,
+    isolation,
+    containerImage: isolation === "container" ? containerImage : null,
+  };
+}
+
+export function hashEnvironment(fingerprint: EnvironmentFingerprint): string {
+  return sha256(canonicalJson(fingerprint));
+}
+
 export function computeEnvironmentHash(isolation: IsolationMode, containerImage: string): string {
-  return sha256(
-    canonicalJson({
-      node: process.version,
-      platform: process.platform,
-      arch: process.arch,
-      isolation,
-      containerImage: isolation === "container" ? containerImage : null,
-    }),
-  );
+  return hashEnvironment(environmentFingerprint(isolation, containerImage));
 }
 
 /** Content hash of a snapshot directory: sorted relative paths and file bytes. */

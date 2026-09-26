@@ -10,7 +10,14 @@ import {
   type VerificationReport,
 } from "../verification/reports.ts";
 import type { ContainerRegistry } from "../verification/candidate-process.ts";
-import { computeEnvironmentHash, computeEvaluatorHash, runSuite } from "../verification/runner.ts";
+import {
+  computeEvaluatorHash,
+  type EnvironmentFingerprint,
+  environmentFingerprint,
+  hashEnvironment,
+  type HostRuntime,
+  runSuite,
+} from "../verification/runner.ts";
 import { loadScenarios, type Scenario } from "../verification/scenarios/index.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import { auditClaim } from "./claim-audit.ts";
@@ -38,7 +45,12 @@ import {
   SupermemoryAdapter,
 } from "./memory-adapter.ts";
 import { composeRetrievalQuery, MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
-import { contractHash, type MissionConfig } from "./mission-contract.ts";
+import {
+  type Amendment,
+  contractHash,
+  type MissionConfig,
+  planAmendment,
+} from "./mission-contract.ts";
 import {
   ensureMissionDirs,
   FileEvidenceStore,
@@ -79,6 +91,31 @@ export interface ControllerOptions {
   leaseTtlMs?: number;
   /** Lease owner identity recorded in the ledger (default: host, pid and a random suffix). */
   leaseOwner?: string;
+  /** Test hook: runtime facts hashed into the environment identity (default: this process). */
+  host?: HostRuntime;
+}
+
+/** `runs/<mission>/manifest.json`: the persisted config plus the identities frozen in the ledger. */
+export interface MissionManifest {
+  missionId: string;
+  contractHash: string;
+  evaluatorHash: string;
+  environmentHash: string;
+  /** Runtime facts behind `environmentHash`, so resume can tell a Node patch from a platform change. */
+  environment: EnvironmentFingerprint;
+  seedArtifactHash: string;
+  ledgerBackend: string;
+  config: MissionConfig;
+}
+
+export interface RebaselineOutcome {
+  evaluatorHash: { from: string; to: string };
+  environmentHash: { from: string; to: string };
+  baselineP95Ms: number | null;
+  /** Best artifact before the rebaseline and whether it kept its place under the new evaluator. */
+  previousBest: string | null;
+  bestArtifactHash: string;
+  bestRetained: boolean;
 }
 
 export const DEFAULT_LEASE_TTL_MS = 30_000;
@@ -147,7 +184,7 @@ const TASKS = [
  * next side effect, so a crash at any point resumes from durable state.
  */
 export class MissionController {
-  readonly config: MissionConfig;
+  private currentConfig: MissionConfig;
   readonly paths: MissionPaths;
   readonly artifacts: ArtifactStore;
   readonly evidence: FileEvidenceStore;
@@ -170,6 +207,7 @@ export class MissionController {
   /** Tool-call audit events are appended in order without blocking the broker; flushed before every transaction. */
   private toolEvents: Promise<void> = Promise.resolve();
   readonly evaluatorHash: string;
+  readonly environment: EnvironmentFingerprint;
   readonly environmentHash: string;
   readonly contractHash: string;
   private segmentOrdinal = 0;
@@ -179,7 +217,7 @@ export class MissionController {
   private wallMark = Date.now();
 
   constructor(config: MissionConfig, paths: MissionPaths, options: ControllerOptions = {}) {
-    this.config = config;
+    this.currentConfig = config;
     this.paths = paths;
     ensureMissionDirs(paths);
     this.openLedger = options.ledger ?? (() => openLedger(config, paths));
@@ -194,7 +232,12 @@ export class MissionController {
     this.containerRuntime = options.containerRuntime;
     this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.evaluatorHash = computeEvaluatorHash();
-    this.environmentHash = computeEnvironmentHash(config.isolation, config.containerImage);
+    this.environment = environmentFingerprint(
+      config.isolation,
+      config.containerImage,
+      options.host,
+    );
+    this.environmentHash = hashEnvironment(this.environment);
     this.contractHash = contractHash(config);
     this.memory =
       options.memory ??
@@ -202,6 +245,11 @@ export class MissionController {
         ? new SupermemoryAdapter(process.env.SUPERMEMORY_API_KEY)
         : new LocalMemoryAdapter());
     this.worker = options.worker ?? new ScriptedWorker();
+  }
+
+  /** Frozen objective plus the operating parameters as last amended. */
+  get config(): MissionConfig {
+    return this.currentConfig;
   }
 
   /** The mission ledger; opened on first use by `initialize()`, `run()` or `mission()`. */
@@ -304,17 +352,263 @@ export class MissionController {
         },
       );
     });
-    writeJsonAtomic(this.paths.manifest, {
+    this.writeManifest({
       missionId: this.config.missionId,
       contractHash: this.contractHash,
       evaluatorHash: this.evaluatorHash,
       environmentHash: this.environmentHash,
+      environment: this.environment,
       seedArtifactHash: seed.hash,
       ledgerBackend: ledger.backend,
       config: { ...this.config, ledger: { backend: ledger.backend } },
     });
     this.artifacts.restoreWorkspace(seed.hash, this.paths.candidate);
     return this.mission();
+  }
+
+  /** The persisted manifest, or undefined before `initialize()`. */
+  readManifest(): MissionManifest | undefined {
+    if (!existsSync(this.paths.manifest)) return undefined;
+    return JSON.parse(readFileSync(this.paths.manifest, "utf8")) as MissionManifest;
+  }
+
+  private writeManifest(manifest: MissionManifest): void {
+    writeJsonAtomic(this.paths.manifest, manifest);
+  }
+
+  /** Rewrites the manifest so it mirrors the ledger's identities and the current config. */
+  private syncManifest(mission: MissionRow): void {
+    const previous = this.readManifest();
+    this.writeManifest({
+      missionId: mission.missionId,
+      contractHash: mission.contractHash,
+      evaluatorHash: mission.evaluatorHash,
+      environmentHash: mission.environmentHash,
+      environment:
+        mission.environmentHash === this.environmentHash
+          ? this.environment
+          : (previous?.environment ?? this.environment),
+      seedArtifactHash: mission.seedArtifactHash ?? previous?.seedArtifactHash ?? "",
+      ledgerBackend: this.ledger.backend,
+      config: { ...this.config, ledger: { backend: this.ledger.backend } },
+    });
+  }
+
+  /**
+   * `horizon amend`: replaces the operating parameters (budgets, model, worker,
+   * rotation, stagnation, memory) of a frozen mission. The objective must hash
+   * identically and the ledger backend stays pinned. Every leaf change is
+   * audited as `mission.amended`; each raised budget limit also as
+   * `budget.extended`, and a mission stopped on `budget_exhausted` becomes
+   * resumable again. Takes the mission lease, so a live run is never amended
+   * underneath.
+   */
+  async amend(next: MissionConfig): Promise<Amendment> {
+    if (next.missionId !== this.config.missionId)
+      throw new Error(
+        `amendment is for mission ${next.missionId}, not ${this.config.missionId}; start a new mission instead`,
+      );
+    const amendment = planAmendment(this.config, next);
+    await this.open();
+    const mission = await this.mission();
+    if (mission.contractHash !== this.contractHash)
+      throw new Error(
+        `contract hash drift: ledger ${mission.contractHash.slice(0, 12)} vs manifest ${this.contractHash.slice(0, 12)}`,
+      );
+    if (amendment.changes.length === 0) {
+      this.log("amend: no operating parameter differs; nothing recorded");
+      return amendment;
+    }
+    await this.claimLease();
+    try {
+      const amendedAt = new Date().toISOString();
+      const amendmentId = sha256(canonicalJson({ changes: amendment.changes, amendedAt })).slice(
+        0,
+        16,
+      );
+      const reopened =
+        mission.status === "budget_exhausted" && amendment.budgetExtensions.length > 0;
+      await this.transaction(async (tx) => {
+        await tx.appendEvent(
+          `mission:${this.config.missionId}:amended:${amendmentId}`,
+          "mission.amended",
+          this.config.missionId,
+          {
+            amendmentId,
+            contractHash: this.contractHash,
+            changes: amendment.changes,
+            previousStatus: mission.status,
+            status: reopened ? "ready" : mission.status,
+          },
+        );
+        for (const extension of amendment.budgetExtensions)
+          await tx.appendEvent(
+            `mission:${this.config.missionId}:budget-extended:${amendmentId}:${extension.path}`,
+            "budget.extended",
+            this.config.missionId,
+            { amendmentId, ...extension },
+          );
+        if (reopened)
+          await tx.updateMission(this.config.missionId, { status: "ready", nextWakeAt: null });
+      });
+      this.currentConfig = { ...next, ledger: { backend: this.ledger.backend } };
+      this.syncManifest(await this.mission());
+      for (const change of amendment.changes)
+        this.log(
+          `amend: ${change.path} ${JSON.stringify(change.from)} -> ${JSON.stringify(change.to)}`,
+        );
+      if (reopened) this.log("amend: budget extended; mission is ready to resume");
+      return amendment;
+    } finally {
+      await this.releaseLease();
+    }
+  }
+
+  /**
+   * `horizon rebaseline`: adopts the current evaluator and runtime as the
+   * mission's frozen identities after they drifted. Verdicts measured under the
+   * old evaluator are kept as history but no longer define the baseline or the
+   * best: the seed is re-measured, then the previous best must beat the new
+   * baseline again under the new evaluator or the seed becomes the best. The
+   * holdout is re-run on the next resume. Recorded as `evaluator.rebaselined`.
+   */
+  async rebaseline(): Promise<RebaselineOutcome> {
+    await this.open();
+    await this.claimLease();
+    try {
+      const before = await this.mission();
+      if (before.contractHash !== this.contractHash)
+        throw new Error(
+          `contract hash drift: ledger ${before.contractHash.slice(0, 12)} vs manifest ${this.contractHash.slice(0, 12)}; the frozen objective cannot be rebaselined`,
+        );
+      const drifted =
+        before.evaluatorHash !== this.evaluatorHash ||
+        before.environmentHash !== this.environmentHash;
+      const outcome: RebaselineOutcome = {
+        evaluatorHash: { from: before.evaluatorHash, to: this.evaluatorHash },
+        environmentHash: { from: before.environmentHash, to: this.environmentHash },
+        baselineP95Ms: before.baselineP95Ms,
+        previousBest: before.bestArtifactHash,
+        bestArtifactHash: before.bestArtifactHash ?? before.seedArtifactHash ?? "",
+        bestRetained: true,
+      };
+      if (!drifted) {
+        this.log("rebaseline: evaluator and environment match the frozen mission; nothing to do");
+        return outcome;
+      }
+      if (this.config.isolation === "container") assertSandboxAvailable(this.config.containerImage);
+      const seed = before.seedArtifactHash;
+      if (!seed) throw new Error("mission has no seed artifact");
+      const rebaselineId = `${this.evaluatorHash.slice(0, 12)}-${this.environmentHash.slice(0, 12)}`;
+      await this.transaction(async (tx) => {
+        await tx.updateMission(this.config.missionId, {
+          evaluatorHash: this.evaluatorHash,
+          environmentHash: this.environmentHash,
+          status: "ready",
+          baselineP95Ms: null,
+          frozenAcceptanceMargin: null,
+          bestP95Ms: null,
+          activeTaskId: null,
+          nextWakeAt: null,
+        });
+        await tx.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "pending" });
+        await tx.upsertTask({ ...TASKS[2]!, missionId: this.config.missionId, status: "pending" });
+        await tx.appendEvent(
+          `mission:${this.config.missionId}:rebaselined:${rebaselineId}`,
+          "evaluator.rebaselined",
+          this.config.missionId,
+          {
+            evaluatorHash: outcome.evaluatorHash,
+            environmentHash: outcome.environmentHash,
+            environment: this.environment,
+            previousBaselineP95Ms: before.baselineP95Ms,
+            previousBestArtifactHash: before.bestArtifactHash,
+            previousBestP95Ms: before.bestP95Ms,
+            previousStatus: before.status,
+          },
+        );
+        await this.checkpoint(tx, "ready", "baseline", null, `rebaselined:${rebaselineId}`);
+      });
+      this.syncManifest(await this.mission());
+      this.log(
+        `rebaseline: evaluator ${before.evaluatorHash.slice(0, 12)} -> ${this.evaluatorHash.slice(0, 12)}, env ${before.environmentHash.slice(0, 12)} -> ${this.environmentHash.slice(0, 12)}`,
+      );
+
+      await this.runBaseline();
+      const measured = await this.mission();
+      outcome.baselineP95Ms = measured.baselineP95Ms;
+      outcome.bestArtifactHash = seed;
+      outcome.bestRetained = before.bestArtifactHash === null || before.bestArtifactHash === seed;
+      const previousBest = before.bestArtifactHash;
+      if (previousBest && previousBest !== seed) {
+        const experimentId = `exp-rebaseline-${this.config.missionId}-${previousBest.slice(0, 12)}-${rebaselineId}`;
+        if (!(await this.ledger.getExperiment(experimentId))) {
+          await this.ledger.insertExperiment({
+            experimentId,
+            missionId: this.config.missionId,
+            taskId: "optimize-search",
+            parentArtifactHash: seed,
+            strategy: "rebaseline",
+            hypothesis: "previous best still beats the seed under the new evaluator",
+            status: "snapshot_ready",
+            attempt: 1,
+            segmentOrdinal: this.segmentOrdinal,
+          });
+          await this.ledger.updateExperiment(experimentId, { candidateArtifactHash: previousBest });
+        }
+        await this.ledger.updateExperiment(experimentId, { status: "evaluating" });
+        const reports = await this.runSuites(experimentId, previousBest, [
+          "smoke",
+          "correctness",
+          "learned",
+          "performance",
+        ]);
+        const perf = reports.find((r) => r.suite === "performance");
+        const baselineReport = await this.bestPerformanceReport(measured);
+        const decision =
+          perf && reports.every((r) => r.status === "passed")
+            ? firstComparison(
+                perf.metrics,
+                measured.bestP95Ms,
+                baselineReport?.metrics.repetitionP95Ms,
+                this.timingPolicy(measured),
+              )
+            : { kind: "reject" as const, reason: "previous best failed the fixed suites" };
+        const retained = decision.kind === "accept";
+        await this.transaction(async (tx) => {
+          await tx.updateExperiment(experimentId, {
+            status: retained ? "accepted" : "rejected",
+            verdict: `rebaseline: ${decision.reason}`,
+            finishedAt: new Date().toISOString(),
+          });
+          if (retained)
+            await tx.updateMission(this.config.missionId, {
+              bestArtifactHash: previousBest,
+              bestP95Ms: perf?.metrics.p95LatencyMs ?? null,
+            });
+          await tx.appendEvent(
+            `${experimentId}:remeasured`,
+            "rebaseline.best_remeasured",
+            experimentId,
+            {
+              artifactHash: previousBest,
+              retained,
+              p95: perf?.metrics.p95LatencyMs ?? null,
+              baselineP95Ms: measured.baselineP95Ms,
+              reason: decision.reason,
+            },
+          );
+        });
+        outcome.bestRetained = retained;
+        outcome.bestArtifactHash = retained ? previousBest : seed;
+        this.log(
+          `rebaseline: previous best ${previousBest.slice(0, 12)} ${retained ? "retained" : "demoted to the seed"} (${decision.reason})`,
+        );
+      }
+      return outcome;
+    } finally {
+      await this.releaseLease();
+    }
   }
 
   /** Ledger-backed registry: container names are durable before `docker run` and closed after stop. */
@@ -429,12 +723,15 @@ export class MissionController {
         this.paths.reports,
         {
           evaluatorHash: this.evaluatorHash,
-          environmentHash: this.environmentHash,
           contractHash: this.contractHash,
+          environment: this.environment,
+          frozenEnvironment: this.readManifest()?.environment,
         },
         this.containerRuntime,
       );
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
+      if (recovery.actions.some((a) => a.kind === "environment_drift_accepted"))
+        this.syncManifest(await this.mission());
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
       await this.honourWakeTime();
       await this.ledger.updateMission(this.config.missionId, {
