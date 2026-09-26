@@ -57,7 +57,7 @@ Code: everything under `horizon/` (see PR https://github.com/gpu004/mongomongo/p
 
 ```
 npm run check                      # tsc --noEmit: clean
-npm test                           # 47 tests, 47 pass (test helpers force the local memory adapter so a key in env never routes tests to the hosted service)
+npm test                           # node --test over test/*.test.ts, all pass (test helpers force the local memory adapter so a key in env never routes tests to the hosted service)
 node scripts/smoke-runner.ts       # seed pass/pass/pass; stale-cache smoke pass, correctness fail, perf fail; bypass structural fail
 node src/cli.ts mission create --config mission.example.json && node src/cli.ts run --mission search-p95-demo   # succeeded
 (Docker) mission search-p95-docker status=succeeded, observed container
