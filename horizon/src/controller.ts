@@ -50,7 +50,7 @@ import {
   rerunComparison,
   type TimingDecision,
 } from "./timing-policy.ts";
-import type { Worker, WorkerCycleResult } from "./worker.ts";
+import { type Worker, type WorkerCycleResult, WorkerUnavailableError } from "./worker.ts";
 
 export const RESOURCES_DIR = new URL("../resources/", import.meta.url).pathname;
 
@@ -62,6 +62,8 @@ export interface ControllerOptions {
   crashAt?: string;
   /** Stop after this many cycles regardless of budget (CLI --cycles). */
   maxCycles?: number;
+  /** Test hook: how `run()` waits for a persisted `nextWakeAt` (default: real sleep). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export type Verdict = "accepted" | "rejected" | "inconclusive";
@@ -123,6 +125,7 @@ export class MissionController {
   private readonly log: (line: string) => void;
   private readonly crashAt: string | undefined;
   private readonly maxCycles: number;
+  private readonly sleep: (ms: number) => Promise<void>;
   readonly evaluatorHash: string;
   readonly environmentHash: string;
   readonly contractHash: string;
@@ -142,6 +145,7 @@ export class MissionController {
     this.log = options.log ?? (() => {});
     this.crashAt = options.crashAt;
     this.maxCycles = options.maxCycles ?? Number.POSITIVE_INFINITY;
+    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.evaluatorHash = computeEvaluatorHash();
     this.environmentHash = computeEnvironmentHash(config.isolation, config.containerImage);
     this.contractHash = contractHash(config);
@@ -245,7 +249,8 @@ export class MissionController {
       );
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
-      this.ledger.updateMission(this.config.missionId, { status: "running" });
+      await this.honourWakeTime();
+      this.ledger.updateMission(this.config.missionId, { status: "running", nextWakeAt: null });
       await this.drainOutbox();
 
       let cycles = 0;
@@ -281,6 +286,7 @@ export class MissionController {
             this.finish("blocked", "worker has no further hypotheses");
             break;
           }
+          if (done === "blocked" || done === "waiting") break;
         }
       }
       await this.drainOutbox();
@@ -312,9 +318,67 @@ export class MissionController {
     );
   }
 
+  /** A `waiting` mission persisted its retry time; sleep it off (unbilled) before touching the worker again. */
+  private async honourWakeTime(): Promise<void> {
+    const mission = this.mission();
+    if (mission.status !== "waiting" || !mission.nextWakeAt) return;
+    const delay = Date.parse(mission.nextWakeAt) - Date.now();
+    if (delay <= 0) return;
+    this.log(`mission waiting until ${mission.nextWakeAt} (${Math.ceil(delay / 1000)}s)`);
+    await this.sleep(delay);
+    this.wallMark = Date.now();
+  }
+
+  /**
+   * The worker itself is unavailable (not the candidate). A missing credential
+   * blocks the mission; a rate limit parks it in `waiting` with `nextWakeAt` so
+   * `resume` can honour the retry time. Any experiment opened for this cycle is
+   * interrupted, exactly as after a crash.
+   */
+  private parkOnWorkerFault(
+    error: WorkerUnavailableError,
+    experimentId: string | null,
+  ): "blocked" | "waiting" {
+    if (experimentId)
+      this.ledger.transaction(() => {
+        this.ledger.updateExperiment(experimentId, {
+          status: "interrupted",
+          verdict: `worker unavailable: ${error.message}`,
+          finishedAt: new Date().toISOString(),
+        });
+        this.ledger.appendEvent(
+          `${experimentId}:interrupted:worker`,
+          "experiment.interrupted",
+          experimentId,
+          { previousStatus: "editing", reason: error.kind },
+        );
+      });
+    if (error.kind !== "rate_limited") {
+      this.finish("blocked", error.message);
+      return "blocked";
+    }
+    const nextWakeAt = new Date(Date.now() + (error.retryAfterMs ?? 0)).toISOString();
+    this.ledger.transaction(() => {
+      this.ledger.updateMission(this.config.missionId, {
+        status: "waiting",
+        activeTaskId: null,
+        nextWakeAt,
+      });
+      this.ledger.appendEvent(
+        `mission:${this.config.missionId}:waiting:${Date.now()}`,
+        "mission.waiting",
+        this.config.missionId,
+        { reason: error.message, nextWakeAt },
+      );
+      this.checkpoint("waiting", "optimize-search", null, "waiting:provider");
+    });
+    this.log(`mission waiting: ${error.message}; resume at or after ${nextWakeAt}`);
+    return "waiting";
+  }
+
   private finish(status: MissionStatus, detail = ""): void {
     this.ledger.transaction(() => {
-      this.ledger.updateMission(this.config.missionId, { status });
+      this.ledger.updateMission(this.config.missionId, { status, nextWakeAt: null });
       this.ledger.appendEvent(
         `mission:${this.config.missionId}:finish:${Date.now()}`,
         "mission.finished",
@@ -456,10 +520,15 @@ export class MissionController {
   private async runCycle(
     cycle: number,
     recovery: RecoveryOutcome,
-  ): Promise<"continue" | "exhausted"> {
+  ): Promise<"continue" | "exhausted" | "blocked" | "waiting"> {
     const mission = this.mission();
     const parent = mission.bestArtifactHash ?? mission.seedArtifactHash!;
-    await this.ensureSegment();
+    try {
+      await this.ensureSegment();
+    } catch (error) {
+      if (error instanceof WorkerUnavailableError) return this.parkOnWorkerFault(error, null);
+      throw error;
+    }
 
     const experimentId = `exp-${String(mission.spentExperiments + 1).padStart(4, "0")}-${randomUUID().slice(0, 8)}`;
     this.ledger.transaction(() => {
@@ -499,13 +568,21 @@ export class MissionController {
       () => this.cycleDeadline,
     );
     const recoveryNote = recovery.actions.find((a) => a.kind === "interrupted_edit")?.detail;
-    const result = await this.worker.runCycle({
-      cycle,
-      packet,
-      broker,
-      deadlineAt: this.cycleDeadline,
-      ...(cycle === 1 && recoveryNote ? { recoveryNote } : {}),
-    });
+    let result: WorkerCycleResult;
+    try {
+      result = await this.worker.runCycle({
+        cycle,
+        packet,
+        broker,
+        deadlineAt: this.cycleDeadline,
+        ...(cycle === 1 && recoveryNote ? { recoveryNote } : {}),
+      });
+    } catch (error) {
+      broker.terminateChildren();
+      if (error instanceof WorkerUnavailableError)
+        return this.parkOnWorkerFault(error, experimentId);
+      throw error;
+    }
     broker.terminateChildren();
     this.spendTokens(result.usage);
     const audit = auditClaim(result.claim, broker.verifications);
