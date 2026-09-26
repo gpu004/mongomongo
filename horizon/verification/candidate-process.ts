@@ -1,14 +1,24 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import {
+  assertSandboxAvailable,
+  containerAddress,
+  dockerRunArgs,
+  ensureMissionNetwork,
+  killContainer,
+} from "../src/sandbox.ts";
 
 export type IsolationMode = "container" | "subprocess";
 
 export interface LaunchOptions {
   snapshotDir: string;
   isolation: IsolationMode;
-  /** Pinned image used in container mode. */
+  /** Digest-pinned image used in container mode. */
   containerImage: string;
+  /** Labels the container so orphans can be reclaimed by mission/operation on resume. */
+  missionId: string;
+  operationId: string;
   startupTimeoutMs: number;
   memoryLimitBytes: number;
 }
@@ -26,8 +36,10 @@ export interface RunningCandidate {
 }
 
 /**
- * The only place that launches candidate code. Container mode mounts the
- * immutable snapshot read-only and exposes one port on loopback; the runner
+ * The only place that launches candidate code. Container mode runs the sandbox
+ * backend (`src/sandbox.ts`): non-root, read-only snapshot mount, no capabilities,
+ * and the mission's private internal network, which the verifier reaches by
+ * container address and which has no route to the public network. The runner
  * never shares its reports, fixtures, or credentials with the candidate.
  * Subprocess mode is a cooperative fallback that cannot establish evaluator
  * tamper resistance; reports record which mode produced them.
@@ -64,51 +76,30 @@ function launchSubprocess(options: LaunchOptions, entry: string): Promise<Runnin
 }
 
 function launchInContainer(options: LaunchOptions): Promise<RunningCandidate> {
+  assertSandboxAvailable(options.containerImage);
   const name = `horizon-cand-${randomUUID().slice(0, 12)}`;
-  const args = [
-    "run",
-    "--rm",
-    "--name",
+  const network = ensureMissionNetwork(options.missionId);
+  const args = dockerRunArgs({
+    missionId: options.missionId,
+    operationId: options.operationId,
+    role: "candidate",
     name,
-    "--read-only",
-    "--tmpfs",
-    "/tmp",
-    "--memory",
-    String(options.memoryLimitBytes),
-    "--cpus",
-    "1",
-    "--pids-limit",
-    "128",
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges",
-    "-v",
-    `${options.snapshotDir}:/candidate:ro`,
-    "-w",
-    "/candidate",
-    "-e",
-    "HOST=0.0.0.0",
-    "-e",
-    "PORT=8080",
-    "-p",
-    "127.0.0.1::8080",
-    options.containerImage,
-    "node",
-    "src/http/server.ts",
-  ];
-  const child = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
+    image: options.containerImage,
+    hostDir: options.snapshotDir,
+    mountPath: "/candidate",
+    memoryLimitBytes: options.memoryLimitBytes,
+    network: { internal: network },
+    env: { HOST: "0.0.0.0", PORT: "8080", NODE_ENV: "candidate" },
+    command: ["node", "src/http/server.ts"],
+  });
+  const child = spawn("docker", args, {
+    env: { PATH: process.env.PATH ?? "" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   return waitForListening(
     child,
     options.startupTimeoutMs,
-    () => {
-      const mapped =
-        execFileSync("docker", ["port", name, "8080/tcp"], { encoding: "utf8" })
-          .trim()
-          .split("\n")[0] ?? "";
-      const port = mapped.split(":").pop();
-      return `http://127.0.0.1:${port}`;
-    },
+    (port) => `http://${containerAddress(name, network)}:${port}`,
     name,
   );
 }
@@ -148,13 +139,7 @@ function waitForListening(
         }
         child.once("exit", (code, signal) => done({ exitCode: code, signal }));
       });
-      if (containerName) {
-        try {
-          execFileSync("docker", ["kill", containerName], { stdio: "ignore" });
-        } catch {
-          /* already gone */
-        }
-      }
+      if (containerName) killContainer(containerName);
       child.kill("SIGTERM");
       const killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
       const result = await exit;

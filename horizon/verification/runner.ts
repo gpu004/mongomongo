@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { SandboxUnavailableError } from "../src/sandbox.ts";
 import {
   CandidateStartupError,
   launchCandidate,
@@ -197,6 +198,8 @@ export async function runSuite(config: RunnerConfig, suite: Suite): Promise<Veri
       snapshotDir: config.snapshotDir,
       isolation: config.isolation,
       containerImage: config.containerImage,
+      missionId: config.missionId,
+      operationId: config.experimentId,
       startupTimeoutMs: config.startupTimeoutMs,
       memoryLimitBytes: config.memoryLimitBytes,
     });
@@ -204,6 +207,9 @@ export async function runSuite(config: RunnerConfig, suite: Suite): Promise<Veri
     const message = error instanceof Error ? error.message : String(error);
     const evidenceId = config.evidence.write("startup-failure", { message });
     evidenceIds.push(evidenceId);
+    // A missing sandbox backend is the harness's problem, not the candidate's.
+    if (error instanceof SandboxUnavailableError)
+      return finish("infra_error", [structuralAssertion], {}, workloadHash, message);
     const status =
       error instanceof CandidateStartupError && message.includes("did not report listening")
         ? "timeout"
@@ -274,6 +280,8 @@ async function relaunch(
     snapshotDir: config.snapshotDir,
     isolation: config.isolation,
     containerImage: config.containerImage,
+    missionId: config.missionId,
+    operationId: config.experimentId,
     startupTimeoutMs: config.startupTimeoutMs,
     memoryLimitBytes: config.memoryLimitBytes,
   });

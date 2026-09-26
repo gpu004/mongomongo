@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -14,6 +15,20 @@ import type { Operation } from "../verification/reference-model.ts";
 import type { Suite, VerificationReport } from "../verification/reports.ts";
 import type { ObservedVerification } from "./claim-audit.ts";
 import type { FileEvidenceStore } from "./mission-paths.ts";
+import { dockerRunArgs, killContainer } from "./sandbox.ts";
+
+/**
+ * When set, worker commands run inside a throwaway sandbox container (workspace mounted
+ * read-only, no network, unprivileged user) instead of on the host.
+ */
+export interface ExecSandbox {
+  image: string;
+  missionId: string;
+  operationId: string;
+}
+
+const WORKER_EXEC_MEMORY_BYTES = 256 * 1024 * 1024;
+const WORKER_EXEC_MOUNT = "/workspace";
 
 export interface RecallResult {
   episodeId: string;
@@ -65,7 +80,9 @@ export class ToolBroker {
   readonly evidence: FileEvidenceStore;
   readonly hooks: BrokerHooks;
   private readonly deadline: () => number;
-  private readonly children = new Set<ReturnType<typeof spawn>>();
+  private readonly sandbox: ExecSandbox | undefined;
+  /** Live children with the sandbox container name they run in (undefined on the host). */
+  private readonly children = new Map<ReturnType<typeof spawn>, string | undefined>();
   /** Every verifier result the worker saw this cycle, in order; used to audit its claim. */
   readonly verifications: ObservedVerification[] = [];
   private realWorkspaceRoot: string | undefined;
@@ -75,11 +92,18 @@ export class ToolBroker {
     evidence: FileEvidenceStore,
     hooks: BrokerHooks,
     deadline: () => number,
+    sandbox?: ExecSandbox,
   ) {
     this.workspaceDir = resolve(workspaceDir);
     this.evidence = evidence;
     this.hooks = hooks;
     this.deadline = deadline;
+    this.sandbox = sandbox;
+  }
+
+  /** True when worker commands are routed through the sandbox backend rather than spawned on the host. */
+  get sandboxed(): boolean {
+    return this.sandbox !== undefined;
   }
 
   /** Real path of the workspace root, resolved once (the root itself may sit under a symlinked TMPDIR). */
@@ -210,7 +234,11 @@ export class ToolBroker {
     return { path, bytes: Buffer.byteLength(next) };
   }
 
-  /** Bounded read-only command in the candidate workspace. Small allowlist; no shell; no interpreters. */
+  /**
+   * Bounded read-only command in the candidate workspace. Small allowlist; no shell; no
+   * interpreters. With an `ExecSandbox` the command never touches the host: it runs as an
+   * unprivileged user in a container with no network and the workspace mounted read-only.
+   */
   workspaceExec(command: string, args: string[], timeoutMs: number): Promise<ExecResult> {
     this.checkDeadline();
     if (!ALLOWED_EXEC.has(command))
@@ -226,13 +254,40 @@ export class ToolBroker {
       return Promise.reject(err);
     }
     const remaining = Math.max(1000, Math.min(timeoutMs, this.deadline() - Date.now()));
+    let launch: { file: string; args: string[]; cwd: string | undefined; container?: string };
+    if (this.sandbox) {
+      const container = `horizon-exec-${randomUUID().slice(0, 12)}`;
+      try {
+        launch = {
+          file: "docker",
+          args: dockerRunArgs({
+            missionId: this.sandbox.missionId,
+            operationId: this.sandbox.operationId,
+            role: "worker-exec",
+            name: container,
+            image: this.sandbox.image,
+            hostDir: this.realRoot(),
+            mountPath: WORKER_EXEC_MOUNT,
+            memoryLimitBytes: WORKER_EXEC_MEMORY_BYTES,
+            network: "none",
+            command: [command, ...args],
+          }),
+          cwd: undefined,
+          container,
+        };
+      } catch (err) {
+        return Promise.reject(err);
+      }
+    } else {
+      launch = { file: command, args, cwd: this.workspaceDir };
+    }
     return new Promise((resolvePromise) => {
-      const child = spawn(command, args, {
-        cwd: this.workspaceDir,
+      const child = spawn(launch.file, launch.args, {
+        ...(launch.cwd !== undefined ? { cwd: launch.cwd } : {}),
         env: { PATH: process.env.PATH ?? "" },
         stdio: ["ignore", "pipe", "pipe"],
       });
-      this.children.add(child);
+      this.children.set(child, launch.container);
       let stdout = "";
       let stderr = "";
       let timedOut = false;
@@ -240,6 +295,7 @@ export class ToolBroker {
       child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
       const timer = setTimeout(() => {
         timedOut = true;
+        if (launch.container) killContainer(launch.container);
         child.kill("SIGKILL");
       }, remaining);
       child.on("close", (exitCode) => {
@@ -248,6 +304,7 @@ export class ToolBroker {
         const evidenceId = this.evidence.write("exec", {
           command,
           args,
+          sandbox: launch.container ? { container: launch.container, network: "none" } : null,
           exitCode,
           stdout,
           stderr,
@@ -336,7 +393,10 @@ export class ToolBroker {
 
   /** Deadline or abort: kill anything the worker started. */
   terminateChildren(): void {
-    for (const child of this.children) child.kill("SIGKILL");
+    for (const [child, container] of this.children) {
+      if (container) killContainer(container);
+      child.kill("SIGKILL");
+    }
     this.children.clear();
   }
 }

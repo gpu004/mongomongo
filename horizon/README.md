@@ -8,7 +8,10 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ## Requirements
 
 - Node >= 24 (uses `node:sqlite` and type-stripped `.ts` execution)
-- Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra
+- Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra.
+  Container mode requires `containerImage` pinned by digest (`repo@sha256:...`) and present
+  locally (`docker pull node@sha256:...`); the sandbox never pulls at run time and fails
+  explicitly instead of falling back to the host.
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
 - An LLM API key for the Pi worker (`"worker": "pi"`); the `scripted` worker needs none
 
@@ -17,7 +20,9 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ```sh
 npm install
 npm run check          # tsc --noEmit
-npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget
+npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, sandbox
+                       # test/sandbox-escape.test.ts runs the adversarial escape-probe fixture against Docker when the
+                       # pinned image is present (skipped otherwise; HORIZON_REQUIRE_DOCKER=1 makes the skip a failure)
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
 
