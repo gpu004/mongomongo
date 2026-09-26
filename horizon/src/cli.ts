@@ -28,11 +28,11 @@ import { PiWorker } from "./pi-worker.ts";
 import { exportMission, renderProgress, summarize } from "./progress.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
 import { renderSkillEval, runSkillEval } from "./skill-eval.ts";
-import type { Worker } from "./worker.ts";
+import { providerApiKeyEnv, type Worker } from "./worker.ts";
 
 const USAGE = `horizon <command> [options]
 
-  doctor [--config mission.json]           check node, sqlite, docker, seed, evaluator hash,
+  doctor [--config mission.json]           check node, sqlite, docker, seed, evaluator hash, provider API key,
                                            sandbox and (when configured) the MongoDB ledger
   mission create --config mission.json     freeze identities and import the seed
   run --mission M [--cycles N]             run (or resume) the mission loop
@@ -86,8 +86,7 @@ function loadMission(): { config: MissionConfig; paths: ReturnType<typeof missio
 
 function makeWorker(config: MissionConfig, paths: ReturnType<typeof missionPaths>): Worker {
   if (config.worker === "scripted") return new ScriptedWorker();
-  const envKey = `${config.model.provider.toUpperCase().replace(/-/g, "_")}_API_KEY`;
-  const apiKey = process.env[envKey];
+  const apiKey = process.env[providerApiKeyEnv(config.model.provider)];
   return new PiWorker({
     workspaceDir: paths.candidate,
     agentDir: join(paths.root, "pi-agent"),
@@ -150,6 +149,16 @@ async function main(): Promise<number> {
         process.env.SUPERMEMORY_API_KEY
           ? "api key present"
           : "no SUPERMEMORY_API_KEY (local memory adapter)",
+      ]);
+      const doctorConfig = loadMissionConfig(
+        values.config ? resolve(values.config) : join(RESOURCES_DIR, "../mission.example.json"),
+      );
+      const providerEnv = providerApiKeyEnv(doctorConfig.model.provider);
+      checks.push([
+        `provider(${doctorConfig.model.provider})`,
+        process.env[providerEnv]
+          ? `${providerEnv} present`
+          : `no ${providerEnv} (required for "worker": "pi"; the scripted worker needs none)`,
       ]);
       checks.push(["runsRoot", runsRoot]);
       let ok = true;

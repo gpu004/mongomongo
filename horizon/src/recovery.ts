@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { validateReport, type VerificationReport } from "../verification/reports.ts";
@@ -17,10 +18,28 @@ export interface RecoveryAction {
     | "drain_outbox"
     | "discarded_uncommitted_segment"
     | "cleanup_sandboxes"
-    | "reconcile_operation";
+    | "reconcile_operation"
+    | "removed_orphaned_container";
   experimentId?: string;
   detail: string;
 }
+
+/** Minimal container runtime surface used by resume to remove orphans; injectable for tests. */
+export interface ContainerRuntime {
+  /** Force-remove a container by name; returns true if the runtime reported it existed. */
+  remove(containerName: string): boolean;
+}
+
+export const dockerRuntime: ContainerRuntime = {
+  remove(containerName) {
+    try {
+      execFileSync("docker", ["rm", "-f", containerName], { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};
 
 export interface RecoveryOutcome {
   checkpoint: CheckpointRow | undefined;
@@ -45,6 +64,7 @@ export async function recover(
   reportsDir: string,
   expected: { evaluatorHash: string; environmentHash: string; contractHash: string },
   sandbox?: Sandbox,
+  runtime: ContainerRuntime = dockerRuntime,
 ): Promise<RecoveryOutcome> {
   const actions: RecoveryAction[] = [];
   const mission = await ledger.getMission(missionId);
@@ -55,6 +75,24 @@ export async function recover(
       actions: [{ kind: "fresh", detail: "no mission row" }],
       activeExperiment: undefined,
     };
+
+  for (const container of await ledger.listLiveContainers(missionId)) {
+    const existed = runtime.remove(container.containerName);
+    await ledger.transaction(async () => {
+      await ledger.releaseContainer(container.containerName, "orphan_removed");
+      await ledger.appendEvent(
+        `recovery:${container.containerName}:orphan-removed`,
+        "container.orphan_removed",
+        container.experimentId,
+        { containerName: container.containerName, existed },
+      );
+    });
+    actions.push({
+      kind: "removed_orphaned_container",
+      experimentId: container.experimentId,
+      detail: `${container.containerName} ${existed ? "was still present and was removed" : "already gone; record closed"}`,
+    });
+  }
 
   if (mission.contractHash !== expected.contractHash)
     throw new Error(

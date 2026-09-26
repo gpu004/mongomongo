@@ -67,6 +67,8 @@ export interface ServiceRequest {
   entry: string;
   startupTimeoutMs: number;
   memoryLimitBytes: number;
+  /** Container backends call this with the sandbox name before it is started. */
+  beforeStart?: (sandboxId: string) => Promise<void>;
 }
 
 export interface ServiceExit {
@@ -593,6 +595,7 @@ export class DockerSandbox implements Sandbox {
     const network = await this.ensureNetwork(request.scope.missionId);
     const name = sandboxName(request.scope);
     const snapshot = realpathSync(request.snapshotDir);
+    await request.beforeStart?.(name);
     const args = [
       ...this.baseArgs(name, request.scope, request.memoryLimitBytes),
       "--network",

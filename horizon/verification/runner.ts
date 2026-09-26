@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   CandidateStartupError,
   launchCandidate,
+  type ContainerRegistry,
   type IsolationMode,
   type RunningCandidate,
 } from "./candidate-process.ts";
@@ -47,6 +48,8 @@ export interface RunnerConfig {
   scenariosDir?: string;
   /** Stable id of the ledger operation this run belongs to; labels every sandbox it starts. */
   operationId?: string;
+  /** Records container names durably so resume can remove orphans (container mode). */
+  containerRegistry?: ContainerRegistry;
 }
 
 const VERIFICATION_DIR = new URL("./", import.meta.url).pathname;
@@ -205,6 +208,7 @@ export async function runSuite(config: RunnerConfig, suite: Suite): Promise<Veri
       startupTimeoutMs: config.startupTimeoutMs,
       memoryLimitBytes: config.memoryLimitBytes,
       scope: sandboxScope(config, suite),
+      containerRegistry: config.containerRegistry,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -284,6 +288,7 @@ async function relaunch(
     startupTimeoutMs: config.startupTimeoutMs,
     memoryLimitBytes: config.memoryLimitBytes,
     scope: sandboxScope(config, suite),
+    containerRegistry: config.containerRegistry,
   });
 }
 

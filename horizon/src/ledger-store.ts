@@ -3,6 +3,8 @@ import type { VerificationReport } from "../verification/reports.ts";
 import {
   type ArtifactRow,
   type CheckpointRow,
+  type ContainerRow,
+  type ContainerState,
   type EpisodeRow,
   type EventRow,
   type ExperimentRow,
@@ -37,6 +39,7 @@ export type NewMission = Omit<
   | "spentWallMs"
   | "usageUncertain"
   | "learnedSuiteVersion"
+  | "frozenAcceptanceMargin"
 >;
 export type NewExperiment = Omit<
   ExperimentRow,
@@ -186,6 +189,11 @@ export interface LedgerStore {
   activeSegment(missionId: string): Promise<SegmentRow | undefined>;
   listSegments(missionId: string): Promise<SegmentRow[]>;
   discardUncommittedSegments(missionId: string): Promise<number>;
+
+  registerContainer(containerName: string, missionId: string, experimentId: string): Promise<void>;
+  releaseContainer(containerName: string, state?: ContainerState): Promise<void>;
+  listLiveContainers(missionId: string): Promise<ContainerRow[]>;
+  listContainers(missionId: string): Promise<ContainerRow[]>;
 
   enqueueOutbox(episodeId: string, payload: unknown): Promise<string>;
   outboxPayloadForEpisode(episodeId: string): Promise<unknown>;
@@ -408,6 +416,18 @@ export class SqliteLedgerStore implements LedgerStore {
   }
   discardUncommittedSegments(missionId: string) {
     return this.run((l) => l.discardUncommittedSegments(missionId));
+  }
+  registerContainer(containerName: string, missionId: string, experimentId: string) {
+    return this.run((l) => l.registerContainer(containerName, missionId, experimentId));
+  }
+  releaseContainer(containerName: string, state?: ContainerState) {
+    return this.run((l) => l.releaseContainer(containerName, state));
+  }
+  listLiveContainers(missionId: string) {
+    return this.run((l) => l.listLiveContainers(missionId));
+  }
+  listContainers(missionId: string) {
+    return this.run((l) => l.listContainers(missionId));
   }
   enqueueOutbox(episodeId: string, payload: unknown) {
     return this.run((l) => l.enqueueOutbox(episodeId, payload));

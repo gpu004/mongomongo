@@ -52,6 +52,8 @@ export interface MissionRow {
   status: MissionStatus;
   seedArtifactHash: string | null;
   baselineP95Ms: number | null;
+  /** Margin frozen after the baseline measured its noise; null until the baseline completes. */
+  frozenAcceptanceMargin: number | null;
   bestArtifactHash: string | null;
   bestP95Ms: number | null;
   activeTaskId: string | null;
@@ -204,6 +206,18 @@ export interface OperationRow {
   updatedAt: string;
 }
 
+export type ContainerState = "launching" | "released" | "orphan_removed";
+
+/** Execution environment (Docker container) launched for an experiment; live rows are reconciled on resume. */
+export interface ContainerRow {
+  containerName: string;
+  missionId: string;
+  experimentId: string;
+  state: ContainerState;
+  createdAt: string;
+  releasedAt: string | null;
+}
+
 export interface EventRow {
   seq: number;
   eventKey: string;
@@ -221,7 +235,8 @@ CREATE TABLE IF NOT EXISTS mission (
   spent_experiments INTEGER NOT NULL DEFAULT 0, spent_input_tokens INTEGER NOT NULL DEFAULT 0,
   spent_output_tokens INTEGER NOT NULL DEFAULT 0, spent_memory_operations INTEGER NOT NULL DEFAULT 0,
   spent_wall_ms INTEGER NOT NULL DEFAULT 0, usage_uncertain INTEGER NOT NULL DEFAULT 0,
-  learned_suite_version INTEGER NOT NULL DEFAULT 0, next_wake_at TEXT, created_at TEXT NOT NULL
+  learned_suite_version INTEGER NOT NULL DEFAULT 0, next_wake_at TEXT, created_at TEXT NOT NULL,
+  frozen_acceptance_margin REAL
 );
 CREATE TABLE IF NOT EXISTS task (
   task_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, ordinal INTEGER NOT NULL, depends_on TEXT NOT NULL,
@@ -285,6 +300,11 @@ CREATE INDEX IF NOT EXISTS operation_state ON operation(mission_id, state);
 CREATE TABLE IF NOT EXISTS learned_scenario (
   scenario_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, lesson_id TEXT NOT NULL, suite_version INTEGER NOT NULL, path TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS container (
+  container_name TEXT PRIMARY KEY, mission_id TEXT NOT NULL, experiment_id TEXT NOT NULL, state TEXT NOT NULL,
+  created_at TEXT NOT NULL, released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS container_mission_state ON container(mission_id, state);
 `;
 
 function now(): string {
@@ -313,6 +333,7 @@ export class Ledger {
     this.db.exec("PRAGMA synchronous = FULL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
+    this.migrate();
     this.backfillEpisodeIndex();
     this.lockPath = join(dirname(path), "controller.lock");
   }
@@ -419,6 +440,7 @@ export class Ledger {
       | "spentWallMs"
       | "usageUncertain"
       | "learnedSuiteVersion"
+      | "frozenAcceptanceMargin"
     >,
   ): void {
     this.db
@@ -458,6 +480,7 @@ export class Ledger {
       status: r.status as MissionStatus,
       seedArtifactHash: nullableString(r.seed_artifact_hash),
       baselineP95Ms: nullableNumber(r.baseline_p95_ms),
+      frozenAcceptanceMargin: nullableNumber(r.frozen_acceptance_margin),
       bestArtifactHash: nullableString(r.best_artifact_hash),
       bestP95Ms: nullableNumber(r.best_p95_ms),
       activeTaskId: nullableString(r.active_task_id),
@@ -481,6 +504,7 @@ export class Ledger {
       status: "status",
       seedArtifactHash: "seed_artifact_hash",
       baselineP95Ms: "baseline_p95_ms",
+      frozenAcceptanceMargin: "frozen_acceptance_margin",
       bestArtifactHash: "best_artifact_hash",
       bestP95Ms: "best_p95_ms",
       activeTaskId: "active_task_id",
@@ -744,6 +768,17 @@ export class Ledger {
       this.db
         .prepare("INSERT INTO episode_fts (episode_id, mission_id, summary) VALUES (?, ?, ?)")
         .run(e.episodeId, e.missionId, e.summary);
+  }
+
+  /** Additive column migrations for ledgers created by earlier schema revisions. */
+  private migrate(): void {
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(mission)").all() as { name: string }[]).map(
+        (c) => c.name,
+      ),
+    );
+    if (!columns.has("frozen_acceptance_margin"))
+      this.db.exec("ALTER TABLE mission ADD COLUMN frozen_acceptance_margin REAL");
   }
 
   private backfillEpisodeIndex(): void {
@@ -1052,6 +1087,44 @@ export class Ledger {
     );
   }
 
+  // ---- execution environments -------------------------------------------
+
+  /** Durable record written before `docker run`, so a crashed controller's container can be found on resume. */
+  registerContainer(containerName: string, missionId: string, experimentId: string): void {
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO container (container_name, mission_id, experiment_id, state, created_at) VALUES (?, ?, ?, 'launching', ?)",
+      )
+      .run(containerName, missionId, experimentId, now());
+  }
+
+  releaseContainer(containerName: string, state: ContainerState = "released"): void {
+    this.db
+      .prepare(
+        "UPDATE container SET state = ?, released_at = ? WHERE container_name = ? AND state = 'launching'",
+      )
+      .run(state, now(), containerName);
+  }
+
+  /** Containers whose stop was never recorded: candidates for orphan cleanup. */
+  listLiveContainers(missionId: string): ContainerRow[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT * FROM container WHERE mission_id = ? AND state = 'launching' ORDER BY created_at, container_name",
+        )
+        .all(missionId) as Row[]
+    ).map(toContainer);
+  }
+
+  listContainers(missionId: string): ContainerRow[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM container WHERE mission_id = ? ORDER BY created_at, container_name")
+        .all(missionId) as Row[]
+    ).map(toContainer);
+  }
+
   enqueueOutbox(episodeId: string, payload: unknown): string {
     const payloadHash = sha256(canonicalJson(payload));
     const idempotencyKey = `${episodeId}:${payloadHash.slice(0, 16)}`;
@@ -1200,6 +1273,17 @@ function nullableString(v: Cell): string | null {
 
 function nullableNumber(v: Cell): number | null {
   return v === null || v === undefined ? null : Number(v);
+}
+
+function toContainer(r: Row): ContainerRow {
+  return {
+    containerName: String(r.container_name),
+    missionId: String(r.mission_id),
+    experimentId: String(r.experiment_id),
+    state: String(r.state) as ContainerState,
+    createdAt: String(r.created_at),
+    releasedAt: r.released_at == null ? null : String(r.released_at),
+  };
 }
 
 function toExperiment(r: Row): ExperimentRow {

@@ -20,6 +20,8 @@ import {
 import type {
   ArtifactRow,
   CheckpointRow,
+  ContainerRow,
+  ContainerState,
   EpisodeRow,
   EventRow,
   ExperimentRow,
@@ -70,6 +72,7 @@ export const COLLECTIONS = [
   "events",
   "outbox",
   "operations",
+  "containers",
 ] as const;
 type CollectionName = (typeof COLLECTIONS)[number];
 
@@ -123,6 +126,7 @@ export const INDEXES: Record<CollectionName, IndexSpec[]> = {
     { name: "mission_ord", key: { missionId: 1, ord: 1 } },
   ],
   operations: [{ name: "mission_state", key: { missionId: 1, state: 1, createdAt: 1 } }],
+  containers: [{ name: "mission_state", key: { missionId: 1, state: 1, createdAt: 1 } }],
 };
 
 interface Stored {
@@ -512,6 +516,7 @@ export class MongoLedgerStore implements LedgerStore {
             spentWallMs: 0,
             usageUncertain: 0,
             learnedSuiteVersion: 0,
+            frozenAcceptanceMargin: null,
             createdAt: now(),
           },
         },
@@ -1052,6 +1057,60 @@ export class MongoLedgerStore implements LedgerStore {
       async (session) =>
         (await this.col("segments").deleteMany({ missionId, committed: 0 }, so(session)))
           .deletedCount,
+    );
+  }
+
+  // ---- execution environments -------------------------------------------
+
+  registerContainer(containerName: string, missionId: string, experimentId: string): Promise<void> {
+    return this.write(async (session) => {
+      await this.col<Doc<ContainerRow>>("containers").updateOne(
+        { _id: this.id(`container:${containerName}`) },
+        {
+          $setOnInsert: {
+            schemaVersion: SCHEMA_VERSION,
+            containerName,
+            missionId,
+            experimentId,
+            state: "launching",
+            createdAt: now(),
+            releasedAt: null,
+          },
+        },
+        { upsert: true, ...so(session) },
+      );
+    });
+  }
+
+  releaseContainer(containerName: string, state: ContainerState = "released"): Promise<void> {
+    return this.write(async (session) => {
+      await this.col<Doc<ContainerRow>>("containers").updateOne(
+        { _id: this.id(`container:${containerName}`), state: "launching" },
+        { $set: { state, releasedAt: now() } },
+        so(session),
+      );
+    });
+  }
+
+  listLiveContainers(missionId: string): Promise<ContainerRow[]> {
+    return this.listContainerDocs(missionId, { state: "launching" });
+  }
+
+  listContainers(missionId: string): Promise<ContainerRow[]> {
+    return this.listContainerDocs(missionId, {});
+  }
+
+  private listContainerDocs(
+    missionId: string,
+    filter: { state?: ContainerState },
+  ): Promise<ContainerRow[]> {
+    return this.read(async (session) =>
+      (
+        await this.col<Doc<ContainerRow>>("containers")
+          .find({ missionId, ...filter }, so(session))
+          .sort({ createdAt: 1, _id: 1 })
+          .toArray()
+      ).map((d) => strip<ContainerRow>(d, missionId)),
     );
   }
 

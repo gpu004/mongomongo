@@ -8,7 +8,7 @@ ledger (SQLite or MongoDB Atlas), and a scoped memory layer keep the mission hon
 ## Requirements
 
 - Node >= 24 (uses `node:sqlite` and type-stripped `.ts` execution)
-- Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra
+- Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra. Container names are recorded in the ledger before `docker run`, so `resume` removes any candidate container orphaned by a controller crash
 - MongoDB (optional) for `"ledger": { "backend": "mongodb" }`: Atlas, or any replica set for transactions
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
 - An LLM API key for the Pi worker (`"worker": "pi"`); the `scripted` worker needs none
@@ -18,6 +18,8 @@ ledger (SQLite or MongoDB Atlas), and a scoped memory layer keep the mission hon
 ```sh
 npm install
 npm run check          # tsc --noEmit
+npm run lint           # oxlint .
+npm run format:check   # oxfmt --check . (npm run format rewrites in place)
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
@@ -39,6 +41,12 @@ npm run horizon -- skill-eval                               # grade the worker o
 npm run horizon -- memory-bench --episodes 1000,10000      # synthetic history benchmark of retrieval
 node scripts/supermemory-probe.ts --episodes 12            # hosted memory: indexing lag, latency, scoped correctness
 ```
+
+The baseline measures repetition spread and freezes the acceptance margin used for every later
+verdict: the configured `acceptanceMargin` when it already covers the spread, otherwise the spread
+itself (rounded up to 0.1%). Spread at or above `maxRepetitionSpread` (default `targetP95Reduction`)
+blocks the mission before optimization so the workload or environment can be repaired. The frozen
+value is stored on the mission row and in the `target.assessed` event.
 
 Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artifacts/<hash>/`
 (immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`.
