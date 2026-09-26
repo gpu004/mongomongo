@@ -1,18 +1,19 @@
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { SimulatedCrash } from "../src/controller.ts";
 import { Ledger } from "../src/ledger.ts";
+import { LeaseError } from "../src/ledger-contract.ts";
 import { missionPaths } from "../src/mission-paths.ts";
 import { controllerFor, tempRunsRoot } from "./helpers.ts";
 
 test("crash during candidate edits: experiment is marked interrupted, workspace restored, mission continues", async () => {
   const runs = tempRunsRoot();
   const first = controllerFor("rec-edit", runs, { crashAt: "editing", maxCycles: 1 });
-  first.initialize();
+  await first.initialize();
   await assert.rejects(first.run(), SimulatedCrash);
-  first.close();
+  await first.close();
 
   // A stray file left by the interrupted edit must not survive recovery.
   const paths = missionPaths("rec-edit", runs);
@@ -20,10 +21,10 @@ test("crash during candidate edits: experiment is marked interrupted, workspace 
 
   const second = controllerFor("rec-edit", runs, { maxCycles: 1 });
   const row = await second.run();
-  const experiments = second.ledger
-    .listExperiments("rec-edit")
-    .filter((e) => e.taskId === "optimize-search");
-  second.close();
+  const experiments = (await second.ledger.listExperiments("rec-edit")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
+  await second.close();
 
   assert.equal(experiments[0]?.status, "interrupted");
   assert.equal(experiments.length, 2);
@@ -35,19 +36,19 @@ test("crash during candidate edits: experiment is marked interrupted, workspace 
 test("crash after snapshot: the same immutable snapshot is evaluated, not re-edited", async () => {
   const runs = tempRunsRoot();
   const first = controllerFor("rec-snap", runs, { crashAt: "snapshot_ready", maxCycles: 1 });
-  first.initialize();
+  await first.initialize();
   await assert.rejects(first.run(), SimulatedCrash);
-  const before = first.ledger
-    .listExperiments("rec-snap")
-    .find((e) => e.taskId === "optimize-search")!;
-  first.close();
+  const before = (await first.ledger.listExperiments("rec-snap")).find(
+    (e) => e.taskId === "optimize-search",
+  )!;
+  await first.close();
   assert.equal(before.status, "snapshot_ready");
 
   const second = controllerFor("rec-snap", runs, { maxCycles: 1 });
   await second.run();
-  const after = second.ledger.getExperiment(before.experimentId)!;
+  const after = (await second.ledger.getExperiment(before.experimentId))!;
   const artifactsDir = missionPaths("rec-snap", runs).artifacts;
-  second.close();
+  await second.close();
 
   assert.equal(after.candidateArtifactHash, before.candidateArtifactHash);
   assert.equal(after.status, "rejected");
@@ -66,17 +67,15 @@ test("crash between report publication and ledger commit: finalized report is co
     crashAt: "report-written:optimize:learned",
     maxCycles: 2,
   });
-  first.initialize();
+  await first.initialize();
   await assert.rejects(first.run(), SimulatedCrash);
-  const exp = first.ledger
-    .listExperiments("rec-report")
+  const exp = (await first.ledger.listExperiments("rec-report"))
     .filter((e) => e.taskId === "optimize-search")
     .at(-1)!;
-  const reportsBefore = first.ledger
-    .listVerifications("rec-report")
+  const reportsBefore = (await first.ledger.listVerifications("rec-report"))
     .filter((v) => v.experimentId === exp.experimentId)
     .map((v) => v.suite);
-  first.close();
+  await first.close();
   assert.equal(exp.status, "evaluating");
   assert.deepEqual(
     reportsBefore.sort(),
@@ -91,12 +90,12 @@ test("crash between report publication and ledger commit: finalized report is co
 
   const second = controllerFor("rec-report", runs, { maxCycles: 1 });
   await second.run();
-  const verifications = second.ledger
-    .listVerifications("rec-report")
-    .filter((v) => v.experimentId === exp.experimentId);
-  const after = second.ledger.getExperiment(exp.experimentId)!;
-  const events = second.ledger.eventsSince(0, 10000);
-  second.close();
+  const verifications = (await second.ledger.listVerifications("rec-report")).filter(
+    (v) => v.experimentId === exp.experimentId,
+  );
+  const after = (await second.ledger.getExperiment(exp.experimentId))!;
+  const events = await second.ledger.eventsSince(0, 10000);
+  await second.close();
 
   assert.equal(
     verifications.filter((v) => v.suite === "learned").length,
@@ -121,12 +120,12 @@ test("crash between report publication and ledger commit: finalized report is co
 test("checkpoints exist for every durable transition and the latest one reflects finished state", async () => {
   const runs = tempRunsRoot();
   const controller = controllerFor("rec-ckpt", runs);
-  controller.initialize();
+  await controller.initialize();
   const row = await controller.run();
-  const latest = controller.ledger.latestCheckpoint("rec-ckpt")!;
-  const count = controller.ledger.countCheckpoints("rec-ckpt");
-  const segments = controller.ledger.listSegments("rec-ckpt");
-  controller.close();
+  const latest = (await controller.ledger.latestCheckpoint("rec-ckpt"))!;
+  const count = await controller.ledger.countCheckpoints("rec-ckpt");
+  const segments = await controller.ledger.listSegments("rec-ckpt");
+  await controller.close();
 
   assert.equal(row.status, "succeeded");
   assert.ok(count >= 6);
@@ -135,34 +134,38 @@ test("checkpoints exist for every durable transition and the latest one reflects
   assert.ok(segments.every((s) => s.committed));
 });
 
-test("re-running a finished mission is idempotent and the controller lock is held for the run", async () => {
+test("re-running a finished mission is idempotent and the fenced lease is held for the run", async () => {
   const runs = tempRunsRoot();
   const controller = controllerFor("rec-idem", runs);
-  controller.initialize();
+  await controller.initialize();
   await controller.run();
-  const experimentsBefore = controller.ledger.listExperiments("rec-idem").length;
-  controller.close();
+  const experimentsBefore = (await controller.ledger.listExperiments("rec-idem")).length;
+  assert.equal(await controller.ledger.getLease("rec-idem"), undefined, "lease released");
+  await controller.close();
 
-  const again = controllerFor("rec-idem", runs);
-  const lockPath = join(runs, "rec-idem", "controller.lock");
-  again.ledger.acquireLock();
-  assert.equal(readFileSync(lockPath, "utf8"), String(process.pid));
-  again.ledger.releaseLock();
-  assert.equal(existsSync(lockPath), false);
+  // A live lease held by another controller refuses a concurrent start without touching state.
+  const again = controllerFor("rec-idem", runs, { leaseOwner: "again" });
+  const ledger = await again.open();
+  const other = await ledger.claimLease("rec-idem", "other-host", 60_000);
+  await assert.rejects(again.run(), LeaseError);
+  assert.equal((await ledger.getLease("rec-idem"))?.owner, "other-host");
+  await ledger.releaseLease(other);
+
   const row = await again.run();
   assert.equal(row.status, "succeeded");
-  assert.equal(again.ledger.listExperiments("rec-idem").length, experimentsBefore);
-  again.close();
+  assert.equal((await again.ledger.listExperiments("rec-idem")).length, experimentsBefore);
+  assert.equal(await again.ledger.getLease("rec-idem"), undefined);
+  await again.close();
 });
 
 test("drift in frozen identities is refused on resume", async () => {
   const runs = tempRunsRoot();
   const controller = controllerFor("rec-drift", runs);
-  controller.initialize();
-  controller.close();
+  await controller.initialize();
+  await controller.close();
   const drifted = controllerFor("rec-drift", runs, {}, { targetP95Reduction: 0.5 });
   await assert.rejects(drifted.run(), /contract hash drift/);
-  drifted.close();
+  await drifted.close();
 });
 
 test("ledger: containers registered within the same millisecond list in registration order", () => {
@@ -189,25 +192,25 @@ test("ledger: containers registered within the same millisecond list in registra
 test("container names are durable before launch and orphans are removed on resume", async () => {
   const runs = tempRunsRoot();
   const first = controllerFor("rec-orphan", runs, { crashAt: "snapshot_ready", maxCycles: 1 });
-  first.initialize();
+  await first.initialize();
   await assert.rejects(first.run(), SimulatedCrash);
-  const experiment = first.ledger
-    .listExperiments("rec-orphan")
-    .find((e) => e.taskId === "optimize-search")!;
+  const experiment = (await first.ledger.listExperiments("rec-orphan")).find(
+    (e) => e.taskId === "optimize-search",
+  )!;
 
   // The registry writes the name before `docker run`; a stopped container is released.
   const registry = first.containerRegistry(experiment.experimentId);
-  registry.register("horizon-cand-released0001");
-  registry.release("horizon-cand-released0001");
+  await registry.register("horizon-cand-released0001");
+  await registry.release("horizon-cand-released0001");
   // A container whose controller died mid-verification never reaches release().
-  registry.register("horizon-cand-orphan000001");
-  const live = first.ledger.listLiveContainers("rec-orphan");
+  await registry.register("horizon-cand-orphan000001");
+  const live = await first.ledger.listLiveContainers("rec-orphan");
   assert.deepEqual(
     live.map((c) => [c.containerName, c.experimentId, c.state]),
     [["horizon-cand-orphan000001", experiment.experimentId, "launching"]],
   );
-  assert.ok(first.ledger.findEvent("container:horizon-cand-orphan000001:launched"));
-  first.close();
+  assert.ok(await first.ledger.findEvent("container:horizon-cand-orphan000001:launched"));
+  await first.close();
 
   const removed: string[] = [];
   const second = controllerFor("rec-orphan", runs, {
@@ -215,14 +218,13 @@ test("container names are durable before launch and orphans are removed on resum
     containerRuntime: { remove: (name) => (removed.push(name), true) },
   });
   await second.run();
-  const containers = second.ledger.listContainers("rec-orphan");
-  const event = second.ledger.findEvent("recovery:horizon-cand-orphan000001:orphan-removed");
-  const recovered = second.ledger
-    .eventsSince(0, 10_000)
+  const containers = await second.ledger.listContainers("rec-orphan");
+  const event = await second.ledger.findEvent("recovery:horizon-cand-orphan000001:orphan-removed");
+  const recovered = (await second.ledger.eventsSince(0, 10_000))
     .filter((e) => e.type === "controller.recovered")
     .at(-1)!.payload as { actions: { kind: string; experimentId?: string }[] };
-  const stillLive = second.ledger.listLiveContainers("rec-orphan").length;
-  second.close();
+  const stillLive = (await second.ledger.listLiveContainers("rec-orphan")).length;
+  await second.close();
 
   assert.deepEqual(removed, ["horizon-cand-orphan000001"]);
   assert.equal(stillLive, 0);

@@ -15,8 +15,11 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
   before `docker run` and every container is labelled with its mission, so `resume` removes any
   candidate or worker container orphaned by a controller crash
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
-- `MONGODB_URI` / `MONGODB_DB` (optional) for the Atlas ledger adapter; see `.env.example`.
-  `doctor` probes connectivity, a disposable write/read, a transaction, and the required
+- `MONGODB_URI` / `MONGODB_DB` (optional) for the MongoDB ledger; see `.env.example`. When set,
+  missions use MongoDB unless the mission config pins `"ledger": { "backend": "sqlite" }`;
+  `"backend": "mongodb"` refuses to start without `MONGODB_URI`. Every controller run claims a
+  fenced lease (monotonic fencing token, heartbeat-renewed) so a stale controller's writes are
+  rejected instead of corrupting the mission. `doctor` probes connectivity, a disposable write/read, a transaction, and the required
   indexes, then removes its probe data without printing credentials
 - An LLM API key for the Pi worker (`"worker": "pi"`): `<PROVIDER>_API_KEY` for the configured `model.provider` (`ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`/`GEMINI_API_KEY` for `google`); the `scripted` worker needs none
 
@@ -28,7 +31,7 @@ npm run check          # tsc --noEmit
 npm run lint           # oxlint . + scripts/lint-comments.ts (no section dividers, diff narration, or unjustified suppressions)
 npm run format:check   # oxfmt --check . (npm run format rewrites in place)
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, ledger contract
-MONGODB_URI=... npm test   # additionally runs the ledger contract tests against MongoDB in a throwaway database
+MONGODB_URI=... npm test   # additionally runs the ledger contract and controller runtime tests against MongoDB in throwaway databases
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, sandbox
                        # test/sandbox-escape.test.ts runs the adversarial escape-probe fixture against Docker when the
                        # pinned image is present (skipped otherwise; HORIZON_REQUIRE_DOCKER=1 makes the skip a failure)
@@ -62,7 +65,7 @@ itself (rounded up to 0.1%). Spread at or above `maxRepetitionSpread` (default `
 blocks the mission before optimization so the workload or environment can be repaired. The frozen
 value is stored on the mission row and in the `target.assessed` event.
 
-Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artifacts/<hash>/`
+Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger; MongoDB when selected), `artifacts/<hash>/`
 (immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`.
 
 ## Layout

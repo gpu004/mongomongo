@@ -39,6 +39,8 @@ export function testConfig(
     },
     budget: { ...base.budget, maxExperiments: 4 },
     memory: { ...base.memory, containerTag: `horizon-${missionId}` },
+    // A MONGODB_URI in the environment must not route tests to a shared database; Mongo coverage opts in explicitly.
+    ledger: { backend: "sqlite" },
     ...overrides,
   };
 }

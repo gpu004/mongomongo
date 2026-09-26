@@ -60,32 +60,34 @@ class RateLimitedWorker implements Worker {
 test("a missing provider credential blocks the mission in the ledger instead of leaving it running", async () => {
   const runs = tempRunsRoot();
   const controller = controllerFor("wf-nokey", runs, { worker: new NoCredentialWorker() });
-  controller.initialize();
+  await controller.initialize();
   const row = await controller.run();
   assert.equal(row.status, "blocked");
   assert.equal(row.nextWakeAt, null);
-  const finish = controller.ledger.eventsSince(0).find((e) => e.type === "mission.finished");
+  const finish = (await controller.ledger.eventsSince(0)).find(
+    (e) => e.type === "mission.finished",
+  );
   assert.ok(finish);
   assert.match(String((finish.payload as { detail: string }).detail), /ANTHROPIC_API_KEY/);
   // No experiment is left open: the fault surfaced before a cycle was planned.
-  const open = controller.ledger
-    .listExperiments("wf-nokey")
-    .filter((e) => !["accepted", "rejected", "inconclusive", "interrupted"].includes(e.status));
+  const open = (await controller.ledger.listExperiments("wf-nokey")).filter(
+    (e) => !["accepted", "rejected", "inconclusive", "interrupted"].includes(e.status),
+  );
   assert.deepEqual(open, []);
-  assert.equal(controller.ledger.latestCheckpoint("wf-nokey")?.missionStatus, "blocked");
-  controller.close();
+  assert.equal((await controller.ledger.latestCheckpoint("wf-nokey"))?.missionStatus, "blocked");
+  await controller.close();
 
   // Resume reaches the same durable verdict rather than crashing out.
   const again = controllerFor("wf-nokey", runs, { worker: new NoCredentialWorker() });
   assert.equal((await again.run()).status, "blocked");
-  again.close();
+  await again.close();
 });
 
 test("a rate-limited provider parks the mission in waiting with nextWakeAt; resume honours the wake time", async () => {
   const runs = tempRunsRoot();
   const worker = new RateLimitedWorker(30_000);
   const controller = controllerFor("wf-429", runs, { worker });
-  controller.initialize();
+  await controller.initialize();
   const before = Date.now();
   const row = await controller.run();
   assert.equal(row.status, "waiting");
@@ -95,16 +97,18 @@ test("a rate-limited provider parks the mission in waiting with nextWakeAt; resu
   assert.equal(worker.cycles, 1);
   assert.equal(row.activeTaskId, null);
 
-  const experiments = controller.ledger
-    .listExperiments("wf-429")
-    .filter((e) => e.taskId === "optimize-search");
+  const experiments = (await controller.ledger.listExperiments("wf-429")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
   assert.equal(experiments.length, 1);
   assert.equal(experiments[0]!.status, "interrupted");
   assert.match(experiments[0]!.verdict ?? "", /rate_limit/);
-  const waiting = controller.ledger.eventsSince(0).find((e) => e.type === "mission.waiting");
+  const waiting = (await controller.ledger.eventsSince(0)).find(
+    (e) => e.type === "mission.waiting",
+  );
   assert.equal((waiting?.payload as { nextWakeAt: string }).nextWakeAt, row.nextWakeAt);
-  assert.equal(controller.ledger.latestCheckpoint("wf-429")?.missionStatus, "waiting");
-  controller.close();
+  assert.equal((await controller.ledger.latestCheckpoint("wf-429"))?.missionStatus, "waiting");
+  await controller.close();
 
   // Resume before the wake time sleeps until it (without billing the wait), then continues normally.
   const slept: number[] = [];
@@ -115,27 +119,27 @@ test("a rate-limited provider parks the mission in waiting with nextWakeAt; resu
       slept.push(ms);
     },
   });
-  const wallBefore = resumed.mission().spentWallMs;
+  const wallBefore = (await resumed.mission()).spentWallMs;
   const after = await resumed.run();
   assert.equal(slept.length, 1);
   assert.ok(slept[0]! > 0 && slept[0]! <= 30_000);
   assert.notEqual(after.status, "waiting");
   assert.equal(after.nextWakeAt, null);
   assert.ok(after.spentWallMs - wallBefore < 30_000, "the wait itself is not billed as wall time");
-  const later = resumed.ledger
-    .listExperiments("wf-429")
-    .filter((e) => e.taskId === "optimize-search");
+  const later = (await resumed.ledger.listExperiments("wf-429")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
   assert.equal(later.length, 2);
   assert.notEqual(later[1]!.status, "interrupted");
-  resumed.close();
+  await resumed.close();
 });
 
 test("a waiting mission whose wake time has passed resumes without sleeping", async () => {
   const runs = tempRunsRoot();
   const first = controllerFor("wf-429-past", runs, { worker: new RateLimitedWorker(0) });
-  first.initialize();
+  await first.initialize();
   assert.equal((await first.run()).status, "waiting");
-  first.close();
+  await first.close();
   const slept: number[] = [];
   const second = controllerFor("wf-429-past", runs, {
     worker: new ScriptedWorker(),
@@ -147,7 +151,7 @@ test("a waiting mission whose wake time has passed resumes without sleeping", as
   const row = await second.run();
   assert.deepEqual(slept, []);
   assert.notEqual(row.status, "waiting");
-  second.close();
+  await second.close();
 });
 
 test("retry-after hints are parsed from provider error text; default applies otherwise", () => {

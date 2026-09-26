@@ -17,8 +17,8 @@ export type IsolationMode = "container" | "subprocess";
  * leaves a registered-but-unreleased name that resume can find and remove.
  */
 export interface ContainerRegistry {
-  register(containerName: string): void;
-  release(containerName: string): void;
+  register(containerName: string): void | Promise<void>;
+  release(containerName: string): void | Promise<void>;
 }
 
 /** Generates the container name; exported so resume can recognise horizon containers. */
@@ -91,10 +91,10 @@ function launchSubprocess(options: LaunchOptions, entry: string): Promise<Runnin
   );
 }
 
-function launchInContainer(options: LaunchOptions): Promise<RunningCandidate> {
+async function launchInContainer(options: LaunchOptions): Promise<RunningCandidate> {
   assertSandboxAvailable(options.containerImage);
   const name = `${CONTAINER_NAME_PREFIX}${randomUUID().slice(0, 12)}`;
-  options.containerRegistry?.register(name);
+  await options.containerRegistry?.register(name);
   const network = ensureMissionNetwork(options.missionId);
   const args = dockerRunArgs({
     missionId: options.missionId,
@@ -163,7 +163,7 @@ function waitForListening(
       const killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
       const result = await exit;
       clearTimeout(killTimer);
-      if (containerName) registry?.release(containerName);
+      if (containerName) await registry?.release(containerName);
       return { ...result, peakMemoryBytes: peak, stderrTail: stderr.slice(-2000) };
     };
 
@@ -192,18 +192,23 @@ function waitForListening(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (containerName) registry?.release(containerName);
-      reject(new CandidateStartupError(`spawn failed: ${error.message}`));
+      void Promise.resolve(containerName ? registry?.release(containerName) : undefined).then(
+        () => reject(new CandidateStartupError(`spawn failed: ${error.message}`)),
+        reject,
+      );
     });
     child.on("exit", (code) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (containerName) registry?.release(containerName);
-      reject(
-        new CandidateStartupError(
-          `candidate exited during startup with code ${code}; stderr: ${stderr.slice(-800)}`,
-        ),
+      void Promise.resolve(containerName ? registry?.release(containerName) : undefined).then(
+        () =>
+          reject(
+            new CandidateStartupError(
+              `candidate exited during startup with code ${code}; stderr: ${stderr.slice(-800)}`,
+            ),
+          ),
+        reject,
       );
     });
   });

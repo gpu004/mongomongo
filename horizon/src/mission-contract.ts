@@ -53,6 +53,11 @@ export interface MissionConfig {
     containerTag: string;
     materializeCorrections: boolean;
   };
+  /**
+   * Ledger backend. "mongodb" requires `MONGODB_URI` and never falls back to SQLite;
+   * when omitted the backend follows the environment (MongoDB if `MONGODB_URI` is set).
+   */
+  ledger?: { backend: "sqlite" | "mongodb" };
 }
 
 export function loadMissionConfig(path: string): MissionConfig {
@@ -125,6 +130,13 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     fail("memory config incomplete");
   if (c.memory!.containerTag !== `horizon-${c.missionId}`)
     fail("memory.containerTag must be horizon-<missionId> (mission-scoped)");
+  if (
+    c.ledger !== undefined &&
+    (typeof c.ledger !== "object" ||
+      c.ledger === null ||
+      (c.ledger.backend !== "sqlite" && c.ledger.backend !== "mongodb"))
+  )
+    fail("ledger.backend must be sqlite|mongodb");
   return c as MissionConfig;
 }
 

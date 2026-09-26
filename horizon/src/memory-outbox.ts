@@ -1,5 +1,6 @@
 import type { FileEvidenceStore } from "./mission-paths.ts";
-import type { EpisodeRow, Ledger, OutboxRow } from "./ledger.ts";
+import type { EpisodeRow, OutboxRow } from "./ledger.ts";
+import type { AsyncLedger } from "./ledger-contract.ts";
 import {
   type EpisodePayload,
   episodeMetadata,
@@ -28,18 +29,22 @@ const MAX_RETRIES = 8;
  * remote status says so, and the same customId is reused on every retry.
  */
 export class MemoryOutbox {
-  private readonly ledger: Ledger;
+  private readonly ledger: AsyncLedger;
   private readonly adapter: MemoryAdapter;
   private readonly containerTag: string;
-  private readonly payloads: (episodeId: string) => EpisodePayload | undefined;
-  private readonly onOperation: () => void;
+  private readonly payloads: (
+    episodeId: string,
+  ) => EpisodePayload | undefined | Promise<EpisodePayload | undefined>;
+  private readonly onOperation: () => void | Promise<void>;
 
   constructor(
-    ledger: Ledger,
+    ledger: AsyncLedger,
     adapter: MemoryAdapter,
     containerTag: string,
-    payloads: (episodeId: string) => EpisodePayload | undefined,
-    onOperation: () => void,
+    payloads: (
+      episodeId: string,
+    ) => EpisodePayload | undefined | Promise<EpisodePayload | undefined>,
+    onOperation: () => void | Promise<void>,
   ) {
     this.ledger = ledger;
     this.adapter = adapter;
@@ -48,8 +53,9 @@ export class MemoryOutbox {
     this.onOperation = onOperation;
   }
 
-  enqueue(payload: EpisodePayload): string {
-    return this.ledger.enqueueOutbox(payload.episodeId, payload);
+  /** Pass the transaction handle when enqueueing inside `ledger.transaction()`. */
+  enqueue(payload: EpisodePayload, ledger: AsyncLedger = this.ledger): Promise<string> {
+    return ledger.enqueueOutbox(payload.episodeId, payload);
   }
 
   async drain(nowMs = Date.now()): Promise<OutboxDrainResult> {
@@ -60,7 +66,7 @@ export class MemoryOutbox {
       failed: 0,
       degraded: false,
     };
-    for (const row of this.ledger.listOutbox([
+    for (const row of await this.ledger.listOutbox([
       "pending",
       "failed",
       "submitted",
@@ -80,36 +86,36 @@ export class MemoryOutbox {
       } catch (error) {
         result.failed += 1;
         result.degraded = true;
-        this.backoff(row, error instanceof Error ? error.message : String(error), nowMs);
+        await this.backoff(row, error instanceof Error ? error.message : String(error), nowMs);
       }
     }
     return result;
   }
 
   private async submit(row: OutboxRow): Promise<void> {
-    const payload = this.payloads(row.episodeId);
+    const payload = await this.payloads(row.episodeId);
     if (!payload) {
-      this.ledger.updateOutbox(row.idempotencyKey, {
+      await this.ledger.updateOutbox(row.idempotencyKey, {
         state: "failed",
         lastError: "episode payload missing locally",
         retries: MAX_RETRIES,
       });
       return;
     }
-    this.onOperation();
+    await this.onOperation();
     const { remoteId } = await this.adapter.add(
       this.containerTag,
       payload.episodeId,
       renderEpisode(payload),
       episodeMetadata(payload),
     );
-    this.ledger.updateOutbox(row.idempotencyKey, {
+    await this.ledger.updateOutbox(row.idempotencyKey, {
       state: "submitted",
       remoteDocumentId: remoteId,
       lastError: null,
       nextAttemptAt: new Date().toISOString(),
     });
-    this.ledger.appendEvent(
+    await this.ledger.appendEvent(
       `outbox:${row.idempotencyKey}:submitted`,
       "memory.submitted",
       row.episodeId,
@@ -119,17 +125,23 @@ export class MemoryOutbox {
 
   private async checkReady(row: OutboxRow): Promise<boolean> {
     if (!row.remoteDocumentId) return false;
-    this.onOperation();
+    await this.onOperation();
     const status = await this.adapter.status(row.remoteDocumentId);
     if (status === "done") {
-      this.ledger.updateOutbox(row.idempotencyKey, { state: "memory_ready", lastError: null });
-      this.ledger.appendEvent(`outbox:${row.idempotencyKey}:ready`, "memory.ready", row.episodeId, {
-        remoteId: row.remoteDocumentId,
+      await this.ledger.updateOutbox(row.idempotencyKey, {
+        state: "memory_ready",
+        lastError: null,
       });
+      await this.ledger.appendEvent(
+        `outbox:${row.idempotencyKey}:ready`,
+        "memory.ready",
+        row.episodeId,
+        { remoteId: row.remoteDocumentId },
+      );
       return true;
     }
     if (status === "failed") {
-      this.ledger.updateOutbox(row.idempotencyKey, {
+      await this.ledger.updateOutbox(row.idempotencyKey, {
         state: "failed",
         lastError: "remote processing failed",
         retries: row.retries + 1,
@@ -137,17 +149,17 @@ export class MemoryOutbox {
       });
       return false;
     }
-    this.ledger.updateOutbox(row.idempotencyKey, {
+    await this.ledger.updateOutbox(row.idempotencyKey, {
       state: "document_ready",
       nextAttemptAt: new Date(Date.now() + BASE_DELAY_MS).toISOString(),
     });
     return false;
   }
 
-  private backoff(row: OutboxRow, message: string, nowMs: number): void {
+  private async backoff(row: OutboxRow, message: string, nowMs: number): Promise<void> {
     const retries = row.retries + 1;
     const delay = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** Math.min(retries, 10));
-    this.ledger.updateOutbox(row.idempotencyKey, {
+    await this.ledger.updateOutbox(row.idempotencyKey, {
       state: row.state === "pending" ? "failed" : row.state,
       retries,
       lastError: message,
@@ -204,41 +216,37 @@ export interface RetrievalSelection {
  */
 export async function retrieveEpisodes(
   adapter: MemoryAdapter,
-  ledger: Ledger,
+  ledger: AsyncLedger,
   evidence: FileEvidenceStore,
   scope: { missionId: string; containerTag: string; contractVersion: number },
   query: string,
   candidateLimit = 10,
   select = 5,
-  onOperation: () => void = () => {},
+  onOperation: () => void | Promise<void> = () => {},
 ): Promise<RetrievalSelection> {
   const selection: RetrievalSelection = { injected: [], filteredOut: [], degraded: false };
   const interpretations = new Map<string, EpisodeRow["interpretation"]>();
   let hits: (MemoryHit & { pending?: boolean; localOnly?: boolean })[] = [];
   try {
-    onOperation();
+    await onOperation();
     hits = await adapter.search(scope.containerTag, query, candidateLimit);
   } catch {
     selection.degraded = true;
-    hits = ledger
-      .searchEpisodes(scope.missionId, query, candidateLimit)
-      .map((row) => localHit(row, query));
+    hits = (await ledger.searchEpisodes(scope.missionId, query, candidateLimit)).map((row) =>
+      localHit(row, query),
+    );
   }
   if (!selection.degraded) {
     const seen = new Set(
       hits.filter((h) => h.metadata.missionId === scope.missionId).map((h) => episodeIdOf(h)),
     );
     // The ledger is canonical: local matches the remote search missed (still indexing, or low remote recall) are merged in.
-    const unindexed = new Set(
-      ledger
-        .searchEpisodes(scope.missionId, query, candidateLimit, { unindexedOnly: true })
-        .map((row) => row.episodeId),
-    );
-    const local = ledger
-      .searchEpisodes(scope.missionId, query, candidateLimit)
-      .concat(
-        ledger.searchEpisodes(scope.missionId, query, candidateLimit, { unindexedOnly: true }),
-      )
+    const unindexedRows = await ledger.searchEpisodes(scope.missionId, query, candidateLimit, {
+      unindexedOnly: true,
+    });
+    const unindexed = new Set(unindexedRows.map((row) => row.episodeId));
+    const local = (await ledger.searchEpisodes(scope.missionId, query, candidateLimit))
+      .concat(unindexedRows)
       .filter(
         (row, i, rows) =>
           !seen.has(row.episodeId) && rows.findIndex((r) => r.episodeId === row.episodeId) === i,
@@ -251,7 +259,7 @@ export async function retrieveEpisodes(
     if (local.length > 0) {
       // Remote and local scores are not comparable; rank the merged set with one IDF-weighted scorer.
       const terms = queryTerms(query);
-      const weights = ledger.termWeights(terms);
+      const weights = await ledger.termWeights(terms);
       const total = terms.reduce((n, t) => n + weights.get(t)!, 0) || 1;
       const rescore = (h: MemoryHit) => {
         const present = new Set(queryTerms(h.content));
@@ -283,7 +291,7 @@ export async function retrieveEpisodes(
       });
       continue;
     }
-    let row = episodeId ? ledger.getEpisode(episodeId) : undefined;
+    let row = episodeId ? await ledger.getEpisode(episodeId) : undefined;
     if (!episodeId || !row || row.missionId !== scope.missionId) {
       selection.filteredOut.push({
         episodeId,
@@ -291,8 +299,8 @@ export async function retrieveEpisodes(
       });
       continue;
     }
-    if (ledger.isSuperseded(episodeId)) {
-      const current = ledger.currentVersionOf(episodeId);
+    if (await ledger.isSuperseded(episodeId)) {
+      const current = await ledger.currentVersionOf(episodeId);
       selection.filteredOut.push({
         episodeId,
         reason: `superseded by ${current?.episodeId ?? "a newer version"}`,
@@ -303,7 +311,7 @@ export async function retrieveEpisodes(
       hit = {
         ...localHit(current, query),
         localOnly: true,
-        pending: !ledger.isIndexed(current.episodeId),
+        pending: !(await ledger.isIndexed(current.episodeId)),
       };
     }
     if (considered.has(episodeId)) continue;

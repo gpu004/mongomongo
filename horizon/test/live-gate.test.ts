@@ -62,9 +62,9 @@ async function interruptedMission(missionId: string, worker: () => Worker) {
     { worker: worker(), crashAt: "snapshot_ready" },
     overrides,
   );
-  first.initialize();
+  await first.initialize();
   await assert.rejects(first.run(), SimulatedCrash);
-  first.close();
+  await first.close();
   const second = controllerFor(missionId, runs, { worker: worker() }, overrides);
   const row = await second.run();
   return { runs, controller: second, row };
@@ -75,10 +75,10 @@ test("live gate: a scripted mission satisfies every structural criterion but is 
     "gate-scripted",
     () => new ScriptedWorker(),
   );
-  const result = evaluateLiveGate(controller.ledger, controller.config);
+  const result = await evaluateLiveGate(controller.ledger, controller.config);
   const paths = missionPaths("gate-scripted", runs);
   const out = exportLiveGate(result, paths);
-  controller.close();
+  await controller.close();
 
   assert.equal(row.status, "succeeded");
   const c = byId(result.checks);
@@ -109,9 +109,9 @@ test("live gate: a scripted mission satisfies every structural criterion but is 
 
 test("live gate: passes only when a pi-labelled worker with reported usage authored the verified candidate", async () => {
   const { controller, row } = await interruptedMission("gate-pi", () => new FakePiWorker());
-  const result = evaluateLiveGate(controller.ledger, { ...controller.config, worker: "pi" });
-  const experiments = controller.ledger.listExperiments("gate-pi");
-  controller.close();
+  const result = await evaluateLiveGate(controller.ledger, { ...controller.config, worker: "pi" });
+  const experiments = await controller.ledger.listExperiments("gate-pi");
+  await controller.close();
 
   assert.equal(row.status, "succeeded");
   assert.ok(
@@ -136,11 +136,11 @@ test("live gate: the manifest's worker setting is part of the verdict", async ()
     worker: new FakePiWorker(),
     maxCycles: 1,
   });
-  controller.initialize();
+  await controller.initialize();
   await controller.run();
-  const asScripted = evaluateLiveGate(controller.ledger, controller.config);
-  const asPi = evaluateLiveGate(controller.ledger, { ...controller.config, worker: "pi" });
-  controller.close();
+  const asScripted = await evaluateLiveGate(controller.ledger, controller.config);
+  const asPi = await evaluateLiveGate(controller.ledger, { ...controller.config, worker: "pi" });
+  await controller.close();
   assert.equal(controller.config.worker, "scripted");
   assert.equal(byId(asScripted.checks).worker_is_pi.passed, false);
   assert.equal(byId(asPi.checks).worker_is_pi.passed, true);
@@ -153,10 +153,10 @@ test("live gate: an unchanged model candidate cannot inherit the baseline's pass
     worker: new NoopPiWorker(),
     maxCycles: 1,
   });
-  controller.initialize();
+  await controller.initialize();
   await controller.run();
-  const result = evaluateLiveGate(controller.ledger, { ...controller.config, worker: "pi" });
-  controller.close();
+  const result = await evaluateLiveGate(controller.ledger, { ...controller.config, worker: "pi" });
+  await controller.close();
 
   const checks = byId(result.checks);
   assert.equal(checks.worker_is_pi.passed, true);

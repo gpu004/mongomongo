@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildPacket, DEFAULT_PACKET_BUDGET, estimateTokens } from "./context-packet.ts";
 import { Ledger } from "./ledger.ts";
+import { SqliteLedger } from "./sqlite-ledger.ts";
 import { type EpisodePayload, LocalMemoryAdapter, renderEpisode } from "./memory-adapter.ts";
 import { MemoryOutbox, retrieveEpisodes, type RetrievalSelection } from "./memory-outbox.ts";
 import { FileEvidenceStore } from "./mission-paths.ts";
@@ -86,14 +87,16 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
   const dir = options.keepDir ?? mkdtempSync(join(tmpdir(), "horizon-membench-"));
   const missionId = "bench";
   const containerTag = `horizon-${missionId}`;
+  // Bulk ingest goes through the synchronous SQLite ledger; delivery and retrieval use the async facade like the controller.
   const ledger = new Ledger(join(dir, "mission.sqlite"));
+  const asyncLedger = new SqliteLedger(ledger);
   const evidence = new FileEvidenceStore(join(dir, "evidence"));
   const evidencePool = Array.from({ length: 20 }, (_, i) => evidence.write("bench", { i }));
   const adapter = new LocalMemoryAdapter();
   adapter.deferReadiness = true;
   const payloads = new Map<string, EpisodePayload>();
   const outbox = new MemoryOutbox(
-    ledger,
+    asyncLedger,
     adapter,
     containerTag,
     (id) => payloads.get(id),
@@ -191,7 +194,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
           summary,
           createdAt: new Date(base + i * 1000).toISOString(),
         });
-        outbox.enqueue(payload);
+        ledger.enqueueOutbox(payload.episodeId, payload);
         latest.set(experiment, { episodeId, value, values: [...(prior?.values ?? []), value] });
       }
     });
@@ -227,7 +230,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
   let maxPacketTokens = 0;
   const ask = async (query: string): Promise<RetrievalSelection> => {
     const t0 = performance.now();
-    const selection = await retrieveEpisodes(adapter, ledger, evidence, scope, query, 10, 5);
+    const selection = await retrieveEpisodes(adapter, asyncLedger, evidence, scope, query, 10, 5);
     latencies.push(performance.now() - t0);
     for (const f of selection.filteredOut) {
       const reason = f.reason.startsWith("superseded") ? "superseded" : f.reason;
@@ -333,7 +336,7 @@ export async function runMemoryBench(options: MemoryBenchOptions): Promise<Memor
     const t0 = performance.now();
     const selection = await retrieveEpisodes(
       adapter,
-      ledger,
+      asyncLedger,
       evidence,
       scope,
       `verified outcome of ${id}`,
