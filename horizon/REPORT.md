@@ -21,7 +21,7 @@ Baseline measurements the prompt asks for that are **not** available: cost in cu
 
 ## 2. Architecture and ownership
 
-- **Canonical mission state**: SQLite ledger (`runs/<mission>/ledger.sqlite`), written only by the controller holding `controller.lock`. Missions, tasks, experiments, artifacts, verifications, episodes, lessons, learned scenarios, checkpoints, segments, events, outbox.
+- **Canonical mission state**: SQLite ledger (`runs/<mission>/state.sqlite`), written only by the controller holding `controller.lock`. Missions, tasks, experiments, artifacts, verifications, episodes, lessons, learned scenarios, checkpoints, segments, events, outbox.
 - **Materialized engineering knowledge**: `resources/features.json` + `resources/skills/*/SKILL.md` (versioned, read-only to the worker) and learned scenarios (additive, versioned, appended to the `learned` suite only after fixture validation).
 - **Episodic experience**: episodes rendered from ledger rows (`renderEpisode`), uploaded via the outbox to the memory adapter under `containerTag = horizon-<mission>`. Superseded episodes are kept but filtered from retrieval.
 - **Raw evidence**: `runs/<mission>/evidence/` and `reports/` on disk; only IDs travel into memory.
@@ -57,7 +57,7 @@ Code: everything under `horizon/` (see PR https://github.com/gpu004/mongomongo/p
 
 ```
 npm run check                      # tsc --noEmit: clean
-npm test                           # 43 tests, 43 pass (test helpers force the local memory adapter so a key in env never routes tests to the hosted service)
+npm test                           # 47 tests, 47 pass (test helpers force the local memory adapter so a key in env never routes tests to the hosted service)
 node scripts/smoke-runner.ts       # seed pass/pass/pass; stale-cache smoke pass, correctness fail, perf fail; bypass structural fail
 node src/cli.ts mission create --config mission.example.json && node src/cli.ts run --mission search-p95-demo   # succeeded
 (Docker) mission search-p95-docker status=succeeded, observed container
