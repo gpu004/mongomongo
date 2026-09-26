@@ -234,6 +234,14 @@ export class PiWorker implements Worker {
         );
     }
     const after = this.session.getSessionStats().tokens;
+    const inputTokens =
+      after.input +
+      after.cacheRead +
+      after.cacheWrite -
+      before.input -
+      before.cacheRead -
+      before.cacheWrite;
+    const outputTokens = after.output - before.output;
     const usage = this.session.getContextUsage();
     if (usage?.percent != null && usage.percent >= this.options.compactionThreshold * 100) {
       text += "\n[segment-rotation-requested]";
@@ -243,9 +251,9 @@ export class PiWorker implements Worker {
       whatChanged: pick(text, "CHANGED") ?? "(worker did not summarize changes)",
       claim: pick(text, "CLAIM") ?? text.slice(-600),
       usage: {
-        inputTokens: after.input - before.input,
-        outputTokens: after.output - before.output,
-        uncertain: after.input === before.input && after.output === before.output,
+        inputTokens,
+        outputTokens,
+        uncertain: inputTokens === 0 && outputTokens === 0,
       },
       seededFixture: null,
       aborted,

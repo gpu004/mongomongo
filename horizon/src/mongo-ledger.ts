@@ -43,6 +43,7 @@ import {
   type TaskRow,
   type VerificationRow,
 } from "./ledger.ts";
+import { decodeEvents, encodeEvents, SNAPSHOT_BATCH_SIZE } from "./event-snapshot.ts";
 import type { MongoEnv } from "./mongo-env.ts";
 
 export const SCHEMA_VERSION = 1;
@@ -63,6 +64,7 @@ export const COLLECTIONS = {
   checkpoints: "checkpoints",
   segments: "segments",
   events: "events",
+  eventSnapshots: "eventSnapshots",
   outbox: "outbox",
   leases: "leases",
   counters: "counters",
@@ -70,6 +72,10 @@ export const COLLECTIONS = {
 
 /** Indexes every Atlas ledger database must carry; `doctor` reports any that are missing. */
 export const REQUIRED_INDEXES: Record<string, IndexDescription[]> = {
+  [COLLECTIONS.eventSnapshots]: [
+    { key: { missionId: 1, fromSeq: 1 }, name: "mission_snapshot_order" },
+    { key: { missionId: 1, eventKeys: 1 }, name: "snapshot_event_key" },
+  ],
   [COLLECTIONS.tasks]: [{ key: { missionId: 1, ordinal: 1 }, name: "mission_ordinal" }],
   [COLLECTIONS.experiments]: [
     { key: { missionId: 1, createdAt: 1, _id: 1 }, name: "mission_history" },
@@ -405,10 +411,29 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async eventsSince(seq: number, limit = 1000): Promise<EventRow[]> {
-    const docs = await this.col(COLLECTIONS.events)
-      .find(this.scoped({ seq: { $gt: seq } }), { sort: { seq: 1 }, limit, ...this.opts })
+    const snapshots = await this.col(COLLECTIONS.eventSnapshots)
+      .find(
+        { missionId: this.missionId, throughSeq: { $gt: seq } },
+        { sort: { fromSeq: 1 }, ...this.opts },
+      )
       .toArray();
-    return docs.map(toEvent);
+    const archived: EventRow[] = [];
+    for (const snapshot of snapshots) {
+      archived.push(
+        ...decodeEvents(Buffer.from(String(snapshot.events), "base64")).filter(
+          (event) => event.seq > seq,
+        ),
+      );
+      if (archived.length >= limit) return archived.slice(0, limit);
+    }
+    const docs = await this.col(COLLECTIONS.events)
+      .find(this.scoped({ seq: { $gt: seq } }), {
+        sort: { seq: 1 },
+        limit: limit - archived.length,
+        ...this.opts,
+      })
+      .toArray();
+    return archived.concat(docs.map(toEvent));
   }
 
   async findEvent(eventKey: string): Promise<EventRow | undefined> {
@@ -416,11 +441,54 @@ export class MongoLedger implements AsyncLedger {
       this.scoped({ _id: eventKey }),
       this.opts,
     );
-    return doc ? toEvent(doc) : undefined;
+    if (doc) return toEvent(doc);
+    const snapshot = await this.col(COLLECTIONS.eventSnapshots).findOne(
+      { missionId: this.missionId, eventKeys: eventKey },
+      this.opts,
+    );
+    return snapshot
+      ? decodeEvents(Buffer.from(String(snapshot.events), "base64")).find(
+          (item) => item.eventKey === eventKey,
+        )
+      : undefined;
   }
 
   async lastEventSeq(): Promise<number> {
     return this.currentSeq("event");
+  }
+
+  async compactEventsBefore(seq: number): Promise<number> {
+    return this.fenced(async (tx) => {
+      const docs = await tx
+        .col(COLLECTIONS.events)
+        .find(tx.scoped({ seq: { $lte: seq } }), {
+          sort: { seq: 1 },
+          limit: SNAPSHOT_BATCH_SIZE,
+          ...tx.opts,
+        })
+        .toArray();
+      if (docs.length === 0) return 0;
+      const events = docs.map(toEvent);
+      await tx.col(COLLECTIONS.eventSnapshots).insertOne(
+        {
+          _id: `${tx.missionId}:${events[0]!.seq}`,
+          missionId: tx.missionId,
+          schemaVersion: SCHEMA_VERSION,
+          fromSeq: events[0]!.seq,
+          throughSeq: events.at(-1)!.seq,
+          eventKeys: events.map((event) => event.eventKey),
+          events: encodeEvents(events).toString("base64"),
+        },
+        tx.opts,
+      );
+      await tx
+        .col(COLLECTIONS.events)
+        .deleteMany(
+          tx.scoped({ seq: { $gte: events[0]!.seq, $lte: events.at(-1)!.seq } }),
+          tx.opts,
+        );
+      return events.length;
+    });
   }
 
   async createMission(row: NewMissionRow): Promise<void> {
@@ -885,6 +953,22 @@ export class MongoLedger implements AsyncLedger {
           { $set: { closedAt: now(), lastEventSeq: await tx.lastEventSeq(), archiveHash } },
           tx.opts,
         );
+    });
+  }
+
+  async setSegmentArchive(missionId: string, ordinal: number, archiveHash: string): Promise<void> {
+    return this.fenced(async (tx) => {
+      const result = await tx.col(COLLECTIONS.segments).updateOne(
+        {
+          _id: segmentId(missionId, ordinal),
+          closedAt: { $ne: null },
+          committed: 1,
+          archiveHash: { $in: [null, archiveHash] },
+        },
+        { $set: { archiveHash } },
+        tx.opts,
+      );
+      if (result.matchedCount !== 1) throw new Error(`segment ${ordinal} cannot be archived`);
     });
   }
 
