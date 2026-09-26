@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "normalization-mixed-case-and-nfc",
+  "suite": "correctness",
+  "description": "Queries match regardless of case and Unicode composition (NFC).",
+  "invariantIds": [
+    "INV-NORMALIZE"
+  ],
+  "sequence": [
+    {
+      "op": "insert",
+      "id": "cafe-1",
+      "title": "Café menu",
+      "body": "Espresso and CROISSANT"
+    },
+    {
+      "op": "insert",
+      "id": "plain",
+      "title": "Tea",
+      "body": "green"
+    },
+    {
+      "op": "search",
+      "q": "CAFÉ"
+    },
+    {
+      "op": "search",
+      "q": "café"
+    },
+    {
+      "op": "search",
+      "q": "croissant"
+    },
+    {
+      "op": "search",
+      "q": "Kaffee"
+    }
+  ],
+  "example": "GET /search?q=cafe%CC%81 -> {ids:[\"cafe-1\"]}"
+}

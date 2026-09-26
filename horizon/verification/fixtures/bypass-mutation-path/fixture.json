@@ -1,0 +1,8 @@
+{
+  "fixtureId": "bypass-mutation-path",
+  "kind": "fault-injection",
+  "label": "SEEDED FAULT: HTTP layer mutates DocumentStore directly, bypassing DocumentService",
+  "description": "Overlay applied on top of the seed. The structural import-boundary check must reject it before any scenario runs.",
+  "expectedFailures": ["STRUCT-IMPORT-BOUNDARY"],
+  "overlayDir": "overlay"
+}

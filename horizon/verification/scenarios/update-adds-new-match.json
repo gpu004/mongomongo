@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "update-adds-new-match",
+  "suite": "correctness",
+  "description": "After an update, new content matches and the document keeps its insertion position.",
+  "invariantIds": [
+    "INV-UPDATE-VISIBILITY",
+    "INV-RESULT-ORDER"
+  ],
+  "sequence": [
+    {
+      "op": "insert",
+      "id": "p1",
+      "title": "first",
+      "body": "shared"
+    },
+    {
+      "op": "insert",
+      "id": "p2",
+      "title": "second",
+      "body": "shared"
+    },
+    {
+      "op": "search",
+      "q": "shared"
+    },
+    {
+      "op": "update",
+      "id": "p1",
+      "title": "renamed"
+    },
+    {
+      "op": "search",
+      "q": "renamed"
+    },
+    {
+      "op": "search",
+      "q": "shared"
+    },
+    {
+      "op": "update",
+      "id": "ghost",
+      "title": "x"
+    }
+  ],
+  "example": "GET /search?q=shared after PATCH p1 -> {ids:[\"p1\",\"p2\"]}"
+}

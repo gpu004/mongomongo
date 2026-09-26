@@ -1,0 +1,215 @@
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import type { Operation } from "../verification/reference-model.ts";
+import type { Suite, VerificationReport } from "../verification/reports.ts";
+import type { FileEvidenceStore } from "./mission-paths.ts";
+
+export interface RecallResult {
+	episodeId: string;
+	summary: string;
+	evidenceIds: string[];
+	artifactHash: string;
+	filteredOut?: string;
+}
+
+export interface BrokerHooks {
+	/** Fixed runner on the current candidate workspace snapshot; the broker never scores anything itself. */
+	verify(suite: Suite): Promise<{ report: VerificationReport; reportPath: string }>;
+	profile(scenario: string): Promise<{ evidenceId: string; summary: string }>;
+	recall(query: string, limit: number): Promise<RecallResult[]>;
+	proposeRegression(proposal: { scenarioId: string; invariantId: string; description: string; sequence: Operation[] }): Promise<{ accepted: boolean; reason: string; lessonId?: string }>;
+	/** Called on every finalized tool call so the ledger sees events as they happen, not at agent_settled. */
+	onToolEvent(name: string, params: unknown, summary: string): void;
+}
+
+export interface ExecResult {
+	exitCode: number | null;
+	stdout: string;
+	stderr: string;
+	truncated: boolean;
+	timedOut: boolean;
+	evidenceId: string;
+}
+
+const MAX_READ_CHARS = 20000;
+const MAX_EXEC_CHARS = 8000;
+const ALLOWED_EXEC = new Set(["node", "ls", "cat", "wc", "grep"]);
+
+/**
+ * The only component that touches the candidate workspace or launches candidate
+ * processes. Every path is confined to `workspaceDir`; anything else (harness,
+ * verification, judge files) is denied by construction, not by convention.
+ */
+export class ToolBroker {
+	readonly workspaceDir: string;
+	readonly evidence: FileEvidenceStore;
+	readonly hooks: BrokerHooks;
+	private readonly deadline: () => number;
+	private readonly children = new Set<ReturnType<typeof spawn>>();
+
+	constructor(workspaceDir: string, evidence: FileEvidenceStore, hooks: BrokerHooks, deadline: () => number) {
+		this.workspaceDir = resolve(workspaceDir);
+		this.evidence = evidence;
+		this.hooks = hooks;
+		this.deadline = deadline;
+	}
+
+	/** Resolve a workspace-relative path; rejects traversal, absolute paths and symlink escapes. */
+	resolveInside(relPath: string): string {
+		if (relPath.startsWith("/") || relPath.includes("\0")) throw new Error(`path denied: ${relPath}`);
+		const full = resolve(this.workspaceDir, relPath);
+		const rel = relative(this.workspaceDir, full);
+		if (rel.startsWith("..") || rel.split(sep).includes("..")) throw new Error(`path escapes candidate workspace: ${relPath}`);
+		if (rel.split(sep).includes("node_modules")) throw new Error(`path denied: ${relPath}`);
+		return full;
+	}
+
+	private checkDeadline(): void {
+		if (Date.now() > this.deadline()) throw new Error("cycle deadline exceeded");
+	}
+
+	workspaceRead(path: string): { path: string; content: string; truncated: boolean } {
+		this.checkDeadline();
+		const full = this.resolveInside(path);
+		if (!existsSync(full) || statSync(full).isDirectory()) throw new Error(`not a file: ${path}`);
+		const content = readFileSync(full, "utf8");
+		this.hooks.onToolEvent("workspace_read", { path }, `${content.length} chars`);
+		return { path, content: content.slice(0, MAX_READ_CHARS), truncated: content.length > MAX_READ_CHARS };
+	}
+
+	workspaceSearch(pattern: string, maxResults = 50): { file: string; line: number; text: string }[] {
+		this.checkDeadline();
+		const regex = new RegExp(pattern);
+		const results: { file: string; line: number; text: string }[] = [];
+		const walk = (dir: string) => {
+			for (const entry of readdirSync(dir).sort()) {
+				if (entry === "node_modules" || entry.startsWith(".")) continue;
+				const full = join(dir, entry);
+				if (statSync(full).isDirectory()) walk(full);
+				else if (entry.endsWith(".ts") || entry.endsWith(".json") || entry.endsWith(".md")) {
+					const lines = readFileSync(full, "utf8").split("\n");
+					lines.forEach((text, index) => {
+						if (results.length < maxResults && regex.test(text)) results.push({ file: relative(this.workspaceDir, full), line: index + 1, text: text.slice(0, 200) });
+					});
+				}
+			}
+		};
+		walk(this.workspaceDir);
+		this.hooks.onToolEvent("workspace_search", { pattern }, `${results.length} hits`);
+		return results;
+	}
+
+	listFiles(): string[] {
+		const out: string[] = [];
+		const walk = (dir: string) => {
+			for (const entry of readdirSync(dir).sort()) {
+				if (entry === "node_modules" || entry === ".manifest.json") continue;
+				const full = join(dir, entry);
+				if (statSync(full).isDirectory()) walk(full);
+				else out.push(relative(this.workspaceDir, full));
+			}
+		};
+		walk(this.workspaceDir);
+		return out;
+	}
+
+	/** Exact-string replacement or whole-file write. `oldText` must occur exactly once when given. */
+	workspaceEdit(path: string, edit: { oldText: string; newText: string } | { content: string }): { path: string; bytes: number } {
+		this.checkDeadline();
+		const full = this.resolveInside(path);
+		if (!path.startsWith("src/")) throw new Error("edits are limited to src/ inside the candidate");
+		let next: string;
+		if ("content" in edit) {
+			next = edit.content;
+		} else {
+			if (!existsSync(full)) throw new Error(`not a file: ${path}`);
+			const current = readFileSync(full, "utf8");
+			const first = current.indexOf(edit.oldText);
+			if (first === -1) throw new Error("oldText not found");
+			if (current.indexOf(edit.oldText, first + 1) !== -1) throw new Error("oldText is not unique");
+			next = current.slice(0, first) + edit.newText + current.slice(first + edit.oldText.length);
+		}
+		mkdirSync(dirname(full), { recursive: true });
+		writeFileSync(full, next);
+		this.hooks.onToolEvent("workspace_edit", { path }, `${next.length} chars`);
+		return { path, bytes: Buffer.byteLength(next) };
+	}
+
+	/** Bounded command in the candidate workspace. Only a small allowlist; no shell. */
+	workspaceExec(command: string, args: string[], timeoutMs: number): Promise<ExecResult> {
+		this.checkDeadline();
+		if (!ALLOWED_EXEC.has(command)) return Promise.reject(new Error(`command not allowed: ${command}`));
+		for (const arg of args) {
+			if (arg.startsWith("/") || arg.includes("..")) return Promise.reject(new Error(`argument denied: ${arg}`));
+		}
+		const executable = command === "node" ? process.execPath : command;
+		const remaining = Math.max(1000, Math.min(timeoutMs, this.deadline() - Date.now()));
+		return new Promise((resolvePromise) => {
+			const child = spawn(executable, args, { cwd: this.workspaceDir, env: { PATH: process.env.PATH ?? "" }, stdio: ["ignore", "pipe", "pipe"] });
+			this.children.add(child);
+			let stdout = "";
+			let stderr = "";
+			let timedOut = false;
+			child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+			child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+			const timer = setTimeout(() => {
+				timedOut = true;
+				child.kill("SIGKILL");
+			}, remaining);
+			child.on("close", (exitCode) => {
+				clearTimeout(timer);
+				this.children.delete(child);
+				const evidenceId = this.evidence.write("exec", { command, args, exitCode, stdout, stderr, timedOut });
+				const truncated = stdout.length > MAX_EXEC_CHARS || stderr.length > MAX_EXEC_CHARS;
+				this.hooks.onToolEvent("workspace_exec", { command, args }, `exit ${exitCode} ${evidenceId}`);
+				resolvePromise({ exitCode, stdout: stdout.slice(0, MAX_EXEC_CHARS), stderr: stderr.slice(0, MAX_EXEC_CHARS), truncated, timedOut, evidenceId });
+			});
+		});
+	}
+
+	async verifyCandidate(suite: Suite): Promise<{ reportId: string; status: string; failed: string[]; metrics: VerificationReport["metrics"]; infraMessage?: string }> {
+		this.checkDeadline();
+		const { report } = await this.hooks.verify(suite);
+		const failed = report.assertions.filter((a) => !a.passed).map((a) => `${a.id}: ${a.detail ?? ""} [${a.evidenceId}]`);
+		this.hooks.onToolEvent("verify_candidate", { suite }, `${report.status} ${report.reportId}`);
+		const result: { reportId: string; status: string; failed: string[]; metrics: VerificationReport["metrics"]; infraMessage?: string } = { reportId: report.reportId, status: report.status, failed, metrics: report.metrics };
+		if (report.infraMessage !== undefined) result.infraMessage = report.infraMessage;
+		return result;
+	}
+
+	async profileCandidate(scenario: string): Promise<{ evidenceId: string; summary: string }> {
+		this.checkDeadline();
+		const result = await this.hooks.profile(scenario);
+		this.hooks.onToolEvent("profile_candidate", { scenario }, result.evidenceId);
+		return result;
+	}
+
+	async recallHistory(query: string, limit = 5): Promise<RecallResult[]> {
+		this.checkDeadline();
+		const results = await this.hooks.recall(query, Math.min(Math.max(limit, 1), 12));
+		this.hooks.onToolEvent("recall_history", { query }, results.map((r) => r.episodeId).join(","));
+		return results;
+	}
+
+	readEvidence(evidenceId: string): { evidenceId: string; excerpt: string; truncated: boolean } {
+		this.checkDeadline();
+		const found = this.evidence.read(evidenceId);
+		if (!found) throw new Error(`unknown evidence id: ${evidenceId}`);
+		this.hooks.onToolEvent("read_evidence", { evidenceId }, `${found.excerpt.length} chars`);
+		return found;
+	}
+
+	async proposeRegression(proposal: { scenarioId: string; invariantId: string; description: string; sequence: Operation[] }): Promise<{ accepted: boolean; reason: string; lessonId?: string }> {
+		this.checkDeadline();
+		const result = await this.hooks.proposeRegression(proposal);
+		this.hooks.onToolEvent("propose_regression", { scenarioId: proposal.scenarioId }, result.accepted ? `accepted ${result.lessonId ?? ""}` : `rejected: ${result.reason}`);
+		return result;
+	}
+
+	/** Deadline or abort: kill anything the worker started. */
+	terminateChildren(): void {
+		for (const child of this.children) child.kill("SIGKILL");
+		this.children.clear();
+	}
+}

@@ -1,0 +1,8 @@
+{
+  "fixtureId": "stale-cache",
+  "kind": "fault-injection",
+  "label": "SEEDED FAULT: query-keyed cache without invalidation",
+  "description": "Overlay applied on top of the seed. Faster on repeated queries but returns pre-update and deleted documents.",
+  "expectedFailures": ["INV-UPDATE-VISIBILITY", "INV-DELETE-VISIBILITY"],
+  "overlayDir": "overlay"
+}
