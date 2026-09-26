@@ -30,6 +30,34 @@ export function repetitionSpread(reps: number[] | undefined): number {
   return median > 0 ? (sorted.at(-1)! - sorted[0]!) / median : 0;
 }
 
+export type NoiseFloorDecision =
+  | { kind: "frozen"; acceptanceMargin: number; raised: boolean }
+  | { kind: "repair"; reason: string };
+
+/**
+ * HACKATHON_PLAN §14: the margin frozen for the mission must exceed the noise
+ * observed during baseline setup. When the spread stays under the configured
+ * margin, the configured margin is frozen as-is; when it exceeds it but is
+ * still below `maxRepetitionSpread`, the margin is raised to the spread rounded
+ * up to 0.1%; beyond that ceiling no margin can distinguish a useful change and
+ * the workload or environment must be repaired before optimization.
+ */
+export function freezeAcceptanceMargin(
+  configuredMargin: number,
+  spread: number,
+  maxRepetitionSpread: number,
+): NoiseFloorDecision {
+  if (spread >= maxRepetitionSpread)
+    return {
+      kind: "repair",
+      reason: `baseline repetition spread ${(spread * 100).toFixed(1)}% reaches the ${(maxRepetitionSpread * 100).toFixed(1)}% ceiling; repair the workload or environment before optimizing`,
+    };
+  if (spread <= configuredMargin)
+    return { kind: "frozen", acceptanceMargin: configuredMargin, raised: false };
+  const raised = Math.ceil(Math.round(spread * 1e6) / 1000) / 1000;
+  return { kind: "frozen", acceptanceMargin: raised, raised: true };
+}
+
 export function firstComparison(
   candidate: ReportMetrics,
   bestP95: number | null,

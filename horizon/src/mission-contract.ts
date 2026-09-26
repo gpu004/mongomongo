@@ -15,6 +15,12 @@ export interface MissionConfig {
   targetP95Reduction: number;
   /** Fractional improvement over the current best required to accept, floor 0.05. */
   acceptanceMargin: number;
+  /**
+   * Baseline repetition spread at or above which the mission is blocked before optimization
+   * instead of raising the frozen margin. Defaults to `targetP95Reduction`: noise as large as
+   * the target cannot distinguish a useful change.
+   */
+  maxRepetitionSpread?: number;
   /** Of the paired repetitions, how many must improve (e.g. 4 of 5). */
   requiredImprovedRepetitions: number;
   workload: WorkloadSpec;
@@ -72,6 +78,13 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     fail("targetP95Reduction must be in (0,1)");
   if (typeof c.acceptanceMargin !== "number" || c.acceptanceMargin < 0.05)
     fail("acceptanceMargin floor is 0.05");
+  if (
+    c.maxRepetitionSpread !== undefined &&
+    (typeof c.maxRepetitionSpread !== "number" ||
+      c.maxRepetitionSpread <= 0 ||
+      c.maxRepetitionSpread > 1)
+  )
+    fail("maxRepetitionSpread must be in (0,1]");
   if (typeof c.requiredImprovedRepetitions !== "number")
     fail("requiredImprovedRepetitions required");
   if (!c.workload || !c.holdoutWorkload) fail("workload and holdoutWorkload required");
