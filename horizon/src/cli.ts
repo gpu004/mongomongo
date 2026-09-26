@@ -67,7 +67,10 @@ const { values, positionals } = parseArgs({
 const runsRoot = values["runs-root"] ? resolve(values["runs-root"]) : RUNS_ROOT;
 const log = (line: string) => console.log(line);
 
-function loadMission(): { config: MissionConfig; paths: ReturnType<typeof missionPaths> } {
+function loadMission(): {
+  config: MissionConfig;
+  paths: ReturnType<typeof missionPaths>;
+} {
   const missionId = values.mission;
   if (!missionId) throw new Error("--mission is required");
   const paths = missionPaths(missionId, runsRoot);
@@ -75,7 +78,9 @@ function loadMission(): { config: MissionConfig; paths: ReturnType<typeof missio
     throw new Error(
       `mission ${missionId} not found under ${runsRoot}; run 'horizon mission create'`,
     );
-  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8")) as { config: MissionConfig };
+  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8")) as {
+    config: MissionConfig;
+  };
   return { config: manifest.config, paths };
 }
 
@@ -83,6 +88,10 @@ function makeWorker(config: MissionConfig, paths: ReturnType<typeof missionPaths
   if (config.worker === "scripted") return new ScriptedWorker();
   const envKey = `${config.model.provider.toUpperCase().replace(/-/g, "_")}_API_KEY`;
   const apiKey = process.env[envKey];
+  if (!apiKey)
+    throw new Error(
+      `worker "pi" with provider ${config.model.provider} requires ${envKey} in the environment (set it, or use "worker": "scripted")`,
+    );
   return new PiWorker({
     workspaceDir: paths.candidate,
     agentDir: join(paths.root, "pi-agent"),
@@ -91,7 +100,7 @@ function makeWorker(config: MissionConfig, paths: ReturnType<typeof missionPaths
     provider: config.model.provider,
     modelId: config.model.id,
     compactionThreshold: 0.7,
-    ...(apiKey ? { apiKey } : {}),
+    apiKey,
   });
 }
 
@@ -315,9 +324,12 @@ async function main(): Promise<number> {
       const root = values["runs-root"]
         ? resolve(values["runs-root"])
         : mkdtempSync(join(tmpdir(), "horizon-compare-"));
+      // Resolve the worker up front so a missing credential fails before any mission is created.
+      makeWorker(base, missionPaths(base.missionId, root));
       const result = await compareConfigurations({
         runsRoot: root,
         base: { ...base, segmentRotationCycles: 1 },
+        workerFactory: (_configuration, config, paths) => makeWorker(config, paths),
         // Same schedule for every configuration: crash right after the first candidate snapshot, then resume to completion.
         interruptions: [{ crashAt: "snapshot_ready" }, { crashAt: null }],
         repeats: values.repeats ? Number(values.repeats) : 1,

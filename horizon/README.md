@@ -52,4 +52,4 @@ Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artif
 
 ## Configuration comparison and report
 
-`node src/cli.ts compare --config mission.example.json [--repeats N]` runs the three memory configurations (durable only, +retrieval, +validated correction) from the same seed under one crash schedule and writes `comparison.{json,md}`. Findings and limitations against `LONG_HORIZON_AGENT_PROMPT.md` are in `REPORT.md`.
+`node src/cli.ts compare --config mission.example.json [--repeats N]` runs the three memory configurations (durable only, +retrieval, +validated correction) from the same seed under one crash schedule and writes `comparison.{json,md}`. It honours `worker` and memory settings from the config: `"worker": "pi"` runs the Pi worker (and fails up front without the provider API key), and a `SUPERMEMORY_API_KEY` selects the hosted adapter for the memory-enabled configurations. Findings and limitations against `LONG_HORIZON_AGENT_PROMPT.md` are in `REPORT.md`.
