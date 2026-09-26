@@ -395,6 +395,16 @@ export class DockerSandbox implements Sandbox {
 		return execFileAsync(this.docker, ["rm", "-f", name], { timeout: 20_000 }).then(() => {}, () => {});
 	}
 
+	/** `rm -f` racing another removal can return early; wait until the container is really gone. */
+	private async killAndWait(name: string): Promise<void> {
+		for (let i = 0; i < 50; i += 1) {
+			await this.kill(name);
+			const gone = await execFileAsync(this.docker, ["inspect", "--format", "{{.Id}}", name], { timeout: 10_000 }).then(() => false, () => true);
+			if (gone) return;
+			await new Promise((r) => setTimeout(r, 200));
+		}
+	}
+
 	exec(request: ExecRequest): Promise<ExecOutcome> {
 		const name = sandboxName(request.scope);
 		const workspace = realpathSync(request.workspaceDir);
@@ -405,7 +415,7 @@ export class DockerSandbox implements Sandbox {
 			child.kill("SIGKILL");
 		};
 		return runBounded(child, request, this.limits.maxOutputBytes, kill, name).then(async (outcome) => {
-			if (outcome.timedOut || outcome.aborted) await this.kill(name);
+			if (outcome.timedOut || outcome.aborted) await this.killAndWait(name);
 			return outcome;
 		});
 	}
@@ -458,7 +468,7 @@ export class DockerSandbox implements Sandbox {
 	}
 
 	remove(sandboxId: string): Promise<void> {
-		return this.kill(sandboxId);
+		return this.killAndWait(sandboxId);
 	}
 
 	async cleanupOrphans(missionId: string, keep: ReadonlySet<string> = new Set()): Promise<string[]> {

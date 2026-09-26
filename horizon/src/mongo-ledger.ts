@@ -751,6 +751,7 @@ export async function probeMongo(uri: string, dbName: string): Promise<ProbeResu
 		store = await MongoLedgerStore.connect({ uri, dbName, missionId: probeMission, serverSelectionTimeoutMS: 8000 });
 		const missingIndexes: string[] = [];
 		for (const name of COLLECTIONS) {
+			if (INDEXES[name].length === 0) continue;
 			const have = new Set((await client.db(dbName).collection(name).listIndexes().toArray()).map((i) => String(i.name)));
 			for (const spec of INDEXES[name]) if (!have.has(spec.name)) missingIndexes.push(`${name}.${spec.name}`);
 		}
@@ -772,7 +773,7 @@ export async function probeMongo(uri: string, dbName: string): Promise<ProbeResu
 			add("transaction", committed && aborted, committed && aborted ? "commit visible, abort rolled back" : `commit=${committed} rollback=${aborted}`);
 		}
 	} catch (error) {
-		add("connect", false, redactMessage(error, uri));
+		add(checks.length === 0 ? "connect" : "probe", false, redactMessage(error, uri));
 	} finally {
 		for (const name of COLLECTIONS) await client.db(dbName).collection(name).deleteMany(name === "missions" ? { _id: probeMission as unknown as Document["_id"] } : { missionId: probeMission }).catch(() => {});
 		await store?.close().catch(() => {});
