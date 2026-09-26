@@ -8,15 +8,20 @@ import type { DocumentStore } from "../storage/document-store.ts";
 
 interface IndexedDocument {
 	id: string;
+	title: string;
+	body: string;
 	haystack: string;
 }
 
 /**
- * Pre-normalized haystacks, rebuilt lazily after any mutation. Correctness
- * relies on DocumentService calling invalidate() after every write.
+ * Pre-normalized haystacks, reconciled incrementally after any mutation:
+ * only documents whose title or body changed are re-normalized, so a
+ * mutation costs O(n) cheap comparisons instead of O(n) normalizations.
+ * Correctness relies on DocumentService calling invalidate() after every write.
  */
 export class SearchEngine {
 	private readonly store: DocumentStore;
+	private readonly cache = new Map<string, IndexedDocument>();
 	private index: IndexedDocument[] | null = null;
 	private indexedVersion = -1;
 
@@ -30,7 +35,16 @@ export class SearchEngine {
 
 	private current(): IndexedDocument[] {
 		if (this.index === null || this.indexedVersion !== this.store.version) {
-			this.index = this.store.all().map((document) => ({ id: document.id, haystack: normalizeText(\`\${document.title} \${document.body}\`) }));
+			const seen = new Set<string>();
+			this.index = this.store.all().map((document) => {
+				seen.add(document.id);
+				const cached = this.cache.get(document.id);
+				if (cached && cached.title === document.title && cached.body === document.body) return cached;
+				const entry: IndexedDocument = { id: document.id, title: document.title, body: document.body, haystack: normalizeText(\`\${document.title} \${document.body}\`) };
+				this.cache.set(document.id, entry);
+				return entry;
+			});
+			for (const id of this.cache.keys()) if (!seen.has(id)) this.cache.delete(id);
 			this.indexedVersion = this.store.version;
 		}
 		return this.index;
@@ -105,8 +119,8 @@ export class ScriptedWorker implements Worker {
 			const smoke = await broker.verifyCandidate("smoke");
 			const correctness = smoke.status === "passed" ? await broker.verifyCandidate("correctness") : null;
 			return {
-				hypothesis: "pre-normalize document text once per mutation version instead of per query",
-				whatChanged: "SearchEngine keeps a lazily rebuilt normalized index; invalidate() drops it",
+				hypothesis: "pre-normalize document text once per document change instead of per query or per mutation",
+				whatChanged: "SearchEngine keeps an incrementally reconciled normalized index; invalidate() marks it stale and only changed documents are re-normalized",
 				claim: `smoke ${smoke.status}; correctness ${correctness?.status ?? "not run"}`,
 				usage,
 				seededFixture: null,
@@ -119,7 +133,7 @@ export class ScriptedWorker implements Worker {
 
 	private stepFor(packet: string, cycle: number): "stale-cache" | "normalized-index" | "exhausted" {
 		const triedStale = packet.includes("seeded fault-injection fixture: stale-cache") || packet.includes("SEEDED FAULT-INJECTION FIXTURE: stale-cache");
-		const triedIndex = packet.includes("lazily rebuilt normalized index");
+		const triedIndex = packet.includes("incrementally reconciled normalized index");
 		if (!triedStale && cycle <= 2) return "stale-cache";
 		if (!triedIndex) return "normalized-index";
 		return "exhausted";

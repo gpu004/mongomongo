@@ -36,6 +36,7 @@ export interface MissionMeasurement {
 	bestP95Ms: number | null;
 	experiments: number;
 	rejected: number;
+	inconclusive: number;
 	repeatedFailures: number;
 	crashes: number;
 	recoveries: number;
@@ -121,6 +122,7 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
 					bestP95Ms: mission.bestP95Ms,
 					experiments: experiments.length,
 					rejected: experiments.filter((e) => e.status === "rejected").length,
+					inconclusive: experiments.filter((e) => e.status === "inconclusive").length,
 					repeatedFailures,
 					crashes,
 					recoveries: events.filter((e) => e.type === "controller.recovered").length,
@@ -154,6 +156,7 @@ export function renderComparison(result: CompareResult): string {
 		["best p95", (m) => fmt(m.bestP95Ms)],
 		["experiments", (m) => String(m.experiments)],
 		["rejected", (m) => String(m.rejected)],
+		["inconclusive", (m) => String(m.inconclusive)],
 		["repeated failures", (m) => String(m.repeatedFailures)],
 		["crashes/recoveries", (m) => `${m.crashes}/${m.recoveries}`],
 		["retrieved (injected/filtered)", (m) => `${m.retrievalInjected}/${m.retrievalFilteredOut}`],

@@ -47,6 +47,7 @@ Baseline measurements the prompt asks for that are **not** available: cost in cu
 | 13 | Retrieval: FTS5 ledger index, IDF re-rank, local merge of anything the remote search missed | Correct answers while indexing lags and when remote recall misses | Memory bench 100k episodes 200/200; hosted probe 32/32 during indexing | Local search cost (p95 167 ms at 100k) | Bench + tests | revert |
 | 14 | Hosted search fix: `containerTags: [tag]` | Hosted search returned **0 results** with singular `containerTag` + `includeFullDocs` | First hosted probe: 0 remote hits; after fix 17/20 answers served remotely | none | Probe | revert |
 | 15 | Skill eval (`horizon skill-eval`) | Grades worker behaviour on fixed fixtures, not prose | Scripted worker 9/10 (does not read failing evidence) | Fixtures are few | Test | n/a |
+| 16 | Incremental index reconciliation in the scripted worker's correct candidate (`src/scripted-worker.ts`) | Removes the full-rebuild latency spike that dominated p95 under a 5% mutation ratio | Before: 3/3 diagnostic missions on this VM missed the target (2.72→2.51 ms, 2.71→3.07 ms, 2.50→2.52 ms) and `recovery.test.ts` failed 3/6; after: 2.58→0.89 ms, 3/3 paired repetitions, all tests pass | none (candidate code only; the evaluator is unchanged) | Diagnostic missions + full suite | Revert the constant |
 
 Not done, kept as separate proposals: multi-worker orchestration, model changes, unrestricted self-modification, deployments.
 
@@ -73,7 +74,9 @@ Not run: Pi worker against a live model (no `ANTHROPIC_API_KEY`); any workload l
 ## 5. Results
 
 ### Before/after (single mission, subprocess)
-Baseline p95 1.83 ms → accepted candidate 1.25 ms (3/3 paired repetitions improved, holdout passed). Docker: 2.57 ms → 1.68 ms.
+Original run: baseline p95 1.83 ms → accepted candidate 1.25 ms (3/3 paired repetitions improved, holdout passed). Docker: 2.57 ms → 1.68 ms.
+
+After the incremental-index change (second VM, slower baseline): baseline 1.90 ms (repetition spread 16.4%) → accepted candidate 0.75 ms (−60%, 3/3 paired repetitions improved, holdout passed, 2 experiments, 11 s wall). The root cause of the earlier near-miss was measured, not assumed: with a 5% mutation ratio roughly every twentieth search followed a write and paid a full O(n) re-normalization, so the 95th percentile *was* the rebuild cost. Reconciling only changed documents removes that spike; the evaluator, workload and contract are unchanged.
 
 ### Configuration comparison (`horizon compare`, one run each, identical seed `b6502a00934a`, evaluator `7cae47a2f268`, schedule: crash at `snapshot_ready`, then resume; segment rotation every cycle so that "recent history" is genuinely bounded)
 
@@ -83,7 +86,17 @@ Baseline p95 1.83 ms → accepted candidate 1.25 ms (3/3 paired repetitions impr
 | durable+retrieval | succeeded | reached | 2 | 1 | 0 | 1/2 | 1 | 1886 | 6 | 0 |
 | durable+retrieval+correction | blocked | missed | 3 | 1 | 0 | 1/2 | 3 | 2232 | 7 | 1 |
 
-Reading: with bounded recent history alone, after the segment rotated the worker re-tried the already-rejected stale-cache idea (one wasted experiment). Retrieval brought the older episode back and avoided the repeat. The third configuration's "blocked" is a **timing miss, not a correctness or memory failure**: its accepted candidate measured 1.33 ms against a required 1.14 ms (only 2/3 repetitions improved) — the 30% target is close to the noise floor of this workload on this VM. The scripted worker is deterministic, so the experiment-count difference is real but small; the honest claim is "retrieval prevents the one scripted repeat", not a general effect size.
+Reading: with bounded recent history alone, after the segment rotated the worker re-tried the already-rejected stale-cache idea (one wasted experiment). Retrieval brought the older episode back and avoided the repeat. The third configuration's "blocked" was a **timing miss, not a correctness or memory failure**: its accepted candidate measured 1.33 ms against a required 1.14 ms (only 2/3 repetitions improved) — the 30% target was close to the noise floor of this workload on this VM. The scripted worker is deterministic, so the experiment-count difference is real but small; the honest claim is "retrieval prevents the one scripted repeat", not a general effect size.
+
+Re-run after change 16 (same seed `b6502a00934a`, evaluator `7cae47a2f268`, same schedule, one run each):
+
+| configuration | status | target | baseline p95 | best p95 | experiments | rejected | inconclusive | repeated failures | crashes/recoveries | retrieved | max packet tokens | memory ops | materialized checks |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| durable-only | succeeded | reached | 1.819ms | 0.732ms | 3 | 2 | 0 | **1** | 1/2 | 0 | 1555 | 0 | 0 |
+| durable+retrieval | succeeded | reached | 2.009ms | 0.921ms | 2 | 1 | 0 | 0 | 1/2 | 1 | 1887 | 6 | 0 |
+| durable+retrieval+correction | succeeded | reached | 1.924ms | 0.727ms | 2 | 1 | 0 | 0 | 1/2 | 1 | 1892 | 6 | 1 |
+
+All three configurations now reach the target; the retrieval effect (one avoided repeat) is unchanged.
 
 ### Interruption tests (all pass, `test/recovery.test.ts`)
 Crash during edits → experiment interrupted, workspace restored; crash after snapshot → same snapshot evaluated; crash between report file and ledger commit → report reconciled from disk, not rerun; checkpoints/segments committed; idempotent rerun under lock; frozen-identity drift refused.
@@ -144,7 +157,7 @@ Every report under `runs/<mission>/reports/` carries `missionId`, `experimentId`
 
 - **Unmeasured**: live LLM worker behaviour (the whole "model repeats mistakes" story is exercised only through the scripted worker; no `ANTHROPIC_API_KEY`); hosted Supermemory beyond 20 episodes; `compare` against the hosted adapter (it uses the local adapter); token cost (estimated only). Largest tested history: 100k episodes / 15.3M archived tokens (synthetic, local). No billion-token or multi-hour claim is made.
 - **Skill eval**: the scripted worker does not read the failing assertion evidence before moving on (9/10); a live worker should be graded with `horizon skill-eval --config <pi mission>`.
-- **Known weakness**: the 30% p95 target on the example workload is near the noise floor of this VM (one of three comparison runs missed it with a correct, faster candidate). Either lengthen `measuredRequests`/`repetitions` or lower the target when running on shared hardware.
+- **Addressed weakness**: the 30% p95 target was previously near the noise floor because the scripted candidate's full index rebuild landed in the top 5% of samples (one of three comparison runs missed it with a correct, faster candidate). That is fixed in the candidate (change 16); the residual risk is shared-hardware noise, which the baseline spread warning (change 10) exposes: lengthen `measuredRequests`/`repetitions` when it fires.
 - **Isolation**: `subprocess` mode is cooperative; only `container` mode enforces limits, and it was run manually, not in tests.
 - **Learning**: this is evidence-based strategy selection with materialized checks, not reinforcement learning; no weights change.
 - **Next experiment**: run `horizon compare --repeats 5` with the Pi worker on a real model and a seeded distractor set (irrelevant and stale episodes injected into the memory scope) to measure stale-fact errors and retrieval precision per mission — the harness records `filteredOut` reasons and injected IDs per packet already, so only the distractor generator and a credential are missing.
