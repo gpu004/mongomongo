@@ -28,6 +28,23 @@ export interface PiWorkerOptions {
   compactionThreshold: number;
 }
 
+/** Provider-specific aliases accepted alongside `<PROVIDER>_API_KEY`. */
+const PROVIDER_KEY_ALIASES: Record<string, string[]> = {
+  google: ["GEMINI_API_KEY"],
+};
+
+export function resolveProviderApiKey(
+  provider: string,
+  env: NodeJS.ProcessEnv,
+): { apiKey: string | undefined; envKeys: string[] } {
+  const envKeys = [
+    `${provider.toUpperCase().replace(/-/g, "_")}_API_KEY`,
+    ...(PROVIDER_KEY_ALIASES[provider] ?? []),
+  ];
+  const found = envKeys.find((k) => env[k]);
+  return { apiKey: found ? env[found] : undefined, envKeys };
+}
+
 const SYSTEM_PROMPT = `You are the Horizon worker for one bounded optimization mission on a small TypeScript document-search service.
 
 Rules that are enforced by the host, not by you:
