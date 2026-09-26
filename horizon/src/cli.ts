@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { constants as osConstants, hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { Suite } from "../verification/reports.ts";
@@ -24,6 +24,7 @@ import { evaluateLiveGate, exportLiveGate, renderLiveGate } from "./live-gate.ts
 import { renderMemoryBench, runMemoryBench, type MemoryBenchResult } from "./memory-bench.ts";
 import { loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
 import { FileEvidenceStore, missionPaths, RUNS_ROOT } from "./mission-paths.ts";
+import { clearControl, readControl, writeControl } from "./operator-control.ts";
 import { PiWorker, resolveProviderApiKey } from "./pi-worker.ts";
 import { exportMission, renderProgress, summarize } from "./progress.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
@@ -34,8 +35,10 @@ const USAGE = `horizon <command> [options]
 
   doctor [--config mission.json]           check node, sqlite, mongodb, docker, seed, evaluator hash, provider API key
   mission create --config mission.json     freeze identities and import the seed
-  run --mission M [--cycles N]             run (or resume) the mission loop
-  resume --mission M                       alias of run
+  run --mission M [--cycles N]             run (or resume) the mission loop; SIGINT/SIGTERM stops it gracefully
+  resume --mission M                       clear a pause, then run
+  stop --mission M                         ask the running controller to stop after in-flight work (exit 0)
+  pause --mission M                        like stop, but the mission stays paused until \`resume\`
   verify --mission M --artifact A --suite smoke|correctness|performance|holdout|learned|structural
   profile --mission M --scenario search-read-heavy [--artifact A]
   features check --artifact A|--dir DIR    structural import-boundary check + feature-map reference check
@@ -70,6 +73,40 @@ const { values, positionals } = parseArgs({
 });
 
 const runsRoot = values["runs-root"] ? resolve(values["runs-root"]) : RUNS_ROOT;
+
+/** After the first signal a graceful stop has this long before the process is forced out. */
+const SHUTDOWN_GRACE_MS = Number(process.env.HORIZON_SHUTDOWN_GRACE_MS ?? 60_000);
+
+/**
+ * First SIGINT/SIGTERM: graceful stop (abort the worker and broker children, finish
+ * in-flight ledger work, checkpoint, release the lease, exit 0). A second signal, or
+ * a stop that outlives the grace period, forces exit with the conventional 128+signal code.
+ */
+function installShutdownSignals(controller: MissionController): () => void {
+  let pending = false;
+  const force = (signal: NodeJS.Signals, why: string) => {
+    log(`${signal}: ${why}; forcing exit`);
+    process.exit(128 + osConstants.signals[signal]);
+  };
+  const onSignal = (signal: NodeJS.Signals) => {
+    if (pending) return force(signal, "second signal");
+    pending = true;
+    log(
+      `${signal}: stopping gracefully (send again to force exit; forced after ${SHUTDOWN_GRACE_MS}ms)`,
+    );
+    setTimeout(
+      () => force(signal, `graceful stop exceeded ${SHUTDOWN_GRACE_MS}ms`),
+      SHUTDOWN_GRACE_MS,
+    ).unref();
+    void controller.requestStop({ intent: "stop", source: "signal", reason: signal });
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  return () => {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  };
+}
 const log = (line: string) => console.log(line);
 
 function loadMission(): {
@@ -197,16 +234,19 @@ async function main(): Promise<number> {
     case "run":
     case "resume": {
       const { config, paths } = loadMission();
+      if (command === "resume" && clearControl(paths, "pause")) log("control: pause cleared");
       const controller = new MissionController(config, paths, {
         log,
         worker: makeWorker(config, paths),
         ...(values.cycles ? { maxCycles: Number(values.cycles) } : {}),
         ...(values["crash-at"] ? { crashAt: values["crash-at"] } : {}),
       });
+      const uninstall = installShutdownSignals(controller);
       try {
         const row = await controller.run();
         log("");
         log(renderProgress(await summarize(controller.ledger, config)));
+        if (controller.stopRequested) return 0;
         return row.status === "succeeded" ? 0 : 2;
       } catch (error) {
         if (error instanceof SimulatedCrash) {
@@ -216,8 +256,19 @@ async function main(): Promise<number> {
         if (error instanceof BaselineError) return 2;
         throw error;
       } finally {
+        uninstall();
         await controller.close();
       }
+    }
+    case "stop":
+    case "pause": {
+      const { paths } = loadMission();
+      const current = readControl(paths);
+      writeControl(paths, command, `${hostname()}:${process.pid}`);
+      log(
+        `control: ${command} requested${current ? ` (replaces ${current.command})` : ""}; a running controller honours it between cycles or during a rate-limit wait`,
+      );
+      return 0;
     }
     case "verify":
     case "profile": {

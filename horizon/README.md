@@ -56,7 +56,9 @@ contract covers both adapters.
 npm run horizon -- doctor
 npm run horizon -- mission create --config mission.example.json
 npm run horizon -- run --mission search-p95-demo
-npm run horizon -- resume --mission search-p95-demo      # after an interruption
+npm run horizon -- resume --mission search-p95-demo      # after an interruption or pause
+npm run horizon -- stop --mission search-p95-demo        # ask the running controller to stop after in-flight work (Ctrl-C/SIGTERM does the same)
+npm run horizon -- pause --mission search-p95-demo       # like stop, but `run` stays paused until `resume`
 npm run horizon -- inspect --mission search-p95-demo
 npm run horizon -- export --mission search-p95-demo       # runs/<mission>/exports/summary.{json,md}
 npm run horizon -- live-gate --mission search-p95-demo    # plan.md live-mission criteria -> exports/live-gate.{json,md}; exit 0 only when all met

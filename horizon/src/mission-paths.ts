@@ -9,6 +9,8 @@ export interface MissionPaths {
   root: string;
   db: string;
   manifest: string;
+  /** Operator stop/pause request (`horizon stop|pause`), polled by the running controller. */
+  control: string;
   candidate: string;
   artifacts: string;
   reports: string;
@@ -24,6 +26,7 @@ export function missionPaths(missionId: string, runsRoot = RUNS_ROOT): MissionPa
     root,
     db: join(root, "state.sqlite"),
     manifest: join(root, "manifest.json"),
+    control: join(root, "control.json"),
     candidate: join(root, "candidate"),
     artifacts: join(root, "artifacts"),
     reports: join(root, "reports"),

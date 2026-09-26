@@ -12,6 +12,8 @@ export type MissionStatus =
   | "ready"
   | "running"
   | "waiting"
+  | "interrupted"
+  | "paused"
   | "blocked"
   | "succeeded"
   | "budget_exhausted"
