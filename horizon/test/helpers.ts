@@ -21,6 +21,8 @@ export function testConfig(
     isolation: "subprocess",
     targetP95Reduction: 0.1,
     acceptanceMargin: 0.02,
+    // The small workload is deliberately noisy; the noise-floor policy itself is covered by noise-floor.test.ts.
+    maxRepetitionSpread: 1,
     workload: {
       ...base.workload,
       corpusSize: 3000,

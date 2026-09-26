@@ -15,7 +15,12 @@ import { MemoryOutbox, retrieveEpisodes } from "../src/memory-outbox.ts";
 import { FileEvidenceStore } from "../src/mission-paths.ts";
 import { ScriptedWorker } from "../src/scripted-worker.ts";
 import { runSkillEval, SKILL_FIXTURES } from "../src/skill-eval.ts";
-import { firstComparison, repetitionSpread, rerunComparison } from "../src/timing-policy.ts";
+import {
+  firstComparison,
+  freezeAcceptanceMargin,
+  repetitionSpread,
+  rerunComparison,
+} from "../src/timing-policy.ts";
 import type { Worker } from "../src/worker.ts";
 
 const POLICY = { acceptanceMargin: 0.02, requiredImprovedRepetitions: 2 };
@@ -43,6 +48,34 @@ test("timing: clear wins accept, losses reject, a margin win without paired agre
   assert.equal(ambiguous.kind, "ambiguous");
   assert.match(ambiguous.reason, /1\/3 paired repetitions/);
   assert.equal(firstComparison({ repetitionP95Ms: [] }, 10, [10], POLICY).kind, "reject");
+});
+
+test("noise floor: the frozen margin exceeds the measured spread or the mission asks for repair", () => {
+  assert.deepEqual(freezeAcceptanceMargin(0.05, 0.02, 0.3), {
+    kind: "frozen",
+    acceptanceMargin: 0.05,
+    raised: false,
+  });
+  assert.deepEqual(freezeAcceptanceMargin(0.05, 0.05, 0.3), {
+    kind: "frozen",
+    acceptanceMargin: 0.05,
+    raised: false,
+  });
+  // The issue #14 case: 9.1% spread against a 5% margin freezes a margin above the noise.
+  const raised = freezeAcceptanceMargin(0.05, 0.091, 0.3);
+  assert.equal(raised.kind, "frozen");
+  if (raised.kind === "frozen") {
+    assert.ok(raised.raised);
+    assert.equal(raised.acceptanceMargin, 0.091);
+  }
+  assert.equal(
+    (freezeAcceptanceMargin(0.05, 0.0901, 0.3) as { acceptanceMargin: number }).acceptanceMargin,
+    0.091,
+  );
+  const repair = freezeAcceptanceMargin(0.05, 0.3, 0.3);
+  assert.equal(repair.kind, "repair");
+  if (repair.kind === "repair") assert.match(repair.reason, /repair the workload or environment/);
+  assert.equal(freezeAcceptanceMargin(0.05, 0.45, 0.3).kind, "repair");
 });
 
 test("timing: one rerun resolves to accept, reject or inconclusive without lowering the bar", () => {

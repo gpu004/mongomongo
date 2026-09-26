@@ -25,6 +25,7 @@ import type {
   Ledger,
   LessonRow,
   MissionRow,
+  NewMissionRow,
   OutboxRow,
   OutboxState,
   SegmentRow,
@@ -458,19 +459,7 @@ export class MongoLedger implements Ledger {
 
   // ---- mission ------------------------------------------------------------
 
-  async createMission(
-    row: Omit<
-      MissionRow,
-      | "createdAt"
-      | "spentExperiments"
-      | "spentInputTokens"
-      | "spentOutputTokens"
-      | "spentMemoryOperations"
-      | "spentWallMs"
-      | "usageUncertain"
-      | "learnedSuiteVersion"
-    >,
-  ): Promise<void> {
+  async createMission(row: NewMissionRow): Promise<void> {
     this.assertMission(row.missionId);
     const doc: MissionRow = {
       ...row,
@@ -481,6 +470,7 @@ export class MongoLedger implements Ledger {
       spentWallMs: 0,
       usageUncertain: 0,
       learnedSuiteVersion: 0,
+      frozenAcceptanceMargin: null,
       createdAt: now(),
     };
     await this.write(() => this.col<Doc>("missions").insertOne({ ...doc }, this.opts));

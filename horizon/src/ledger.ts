@@ -52,6 +52,8 @@ export interface MissionRow {
   status: MissionStatus;
   seedArtifactHash: string | null;
   baselineP95Ms: number | null;
+  /** Margin frozen after the baseline measured its noise; null until the baseline completes. */
+  frozenAcceptanceMargin: number | null;
   bestArtifactHash: string | null;
   bestP95Ms: number | null;
   activeTaskId: string | null;
@@ -204,7 +206,8 @@ CREATE TABLE IF NOT EXISTS mission (
   spent_experiments INTEGER NOT NULL DEFAULT 0, spent_input_tokens INTEGER NOT NULL DEFAULT 0,
   spent_output_tokens INTEGER NOT NULL DEFAULT 0, spent_memory_operations INTEGER NOT NULL DEFAULT 0,
   spent_wall_ms INTEGER NOT NULL DEFAULT 0, usage_uncertain INTEGER NOT NULL DEFAULT 0,
-  learned_suite_version INTEGER NOT NULL DEFAULT 0, next_wake_at TEXT, created_at TEXT NOT NULL
+  learned_suite_version INTEGER NOT NULL DEFAULT 0, next_wake_at TEXT, created_at TEXT NOT NULL,
+  frozen_acceptance_margin REAL
 );
 CREATE TABLE IF NOT EXISTS task (
   task_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, ordinal INTEGER NOT NULL, depends_on TEXT NOT NULL,
@@ -374,6 +377,7 @@ export type NewMissionRow = Omit<
   | "spentWallMs"
   | "usageUncertain"
   | "learnedSuiteVersion"
+  | "frozenAcceptanceMargin"
 >;
 export type MissionPatch = Partial<Omit<MissionRow, "missionId" | "createdAt">>;
 export type NewExperimentRow = Omit<
@@ -436,6 +440,7 @@ export class SqliteLedger implements Ledger {
     this.db.exec("PRAGMA synchronous = FULL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
+    this.migrate();
     this.backfillEpisodeIndex();
     this.lockPath = join(dirname(path), "controller.lock");
   }
@@ -553,19 +558,7 @@ export class SqliteLedger implements Ledger {
 
   // ---- mission ------------------------------------------------------------
 
-  async createMission(
-    row: Omit<
-      MissionRow,
-      | "createdAt"
-      | "spentExperiments"
-      | "spentInputTokens"
-      | "spentOutputTokens"
-      | "spentMemoryOperations"
-      | "spentWallMs"
-      | "usageUncertain"
-      | "learnedSuiteVersion"
-    >,
-  ): Promise<void> {
+  async createMission(row: NewMissionRow): Promise<void> {
     this.db
       .prepare(
         `INSERT INTO mission (mission_id, contract_version, contract_hash, evaluator_hash, environment_hash, status, seed_artifact_hash,
@@ -603,6 +596,7 @@ export class SqliteLedger implements Ledger {
       status: r.status as MissionStatus,
       seedArtifactHash: nullableString(r.seed_artifact_hash),
       baselineP95Ms: nullableNumber(r.baseline_p95_ms),
+      frozenAcceptanceMargin: nullableNumber(r.frozen_acceptance_margin),
       bestArtifactHash: nullableString(r.best_artifact_hash),
       bestP95Ms: nullableNumber(r.best_p95_ms),
       activeTaskId: nullableString(r.active_task_id),
@@ -626,6 +620,7 @@ export class SqliteLedger implements Ledger {
       status: "status",
       seedArtifactHash: "seed_artifact_hash",
       baselineP95Ms: "baseline_p95_ms",
+      frozenAcceptanceMargin: "frozen_acceptance_margin",
       bestArtifactHash: "best_artifact_hash",
       bestP95Ms: "best_p95_ms",
       activeTaskId: "active_task_id",
@@ -889,6 +884,17 @@ export class SqliteLedger implements Ledger {
       this.db
         .prepare("INSERT INTO episode_fts (episode_id, mission_id, summary) VALUES (?, ?, ?)")
         .run(e.episodeId, e.missionId, e.summary);
+  }
+
+  /** Additive column migrations for ledgers created by earlier schema revisions. */
+  private migrate(): void {
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(mission)").all() as { name: string }[]).map(
+        (c) => c.name,
+      ),
+    );
+    if (!columns.has("frozen_acceptance_margin"))
+      this.db.exec("ALTER TABLE mission ADD COLUMN frozen_acceptance_margin REAL");
   }
 
   private backfillEpisodeIndex(): void {
