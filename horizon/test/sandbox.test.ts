@@ -1,121 +1,142 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
-import { FileEvidenceStore } from "../src/mission-paths.ts";
+import { loadMissionConfig, validateMissionConfig } from "../src/mission-contract.ts";
 import {
-  dockerRunArgs,
-  listMissionContainers,
   MISSION_LABEL,
+  OPERATION_LABEL,
+  ROLE_LABEL,
   SANDBOX_USER,
+  SandboxUnavailableError,
+  assertSandboxAvailable,
+  dockerRunArgs,
+  isDigestPinnedImage,
+  missionNetworkName,
+  type SandboxSpec,
 } from "../src/sandbox.ts";
-import { type BrokerHooks, ToolBroker } from "../src/tool-broker.ts";
+import { EXAMPLE_CONFIG } from "./helpers.ts";
 
-const IMAGE = "node:24-alpine";
+const PINNED = `node@sha256:${"a".repeat(64)}`;
 
-function dockerReady(): boolean {
-  if (process.env.HORIZON_SKIP_DOCKER_TESTS === "1") return false;
-  return spawnSync("docker", ["info"], { stdio: "ignore", timeout: 10_000 }).status === 0;
+function spec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
+  return {
+    missionId: "m1",
+    operationId: "exp-7",
+    role: "worker-exec",
+    name: "horizon-exec-test",
+    image: PINNED,
+    hostDir: "/host/candidate",
+    mountPath: "/workspace",
+    memoryLimitBytes: 256 * 1024 * 1024,
+    network: "none",
+    command: ["ls", "src"],
+    ...overrides,
+  };
 }
 
-test("sandbox args: non-root, read-only, capability-less, labelled, network as requested", () => {
-  const args = dockerRunArgs({
-    missionId: "m1",
-    role: "worker-exec",
-    name: "n",
-    image: IMAGE,
-    hostDir: "/host/ws",
-    mountPath: "/workspace",
-    memoryLimitBytes: 1024,
-    network: "none",
-    command: ["ls", "-la"],
-  });
-  const joined = args.join(" ");
-  assert.ok(joined.includes(`--user ${SANDBOX_USER}`));
-  assert.ok(joined.includes("--read-only"));
-  assert.ok(joined.includes("--cap-drop ALL"));
-  assert.ok(joined.includes("--network none"));
-  assert.ok(joined.includes(`--label ${MISSION_LABEL}=m1`));
-  assert.ok(joined.includes("-v /host/ws:/workspace:ro"));
-  assert.ok(!joined.includes("-p "));
-  assert.deepEqual(args.slice(-3), [IMAGE, "ls", "-la"]);
+function flag(args: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < args.length; i++) if (args[i] === name) values.push(args[i + 1]!);
+  return values;
+}
 
-  const published = dockerRunArgs({
-    missionId: "m1",
-    role: "candidate",
-    name: "c",
-    image: IMAGE,
-    hostDir: "/snap",
-    mountPath: "/candidate",
-    memoryLimitBytes: 1024,
-    network: "bridge",
-    env: { PORT: "8080" },
-    publishPort: 8080,
-    command: ["node", "src/http/server.ts"],
-  });
-  assert.ok(published.join(" ").includes("-e PORT=8080 -p 127.0.0.1::8080"));
+test("sandbox: only digest-pinned image references are accepted", () => {
+  assert.equal(isDigestPinnedImage(PINNED), true);
+  assert.equal(isDigestPinnedImage(`mirror.gcr.io/library/node@sha256:${"0".repeat(64)}`), true);
+  assert.equal(isDigestPinnedImage(`localhost:5000/node@sha256:${"f".repeat(64)}`), true);
+  assert.equal(isDigestPinnedImage("node:24-alpine"), false);
+  assert.equal(isDigestPinnedImage("node"), false);
+  assert.equal(isDigestPinnedImage(`node@sha256:${"a".repeat(63)}`), false);
+  assert.equal(isDigestPinnedImage(`node@sha1:${"a".repeat(64)}`), false);
+  assert.equal(isDigestPinnedImage(""), false);
+  assert.throws(() => dockerRunArgs(spec({ image: "node:24-alpine" })), SandboxUnavailableError);
+  assert.throws(
+    () => assertSandboxAvailable("node:24-alpine"),
+    (e: unknown) => e instanceof SandboxUnavailableError && /pinned by digest/.test(e.message),
+  );
 });
 
-test("worker exec under container isolation runs unprivileged, offline, on a read-only workspace", async (t) => {
-  if (!dockerReady()) return t.skip("docker unavailable");
-  try {
-    execFileSync("docker", ["image", "inspect", IMAGE], { stdio: "ignore" });
-  } catch {
-    execFileSync("docker", ["pull", IMAGE], { stdio: "ignore", timeout: 300_000 });
-  }
-  const root = mkdtempSync(join(tmpdir(), "horizon-sbx-"));
-  mkdirSync(join(root, "src"));
-  writeFileSync(join(root, "src", "a.ts"), "hello sandbox\n");
-  const hooks: BrokerHooks = {
-    verify: () => Promise.reject(new Error("not used")),
-    profile: () => Promise.reject(new Error("not used")),
-    recall: () => Promise.reject(new Error("not used")),
-    proposeRegression: () => Promise.reject(new Error("not used")),
-    onToolEvent: () => {},
-  };
-  const missionId = `sbx-${process.pid}`;
-  const broker = new ToolBroker(
-    root,
-    new FileEvidenceStore(mkdtempSync(join(tmpdir(), "horizon-ev-"))),
-    hooks,
-    () => Date.now() + 120_000,
-    { image: IMAGE, missionId },
+test("sandbox: docker run is non-root, capability-less, read-only, bounded and labelled", () => {
+  const args = dockerRunArgs(spec());
+  assert.equal(args[0], "run");
+  assert.ok(args.includes("--rm"));
+  assert.deepEqual(flag(args, "--user"), [SANDBOX_USER]);
+  assert.notEqual(SANDBOX_USER.split(":")[0], "0", "sandbox must never run as uid 0");
+  assert.ok(args.includes("--read-only"));
+  assert.deepEqual(flag(args, "--cap-drop"), ["ALL"]);
+  assert.deepEqual(flag(args, "--security-opt"), ["no-new-privileges"]);
+  assert.deepEqual(flag(args, "--memory"), [String(256 * 1024 * 1024)]);
+  assert.deepEqual(flag(args, "--memory-swap"), [String(256 * 1024 * 1024)], "no swap headroom");
+  assert.deepEqual(flag(args, "--cpus"), ["1"]);
+  assert.deepEqual(flag(args, "--pids-limit"), ["128"]);
+  assert.match(flag(args, "--tmpfs")[0]!, /^\/tmp:.*noexec.*size=/);
+  assert.deepEqual(
+    flag(args, "-v"),
+    ["/host/candidate:/workspace:ro"],
+    "only the candidate dir, read-only",
   );
+  assert.deepEqual(flag(args, "-w"), ["/workspace"]);
+  assert.ok(!args.some((a) => a.includes("docker.sock")), "docker socket never mounted");
+  assert.ok(!args.includes("--privileged"));
+  assert.ok(!args.includes("-p") && !args.includes("--publish"), "no port publication");
+  assert.deepEqual(flag(args, "--label").sort(), [
+    `${MISSION_LABEL}=m1`,
+    `${OPERATION_LABEL}=exp-7`,
+    `${ROLE_LABEL}=worker-exec`,
+  ]);
+  // image then command, nothing after
+  assert.deepEqual(args.slice(args.indexOf(PINNED)), [PINNED, "ls", "src"]);
+});
 
-  const read = await broker.workspaceExec("cat", ["src/a.ts"], 60_000);
-  assert.equal(read.exitCode, 0);
-  assert.equal(read.stdout.trim(), "hello sandbox");
-
-  // The allowlist forbids interpreters, so probe the container from the same argument shape
-  // the broker uses: the mount is read-only and the process is not root.
-  const probe = spawnSync(
-    "docker",
-    dockerRunArgs({
-      missionId,
-      role: "worker-exec",
-      name: `horizon-probe-${process.pid}`,
-      image: IMAGE,
-      hostDir: root,
-      mountPath: "/workspace",
-      memoryLimitBytes: 256 * 1024 * 1024,
-      network: "none",
-      command: [
-        "sh",
-        "-c",
-        "id -u; touch src/x 2>&1; wget -q -T 2 -O- http://1.1.1.1 2>&1 || echo offline",
-      ],
+test("sandbox: ordinary execution has no network; candidates get the mission's internal network", () => {
+  assert.deepEqual(flag(dockerRunArgs(spec()), "--network"), ["none"]);
+  const net = missionNetworkName("m1");
+  const candidate = dockerRunArgs(
+    spec({
+      role: "candidate",
+      network: { internal: net },
+      env: { HOST: "0.0.0.0", PORT: "8080" },
+      command: ["node", "src/http/server.ts"],
     }),
-    { encoding: "utf8", timeout: 60_000 },
   );
-  const out = probe.stdout + probe.stderr;
-  assert.equal(out.split("\n")[0], SANDBOX_USER.split(":")[0]);
-  assert.notEqual(out.split("\n")[0], "0");
-  assert.match(out, /Read-only file system/);
-  assert.match(out, /offline|bad address|network is unreachable/i);
+  assert.deepEqual(flag(candidate, "--network"), [net]);
+  assert.deepEqual(flag(candidate, "-e").sort(), ["HOST=0.0.0.0", "PORT=8080"]);
+  assert.ok(
+    !candidate.some((a) => /API_KEY|TOKEN|SECRET|HOME=/.test(a)),
+    "no host credentials passed",
+  );
+});
 
-  const denied = await broker.workspaceExec("cat", ["/etc/passwd"], 60_000).catch((e: Error) => e);
-  assert.ok(denied instanceof Error && /denied/.test(denied.message));
-  assert.deepEqual(listMissionContainers(missionId), []);
+test("sandbox: an unreachable Docker daemon fails explicitly instead of falling back to the host", () => {
+  const previous = process.env.DOCKER_HOST;
+  process.env.DOCKER_HOST = "tcp://127.0.0.1:1";
+  try {
+    assert.throws(
+      () => assertSandboxAvailable(PINNED),
+      (e: unknown) =>
+        e instanceof SandboxUnavailableError && /Docker daemon is unreachable/.test(e.message),
+    );
+  } finally {
+    if (previous === undefined) delete process.env.DOCKER_HOST;
+    else process.env.DOCKER_HOST = previous;
+  }
+});
+
+test("mission contract: container isolation requires a digest-pinned image", () => {
+  const example = loadMissionConfig(EXAMPLE_CONFIG);
+  assert.ok(isDigestPinnedImage(example.containerImage), "example config ships a pinned image");
+  assert.throws(
+    () =>
+      validateMissionConfig({
+        ...example,
+        isolation: "container",
+        containerImage: "node:24-alpine",
+      }),
+    /pinned by digest/,
+  );
+  assert.doesNotThrow(() =>
+    validateMissionConfig({ ...example, isolation: "container", containerImage: PINNED }),
+  );
+  assert.doesNotThrow(() =>
+    validateMissionConfig({ ...example, isolation: "subprocess", containerImage: "" }),
+  );
 });

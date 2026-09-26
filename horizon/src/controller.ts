@@ -46,9 +46,9 @@ import {
   writeJsonAtomic,
 } from "./mission-paths.ts";
 import { type ContainerRuntime, recover, type RecoveryOutcome } from "./recovery.ts";
+import { assertSandboxAvailable, cleanupOrphanContainers } from "./sandbox.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
-import { cleanupOrphanContainers } from "./sandbox.ts";
-import { type BrokerHooks, ToolBroker } from "./tool-broker.ts";
+import { type BrokerHooks, type ExecSandbox, ToolBroker } from "./tool-broker.ts";
 import {
   firstComparison,
   freezeAcceptanceMargin,
@@ -300,11 +300,24 @@ export class MissionController {
     return row;
   }
 
+  /** Under container isolation every worker command runs in the sandbox, labelled with its experiment. */
+  private execSandbox(experimentId: string): ExecSandbox | undefined {
+    if (this.config.isolation !== "container") return undefined;
+    return {
+      image: this.config.containerImage,
+      missionId: this.config.missionId,
+      operationId: experimentId,
+    };
+  }
+
   /** `horizon run` / `horizon resume`: recover, then loop until done or out of budget. */
   async run(): Promise<MissionRow> {
     await this.ledger.acquireLock();
     try {
       if (this.config.isolation === "container") {
+        // Fail before any work is scheduled; the sandbox is never silently replaced by the host.
+        const sandbox = assertSandboxAvailable(this.config.containerImage);
+        this.log(`sandbox: docker ${sandbox.serverVersion}, image ${sandbox.imageId.slice(0, 19)}`);
         const orphans = cleanupOrphanContainers(this.config.missionId);
         if (orphans.length > 0)
           this.log(`recovery: removed ${orphans.length} orphaned container(s) from a previous run`);
@@ -706,9 +719,7 @@ export class MissionController {
       this.evidence,
       this.hooks(experimentId),
       () => this.cycleDeadline,
-      this.config.isolation === "container"
-        ? { image: this.config.containerImage, missionId: this.config.missionId }
-        : undefined,
+      this.execSandbox(experimentId),
     );
     const recoveryNote = recovery.actions.find((a) => a.kind === "interrupted_edit")?.detail;
     let result: WorkerCycleResult;

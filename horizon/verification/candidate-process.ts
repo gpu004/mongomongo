@@ -1,7 +1,13 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dockerRunArgs } from "../src/sandbox.ts";
+import {
+  assertSandboxAvailable,
+  containerAddress,
+  dockerRunArgs,
+  ensureMissionNetwork,
+  killContainer,
+} from "../src/sandbox.ts";
 
 export type IsolationMode = "container" | "subprocess";
 
@@ -11,8 +17,8 @@ export type IsolationMode = "container" | "subprocess";
  * leaves a registered-but-unreleased name that resume can find and remove.
  */
 export interface ContainerRegistry {
-  register(containerName: string): Promise<void>;
-  release(containerName: string): Promise<void>;
+  register(containerName: string): void | Promise<void>;
+  release(containerName: string): void | Promise<void>;
 }
 
 /** Generates the container name; exported so resume can recognise horizon containers. */
@@ -21,10 +27,11 @@ export const CONTAINER_NAME_PREFIX = "horizon-cand-";
 export interface LaunchOptions {
   snapshotDir: string;
   isolation: IsolationMode;
-  /** Pinned image used in container mode. */
+  /** Digest-pinned image used in container mode. */
   containerImage: string;
-  /** Labels the container so orphans can be reclaimed by mission on resume. */
+  /** Labels the container so orphans can be reclaimed by mission/operation on resume. */
   missionId: string;
+  operationId: string;
   startupTimeoutMs: number;
   memoryLimitBytes: number;
   /** Container mode only; subprocess children die with the controller and need no record. */
@@ -44,8 +51,10 @@ export interface RunningCandidate {
 }
 
 /**
- * The only place that launches candidate code. Container mode mounts the
- * immutable snapshot read-only and exposes one port on loopback; the runner
+ * The only place that launches candidate code. Container mode runs the sandbox
+ * backend (`src/sandbox.ts`): non-root, read-only snapshot mount, no capabilities,
+ * and the mission's private internal network, which the verifier reaches by
+ * container address and which has no route to the public network. The runner
  * never shares its reports, fixtures, or credentials with the candidate.
  * Subprocess mode is a cooperative fallback that cannot establish evaluator
  * tamper resistance; reports record which mode produced them.
@@ -83,36 +92,31 @@ function launchSubprocess(options: LaunchOptions, entry: string): Promise<Runnin
 }
 
 async function launchInContainer(options: LaunchOptions): Promise<RunningCandidate> {
+  assertSandboxAvailable(options.containerImage);
   const name = `${CONTAINER_NAME_PREFIX}${randomUUID().slice(0, 12)}`;
   await options.containerRegistry?.register(name);
-  // The candidate needs exactly one inbound path (the published loopback port); it gets no
-  // credentials and no writable mount, so egress has nothing to exfiltrate but is still possible
-  // on the default bridge. `--network none` would remove the published port as well.
+  const network = ensureMissionNetwork(options.missionId);
   const args = dockerRunArgs({
     missionId: options.missionId,
+    operationId: options.operationId,
     role: "candidate",
     name,
     image: options.containerImage,
     hostDir: options.snapshotDir,
     mountPath: "/candidate",
     memoryLimitBytes: options.memoryLimitBytes,
-    network: "bridge",
-    env: { HOST: "0.0.0.0", PORT: "8080" },
-    publishPort: 8080,
+    network: { internal: network },
+    env: { HOST: "0.0.0.0", PORT: "8080", NODE_ENV: "candidate" },
     command: ["node", "src/http/server.ts"],
   });
-  const child = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn("docker", args, {
+    env: { PATH: process.env.PATH ?? "" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   return waitForListening(
     child,
     options.startupTimeoutMs,
-    () => {
-      const mapped =
-        execFileSync("docker", ["port", name, "8080/tcp"], { encoding: "utf8" })
-          .trim()
-          .split("\n")[0] ?? "";
-      const port = mapped.split(":").pop();
-      return `http://127.0.0.1:${port}`;
-    },
+    (port) => `http://${containerAddress(name, network)}:${port}`,
     name,
     options.containerRegistry,
   );
@@ -154,18 +158,12 @@ function waitForListening(
         }
         child.once("exit", (code, signal) => done({ exitCode: code, signal }));
       });
-      if (containerName) {
-        try {
-          execFileSync("docker", ["kill", containerName], { stdio: "ignore" });
-        } catch {
-          /* already gone */
-        }
-      }
+      if (containerName) killContainer(containerName);
       child.kill("SIGTERM");
       const killTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
       const result = await exit;
       clearTimeout(killTimer);
-      if (containerName) await registry?.release(containerName);
+      if (containerName) void registry?.release(containerName);
       return { ...result, peakMemoryBytes: peak, stderrTail: stderr.slice(-2000) };
     };
 

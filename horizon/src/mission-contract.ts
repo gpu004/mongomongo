@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { canonicalJson, sha256 } from "../verification/reports.ts";
 import type { WorkloadSpec } from "../verification/workloads/index.ts";
+import { isDigestPinnedImage } from "./sandbox.ts";
 
 /**
  * Everything frozen before optimization starts. The hash of this object is the
@@ -26,6 +27,7 @@ export interface MissionConfig {
   workload: WorkloadSpec;
   holdoutWorkload: WorkloadSpec;
   isolation: "container" | "subprocess";
+  /** Sandbox image, pinned by digest (`repo@sha256:...`) when isolation is "container". */
   containerImage: string;
   memoryLimitBytes: number;
   startupTimeoutMs: number;
@@ -104,6 +106,8 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     fail("isolation must be container|subprocess");
   if (typeof c.containerImage !== "string")
     fail("containerImage required (may be empty for subprocess)");
+  if (c.isolation === "container" && !isDigestPinnedImage(c.containerImage!))
+    fail("containerImage must be pinned by digest (repo@sha256:...) under container isolation");
   if (typeof c.memoryLimitBytes !== "number" || c.memoryLimitBytes <= 0)
     fail("memoryLimitBytes required");
   if (typeof c.startupTimeoutMs !== "number" || typeof c.requestTimeoutMs !== "number")
