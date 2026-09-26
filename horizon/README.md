@@ -21,6 +21,8 @@ npm test               # recovery, fault injection, policies, report validation,
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
 
+`stagnationLimit` (mission config): once that many optimize-search experiments have concluded since the last accepted one, the worker's packet carries a stagnation directive listing the mechanisms already tried, and a cycle that repeats one of them without first calling `profile_candidate` is rejected without running the verifier.
+
 ## Reproduction
 
 ```sh
