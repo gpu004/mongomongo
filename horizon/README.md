@@ -10,7 +10,7 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 - Node >= 24 (uses `node:sqlite` and type-stripped `.ts` execution)
 - Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra. Container names are recorded in the ledger before `docker run`, so `resume` removes any candidate container orphaned by a controller crash
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
-- An LLM API key for the Pi worker (`"worker": "pi"`); the `scripted` worker needs none
+- An LLM API key for the Pi worker (`"worker": "pi"`): `<PROVIDER>_API_KEY` for the configured `model.provider` (`ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`/`GEMINI_API_KEY` for `google`); the `scripted` worker needs none
 
 ## Setup and checks
 
@@ -32,6 +32,7 @@ npm run horizon -- run --mission search-p95-demo
 npm run horizon -- resume --mission search-p95-demo      # after an interruption
 npm run horizon -- inspect --mission search-p95-demo
 npm run horizon -- export --mission search-p95-demo       # runs/<mission>/exports/summary.{json,md}
+npm run horizon -- live-gate --mission search-p95-demo    # plan.md live-mission criteria -> exports/live-gate.{json,md}; exit 0 only when all met
 
 npm run horizon -- verify --mission search-p95-demo --artifact <hash> --suite smoke|correctness|performance
 npm run horizon -- profile --mission search-p95-demo --scenario search-read-heavy
@@ -57,6 +58,16 @@ Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artif
 - `src/` ledger, artifact store, recovery, controller, tool broker, Pi/scripted workers, memory, lesson policy, CLI
 - `resources/` versioned feature map and verification skill
 - `test/` deterministic tests
+
+## Live Pi mission (plan.md §5 acceptance gate)
+
+`mission.live.example.json` is the example config with `"worker": "pi"` (mission `search-p95-live`, rotation every 2 cycles, bounded token budget). With the provider key in the environment:
+
+```sh
+node scripts/live-mission.ts --config mission.live.example.json [--runs-root DIR] [--crash-at snapshot_ready]
+```
+
+runs the demo sequence — `mission create`, `run` interrupted at the crash point, `resume` to completion, `export`, `live-gate` — and exits with the gate's code. The gate reads only the ledger (never worker prose) and requires: every `optimize-search` experiment authored by the `pi` worker, provider-reported token usage, a measured baseline, at least one non-seeded model candidate with passed smoke+correctness+performance reports, a launch recovered from a checkpoint, an episode retrieved from an earlier segment after a rotation, a passed holdout, and mission status `succeeded`. Commit or link `runs/<mission>/exports/{summary,live-gate}.{json,md}` as the evidence. Running the script against `mission.example.json` (scripted worker) is expected to exit 2 with `worker_is_pi`, `usage_reported` and `model_candidate_verified` failing.
 
 ## Configuration comparison and report
 
