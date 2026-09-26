@@ -114,6 +114,40 @@ function report(reportId: string, experimentId: string, suite: "smoke" | "perfor
 for (const makeBackend of backends) {
   const label = makeBackend().name;
 
+  test(`[${label}] compacted event snapshots preserve pagination and idempotency`, async () => {
+    const backend = makeBackend();
+    const ledger = await backend.open();
+    try {
+      await mission(ledger);
+      for (let i = 1; i <= 105; i++)
+        await ledger.appendEvent(`event-${i}`, "measured", MISSION, { ordinal: i });
+      assert.equal(await ledger.compactEventsBefore(101), 100);
+      assert.equal(await ledger.compactEventsBefore(101), 1);
+      assert.equal(await ledger.compactEventsBefore(101), 0);
+      assert.equal(await ledger.lastEventSeq(), 105);
+      const events = [];
+      let cursor = 0;
+      for (;;) {
+        const page = await ledger.eventsSince(cursor, 17);
+        if (!page.length) break;
+        events.push(...page);
+        cursor = page.at(-1)!.seq;
+      }
+      assert.equal(events.length, 105);
+      assert.deepEqual(
+        events.map((event) => event.seq),
+        Array.from({ length: 105 }, (_, i) => i + 1),
+      );
+      assert.deepEqual((await ledger.findEvent("event-1"))?.payload, { ordinal: 1 });
+      assert.equal(await ledger.appendEvent("event-1", "duplicate", MISSION, {}), 1);
+      assert.equal(await ledger.appendEvent("event-106", "measured", MISSION, {}), 106);
+      assert.equal((await ledger.eventsSince(100)).length, 6);
+    } finally {
+      await ledger.close();
+      await backend.teardown();
+    }
+  });
+
   test(`[${label}] rows round-trip and unique keys are enforced`, async () => {
     const backend = makeBackend();
     const ledger = await backend.open();

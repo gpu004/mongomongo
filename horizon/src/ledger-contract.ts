@@ -50,6 +50,7 @@ export interface AsyncLedger {
   eventsSince(seq: number, limit?: number): Promise<EventRow[]>;
   findEvent(eventKey: string): Promise<EventRow | undefined>;
   lastEventSeq(): Promise<number>;
+  compactEventsBefore(seq: number): Promise<number>;
 
   createMission(row: NewMissionRow): Promise<void>;
   getMission(missionId: string): Promise<MissionRow | undefined>;
@@ -113,6 +114,7 @@ export interface AsyncLedger {
   ): Promise<void>;
   commitSegment(missionId: string, ordinal: number, checkpointId: string): Promise<void>;
   closeSegment(missionId: string, ordinal: number, archiveHash: string | null): Promise<void>;
+  setSegmentArchive(missionId: string, ordinal: number, archiveHash: string): Promise<void>;
   activeSegment(missionId: string): Promise<SegmentRow | undefined>;
   listSegments(missionId: string): Promise<SegmentRow[]>;
   discardUncommittedSegments(missionId: string): Promise<number>;

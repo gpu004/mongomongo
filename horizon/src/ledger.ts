@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { decodeEvents, encodeEvents, SNAPSHOT_BATCH_SIZE } from "./event-snapshot.ts";
 import {
   canonicalJson,
   reportHash,
@@ -282,6 +283,12 @@ CREATE TABLE IF NOT EXISTS event (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE, at TEXT NOT NULL, type TEXT NOT NULL,
   entity_id TEXT NOT NULL, payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS event_snapshot (
+  from_seq INTEGER PRIMARY KEY, through_seq INTEGER NOT NULL, events BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS event_snapshot_key (
+  event_key TEXT PRIMARY KEY, from_seq INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS episode_mission ON episode(mission_id, created_at);
 CREATE INDEX IF NOT EXISTS episode_supersedes ON episode(supersedes);
 CREATE INDEX IF NOT EXISTS outbox_episode ON outbox(episode_id);
@@ -305,7 +312,7 @@ function now(): string {
   return new Date().toISOString();
 }
 
-type Cell = string | number | null | undefined;
+type Cell = string | number | Buffer | null | undefined;
 type Row = Record<string, Cell>;
 
 /**
@@ -419,9 +426,7 @@ export class Ledger {
 
   /** Append an event; a duplicate key is harmless and returns the existing seq. */
   appendEvent(eventKey: string, type: string, entityId: string, payload: unknown): number {
-    const existing = this.db.prepare("SELECT seq FROM event WHERE event_key = ?").get(eventKey) as
-      | { seq: number }
-      | undefined;
+    const existing = this.findEvent(eventKey);
     if (existing) return existing.seq;
     const result = this.db
       .prepare("INSERT INTO event (event_key, at, type, entity_id, payload) VALUES (?, ?, ?, ?, ?)")
@@ -430,32 +435,49 @@ export class Ledger {
   }
 
   eventsSince(seq: number, limit = 1000): EventRow[] {
+    const snapshots = this.db
+      .prepare("SELECT events FROM event_snapshot WHERE through_seq > ? ORDER BY from_seq")
+      .all(seq) as { events: Uint8Array }[];
+    const archived: EventRow[] = [];
+    for (const snapshot of snapshots) {
+      archived.push(...decodeEvents(snapshot.events).filter((event) => event.seq > seq));
+      if (archived.length >= limit) return archived.slice(0, limit);
+    }
     const rows = this.db
       .prepare("SELECT * FROM event WHERE seq > ? ORDER BY seq LIMIT ?")
-      .all(seq, limit) as Row[];
-    return rows.map((r) => ({
-      seq: Number(r.seq),
-      eventKey: String(r.event_key),
-      at: String(r.at),
-      type: String(r.type),
-      entityId: String(r.entity_id),
-      payload: JSON.parse(String(r.payload)),
-    }));
+      .all(seq, limit - archived.length) as Row[];
+    return archived.concat(
+      rows.map((r) => ({
+        seq: Number(r.seq),
+        eventKey: String(r.event_key),
+        at: String(r.at),
+        type: String(r.type),
+        entityId: String(r.entity_id),
+        payload: JSON.parse(String(r.payload)),
+      })),
+    );
   }
 
   findEvent(eventKey: string): EventRow | undefined {
     const r = this.db.prepare("SELECT * FROM event WHERE event_key = ?").get(eventKey) as
       | Row
       | undefined;
-    return r
-      ? {
-          seq: Number(r.seq),
-          eventKey: String(r.event_key),
-          at: String(r.at),
-          type: String(r.type),
-          entityId: String(r.entity_id),
-          payload: JSON.parse(String(r.payload)),
-        }
+    if (r)
+      return {
+        seq: Number(r.seq),
+        eventKey: String(r.event_key),
+        at: String(r.at),
+        type: String(r.type),
+        entityId: String(r.entity_id),
+        payload: JSON.parse(String(r.payload)),
+      };
+    const snapshot = this.db
+      .prepare(
+        "SELECT s.events FROM event_snapshot s JOIN event_snapshot_key k ON s.from_seq = k.from_seq WHERE k.event_key = ?",
+      )
+      .get(eventKey) as { events: Uint8Array } | undefined;
+    return snapshot
+      ? decodeEvents(snapshot.events).find((item) => item.eventKey === eventKey)
       : undefined;
   }
 
@@ -463,7 +485,36 @@ export class Ledger {
     const row = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM event").get() as {
       seq: number;
     };
-    return Number(row.seq);
+    const snapshot = this.db
+      .prepare("SELECT COALESCE(MAX(through_seq), 0) AS seq FROM event_snapshot")
+      .get() as { seq: number };
+    return Math.max(Number(row.seq), Number(snapshot.seq));
+  }
+
+  compactEventsBefore(seq: number): number {
+    const rows = this.db
+      .prepare("SELECT * FROM event WHERE seq <= ? ORDER BY seq LIMIT ?")
+      .all(seq, SNAPSHOT_BATCH_SIZE) as Row[];
+    if (rows.length === 0) return 0;
+    const events = rows.map((r) => ({
+      seq: Number(r.seq),
+      eventKey: String(r.event_key),
+      at: String(r.at),
+      type: String(r.type),
+      entityId: String(r.entity_id),
+      payload: JSON.parse(String(r.payload)),
+    }));
+    this.db
+      .prepare("INSERT INTO event_snapshot (from_seq, through_seq, events) VALUES (?, ?, ?)")
+      .run(events[0]!.seq, events.at(-1)!.seq, encodeEvents(events));
+    const insertKey = this.db.prepare(
+      "INSERT INTO event_snapshot_key (event_key, from_seq) VALUES (?, ?)",
+    );
+    for (const event of events) insertKey.run(event.eventKey, events[0]!.seq);
+    this.db
+      .prepare("DELETE FROM event WHERE seq BETWEEN ? AND ?")
+      .run(events[0]!.seq, events.at(-1)!.seq);
+    return events.length;
   }
 
   createMission(
@@ -1088,6 +1139,15 @@ export class Ledger {
         "UPDATE segment SET closed_at = ?, last_event_seq = ?, archive_hash = ? WHERE mission_id = ? AND ordinal = ?",
       )
       .run(now(), this.lastEventSeq(), archiveHash, missionId, ordinal);
+  }
+
+  setSegmentArchive(missionId: string, ordinal: number, archiveHash: string): void {
+    const result = this.db
+      .prepare(
+        "UPDATE segment SET archive_hash = ? WHERE mission_id = ? AND ordinal = ? AND closed_at IS NOT NULL AND committed = 1 AND (archive_hash IS NULL OR archive_hash = ?)",
+      )
+      .run(archiveHash, missionId, ordinal, archiveHash);
+    if (result.changes !== 1) throw new Error(`segment ${ordinal} cannot be archived`);
   }
 
   activeSegment(missionId: string): SegmentRow | undefined {

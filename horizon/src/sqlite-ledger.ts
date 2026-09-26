@@ -118,6 +118,9 @@ export class SqliteLedger implements AsyncLedger {
   async lastEventSeq() {
     return this.inner.lastEventSeq();
   }
+  async compactEventsBefore(seq: number) {
+    return this.fenced(() => this.inner.compactEventsBefore(seq));
+  }
 
   async createMission(row: NewMissionRow) {
     this.fenced(() => this.inner.createMission(row));
@@ -250,6 +253,9 @@ export class SqliteLedger implements AsyncLedger {
   }
   async closeSegment(missionId: string, ordinal: number, archiveHash: string | null) {
     this.fenced(() => this.inner.closeSegment(missionId, ordinal, archiveHash));
+  }
+  async setSegmentArchive(missionId: string, ordinal: number, archiveHash: string) {
+    this.fenced(() => this.inner.setSegmentArchive(missionId, ordinal, archiveHash));
   }
   async activeSegment(missionId: string) {
     return this.inner.activeSegment(missionId);

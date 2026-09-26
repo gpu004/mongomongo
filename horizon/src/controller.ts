@@ -58,8 +58,10 @@ import {
   writeJsonAtomic,
 } from "./mission-paths.ts";
 import { type ContainerRuntime, recover, type RecoveryOutcome } from "./recovery.ts";
+import { retainedArtifactHashes } from "./retention.ts";
 import { assertSandboxAvailable, cleanupOrphanContainers } from "./sandbox.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
+import { archiveSession, removeArchivedSession } from "./session-archive.ts";
 import { type BrokerHooks, type ExecSandbox, ToolBroker } from "./tool-broker.ts";
 import {
   firstComparison,
@@ -212,6 +214,7 @@ export class MissionController {
   readonly contractHash: string;
   private segmentOrdinal = 0;
   private cyclesInSegment = 0;
+  private openedSegmentOrdinal = 0;
   private cycleDeadline = 0;
   /** Wall time since this mark has not yet been added to mission.spentWallMs. */
   private wallMark = Date.now();
@@ -716,6 +719,7 @@ export class MissionController {
         if (orphans.length > 0)
           this.log(`recovery: removed ${orphans.length} orphaned container(s) from a previous run`);
       }
+      const recoveryStartedAt = performance.now();
       const recovery = await recover(
         this.ledger,
         this.artifacts,
@@ -729,10 +733,21 @@ export class MissionController {
         },
         this.containerRuntime,
       );
+      await this.ledger.appendEvent(
+        `mission:${this.config.missionId}:recovery-measured:${randomUUID()}`,
+        "recovery.measured",
+        this.config.missionId,
+        { durationMs: performance.now() - recoveryStartedAt },
+      );
       for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       if (recovery.actions.some((a) => a.kind === "environment_drift_accepted"))
         this.syncManifest(await this.mission());
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
+      this.cyclesInSegment = (await this.ledger.listExperiments(this.config.missionId)).filter(
+        (experiment) =>
+          experiment.segmentOrdinal === this.segmentOrdinal && experiment.finishedAt !== null,
+      ).length;
+      await this.applyRetention();
       await this.honourWakeTime();
       await this.ledger.updateMission(this.config.missionId, {
         status: "running",
@@ -776,12 +791,14 @@ export class MissionController {
           }
           if (done === "blocked" || done === "waiting") break;
         }
+        await this.applyRetention();
       }
       await this.drainOutbox();
       await this.flushToolEvents();
       return await this.mission();
     } finally {
       await this.worker.closeSegment().catch(() => {});
+      this.openedSegmentOrdinal = 0;
       await this.flushToolEvents().catch(() => {});
       await this.releaseLease();
     }
@@ -1899,6 +1916,7 @@ export class MissionController {
       (await this.ledger.listTasks(this.config.missionId)).find(
         (t) => t.taskId === "optimize-search",
       )?.nextAction ?? "";
+    const retrievalStartedAt = performance.now();
     const retrieval = this.config.memory.enabled
       ? await retrieveEpisodes(
           this.memory,
@@ -1915,6 +1933,7 @@ export class MissionController {
           () => this.spendMemoryOperation(),
         )
       : { injected: [], filteredOut: [], degraded: false };
+    const retrievalMs = performance.now() - retrievalStartedAt;
     const lastVerdict = experiments.at(-1)?.verdict ?? "no experiments yet";
     const pinned = [
       `Mission ${mission.missionId} (contract v${mission.contractVersion}, hash ${mission.contractHash.slice(0, 12)}). Objective: ${this.config.objective}`,
@@ -1944,6 +1963,7 @@ export class MissionController {
     await this.ledger.appendEvent(`${experimentId}:packet`, "packet.built", experimentId, {
       query,
       tokens: packet.tokens,
+      retrievalMs,
       sections: packet.sections,
       injected: packet.injectedEpisodeIds,
       dropped: packet.droppedEpisodeIds,
@@ -2037,23 +2057,18 @@ export class MissionController {
     const active = await this.ledger.activeSegment(this.config.missionId);
     const needsRotation =
       active !== undefined && this.cyclesInSegment >= this.config.segmentRotationCycles;
-    if (
-      active &&
-      !needsRotation &&
-      this.segmentOrdinal === active.ordinal &&
-      this.cyclesInSegment > 0
-    )
-      return;
+    if (active && !needsRotation && this.openedSegmentOrdinal === active.ordinal) return;
     const previous = active
       ? { sessionPath: active.sessionPath, sessionId: active.sessionId ?? "" }
       : null;
     if (active && !needsRotation) {
       await this.worker.openSegment(active.ordinal, previous);
       this.segmentOrdinal = active.ordinal;
-      this.cyclesInSegment = 0;
+      this.openedSegmentOrdinal = active.ordinal;
       return;
     }
     const ordinal = (active?.ordinal ?? this.segmentOrdinal) + 1;
+    if (this.openedSegmentOrdinal) await this.worker.closeSegment();
     // A new segment is a fresh bounded context; `previous` is only for resuming a committed segment.
     const handle = await this.worker.openSegment(ordinal, null);
     await this.transaction(async (tx) => {
@@ -2073,8 +2088,46 @@ export class MissionController {
       });
     });
     this.segmentOrdinal = ordinal;
+    this.openedSegmentOrdinal = ordinal;
     this.cyclesInSegment = 0;
+    await this.archiveOldSegments();
     this.log(`segment ${ordinal} open${active ? ` (rotated from ${active.ordinal})` : ""}`);
+  }
+
+  private async applyRetention(): Promise<void> {
+    const policy = this.config.retention;
+    if (!policy) return;
+    this.assertLeaseLive();
+    const mission = await this.mission();
+    const experiments = await this.ledger.listExperiments(this.config.missionId);
+    this.artifacts.pruneExcept(
+      retainedArtifactHashes(mission, experiments, policy.keepRecentCandidates),
+    );
+    await this.archiveOldSegments();
+    const cutoff = (await this.ledger.lastEventSeq()) - policy.compactEventsAfter;
+    if (cutoff > 0) {
+      while (await this.ledger.compactEventsBefore(cutoff)) {
+        this.assertLeaseLive();
+      }
+    }
+  }
+
+  private async archiveOldSegments(): Promise<void> {
+    const policy = this.config.retention;
+    if (!policy) return;
+    this.assertLeaseLive();
+    const segments = await this.ledger.listSegments(this.config.missionId);
+    for (const segment of segments.slice(0, -policy.keepRecentSegments)) {
+      if (!segment.committed || !segment.closedAt || !segment.sessionPath) continue;
+      if (!segment.archiveHash && !existsSync(segment.sessionPath))
+        throw new Error(`closed segment ${segment.ordinal} has no session file or archive`);
+      const hash =
+        segment.archiveHash ??
+        archiveSession(segment.sessionPath, this.paths.sessions, this.paths.evidence);
+      if (!segment.archiveHash)
+        await this.ledger.setSegmentArchive(this.config.missionId, segment.ordinal, hash);
+      removeArchivedSession(segment.sessionPath, this.paths.sessions, this.paths.evidence, hash);
+    }
   }
 
   private async checkpoint(

@@ -42,6 +42,11 @@ export interface MissionConfig {
   };
   /** Rotate the Pi segment after this many completed cycles. */
   segmentRotationCycles: number;
+  retention?: {
+    keepRecentCandidates: number;
+    keepRecentSegments: number;
+    compactEventsAfter: number;
+  };
   /** Consecutive experiments without valid improvement before a new mechanism/profile is required. */
   stagnationLimit: number;
   model: { provider: string; id: string };
@@ -137,6 +142,13 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     c.segmentRotationCycles < 1
   )
     fail("segmentRotationCycles >= 1 (integer)");
+  if (c.retention !== undefined) {
+    if (typeof c.retention !== "object" || c.retention === null)
+      fail("retention must be an object");
+    positiveInteger("retention.keepRecentCandidates", c.retention.keepRecentCandidates);
+    positiveInteger("retention.keepRecentSegments", c.retention.keepRecentSegments);
+    positiveInteger("retention.compactEventsAfter", c.retention.compactEventsAfter);
+  }
   if (
     typeof c.stagnationLimit !== "number" ||
     !Number.isInteger(c.stagnationLimit) ||
