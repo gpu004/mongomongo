@@ -25,7 +25,7 @@ export const FIXTURES_DIR = new URL("../verification/fixtures/", import.meta.url
 
 export interface FixtureManifest {
   fixtureId: string;
-  kind: "fault-injection";
+  kind: "fault-injection" | "escape-probe";
   label: string;
   description: string;
   expectedFailures: string[];

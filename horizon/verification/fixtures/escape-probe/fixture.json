@@ -1,0 +1,8 @@
+{
+  "fixtureId": "escape-probe",
+  "kind": "escape-probe",
+  "label": "ADVERSARIAL PROBE: candidate tries to read host files, leak credentials, write past its snapshot, plant symlinks and reach the public network",
+  "description": "Overlay applied on top of the seed. The service stays contract-compliant but adds GET /__probe, which attempts every escape the sandbox must deny and reports what it observed. test/sandbox-escape.test.ts runs it under the container backend and records the denials as evidence.",
+  "expectedFailures": [],
+  "overlayDir": "overlay"
+}
