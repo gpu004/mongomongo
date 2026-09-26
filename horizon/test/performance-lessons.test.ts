@@ -282,6 +282,18 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
       seededFixture: "",
     },
   );
+  memory.injectForeign(
+    codebaseTag,
+    "ep-other-3-v1",
+    `Mission other-mission; task optimize-search; hypothesis: reduce read-path p95 by pre-normalizing documents. Outcome: accepted. ${"pre-normalizing documents trace ".repeat(6000)}`,
+    {
+      missionId: "other-mission",
+      episodeId: "ep-other-3-v1",
+      contractVersion: 1,
+      interpretation: "verified",
+      seededFixture: "",
+    },
+  );
   const controller = controllerFor(
     "perf-lessons",
     runs,
@@ -334,9 +346,19 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
   );
   assert.doesNotMatch(worker.packets[0]!, /by guessing/);
   const firstPacket = await ledger.findEvent(`${first.experimentId}:packet`);
-  assert.deepEqual((payloadOf(firstPacket).crossMission as { injected: unknown[] }).injected, [
+  const crossAudit = payloadOf(firstPacket).crossMission as {
+    fetched: string[];
+    injected: unknown[];
+    dropped: string[];
+  };
+  // The oversized verified hit passes post-filtering but not the packet budget: fetched, not injected.
+  assert.deepEqual(new Set(crossAudit.fetched), new Set(["ep-other-1-v1", "ep-other-3-v1"]));
+  assert.deepEqual(crossAudit.injected, [
     { episodeId: "ep-other-1-v1", missionId: "other-mission", containerTag: codebaseTag },
   ]);
+  assert.deepEqual(crossAudit.dropped, ["ep-other-3-v1"]);
+  assert.ok((payloadOf(firstPacket).dropped as string[]).includes("ep-other-3-v1"));
+  assert.doesNotMatch(worker.packets[0]!, /documents trace/);
   assert.ok(
     (payloadOf(firstPacket).filteredOut as { episodeId: string; reason: string }[]).some(
       (f) => f.episodeId === "ep-other-2-v1" && f.reason === "cross-mission: not verifier-backed",

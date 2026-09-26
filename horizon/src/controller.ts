@@ -1868,7 +1868,13 @@ export class MissionController {
       crossMission: {
         readTags: crossTags,
         degraded: cross.degraded,
-        injected: cross.injected.map((r) => ({ episodeId: r.episodeId, ...r.provenance! })),
+        fetched: cross.injected.map((r) => r.episodeId),
+        injected: cross.injected
+          .filter((r) => packet.injectedEpisodeIds.includes(r.episodeId))
+          .map((r) => ({ episodeId: r.episodeId, ...r.provenance! })),
+        dropped: cross.injected
+          .filter((r) => packet.droppedEpisodeIds.includes(r.episodeId))
+          .map((r) => r.episodeId),
       },
       lessons: lessons.map((l) => ({
         lessonId: l.lessonId,
