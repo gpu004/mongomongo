@@ -311,7 +311,7 @@ export class MissionController {
       environmentHash: this.environmentHash,
       seedArtifactHash: seed.hash,
       ledgerBackend: ledger.backend,
-      config: this.config,
+      config: { ...this.config, ledger: { backend: ledger.backend } },
     });
     this.artifacts.restoreWorkspace(seed.hash, this.paths.candidate);
     return this.mission();

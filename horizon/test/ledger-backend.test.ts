@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { MissionController, SimulatedCrash } from "../src/controller.ts";
 import { describeLedgerSelection, openLedger, selectLedgerBackend } from "../src/ledger-backend.ts";
 import { LeaseError } from "../src/ledger-contract.ts";
 import { evaluateLiveGate } from "../src/live-gate.ts";
 import { LocalMemoryAdapter } from "../src/memory-adapter.ts";
-import { loadMissionConfig, validateMissionConfig } from "../src/mission-contract.ts";
+import {
+  loadMissionConfig,
+  type MissionConfig,
+  validateMissionConfig,
+} from "../src/mission-contract.ts";
 import { missionPaths } from "../src/mission-paths.ts";
 import { readMongoEnv } from "../src/mongo-env.ts";
 import { MongoLedger } from "../src/mongo-ledger.ts";
@@ -76,6 +81,33 @@ test("openLedger returns a sqlite ledger without MONGODB_URI and a controller ru
   assert.ok(created, "mission.created event recorded");
   assert.equal((created.payload as { ledgerBackend: string }).ledgerBackend, "sqlite");
   await controller.close();
+});
+
+test("mission create pins the resolved backend in the manifest so resume ignores env drift", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "backend-pinned";
+  const { ledger: _unpinned, ...config } = testConfig(missionId);
+  const paths = missionPaths(missionId, runs);
+  const controller = new MissionController(config, paths, {
+    memory: new LocalMemoryAdapter(),
+    ledger: () => openLedger(config, paths, {}),
+  });
+  await controller.initialize();
+  await controller.close();
+
+  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8")) as {
+    ledgerBackend: string;
+    config: MissionConfig;
+  };
+  assert.equal(manifest.ledgerBackend, "sqlite");
+  assert.deepEqual(manifest.config.ledger, { backend: "sqlite" });
+  assert.deepEqual(selectLedgerBackend(manifest.config, { MONGODB_URI: MONGO_URI }), {
+    backend: "sqlite",
+    source: "config",
+  });
+
+  const mongoCreated = { ...manifest.config, ledger: { backend: "mongodb" as const } };
+  assert.throws(() => selectLedgerBackend(mongoCreated, {}), /requires the mongodb ledger/);
 });
 
 test("a controller whose lease is taken over stops with LeaseError and the new owner's state is untouched", async () => {
