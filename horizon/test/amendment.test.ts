@@ -336,6 +336,16 @@ test("rebaseline after an invalidating runtime change re-measures baseline, best
   assert.equal(measured.environmentHash, newEnvironment);
   assert.ok(measured.baselineP95Ms !== null);
   const reports = await rebaseliner.ledger.listVerifications(id);
+  const baselineEvent = await rebaseliner.ledger.findEvent(`baseline:${id}-r1`);
+  const targetEvent = await rebaseliner.ledger.findEvent(`target:${id}:assessed-r1`);
+  assert.ok(baselineEvent && targetEvent, "the rebaseline records its own baseline/target events");
+  const cited = (baselineEvent.payload as { reportId: string }).reportId;
+  const citedRow = reports.find((v) => v.reportId === cited);
+  assert.equal(citedRow?.experimentId, `exp-baseline-${id}-r1`);
+  assert.equal(citedRow?.environmentHash, newEnvironment);
+  const original = await rebaseliner.ledger.findEvent(`baseline:${id}`);
+  assert.ok(original);
+  assert.notEqual(cited, (original.payload as { reportId: string }).reportId);
   const fresh = reports.filter((v) => v.environmentHash === newEnvironment);
   const seed = measured.seedArtifactHash!;
   assert.ok(
@@ -350,10 +360,7 @@ test("rebaseline after an invalidating runtime change re-measures baseline, best
   assert.equal(reports.length, oldReports.length + fresh.length, "old reports kept as history");
   const experiments = await rebaseliner.ledger.listExperiments(id);
   const baselines = experiments.filter((e) => e.taskId === "baseline").map((e) => e.experimentId);
-  assert.deepEqual(baselines.sort(), [
-    `exp-baseline-${id}`,
-    `exp-baseline-${id}-${computeEvaluatorHash().slice(0, 12)}-${newEnvironment.slice(0, 12)}`,
-  ]);
+  assert.deepEqual(baselines.sort(), [`exp-baseline-${id}`, `exp-baseline-${id}-r1`]);
   assert.equal(
     (await rebaseliner.ledger.listTasks(id)).find((t) => t.taskId === "holdout")?.status,
     "pending",
@@ -377,6 +384,67 @@ test("rebaseline after an invalidating runtime change re-measures baseline, best
   const manifest = readManifest(id, runs);
   assert.equal(manifest.environmentHash, newEnvironment);
   assert.equal(manifest.environment.arch, moved.arch);
+});
+
+test("revisiting an earlier identity (A -> B -> A -> B) starts a fresh epoch instead of replaying B's old rebaseline", async () => {
+  const runs = tempRunsRoot();
+  const id = "amend-rebase-revisit";
+  const a = HOST;
+  const b = { ...HOST, arch: HOST.arch === "arm64" ? "x64" : "arm64" };
+  const first = controllerFor(id, runs, { host: a });
+  await first.initialize();
+  assert.equal((await first.run()).status, "succeeded");
+  await first.close();
+
+  for (const host of [b, a, b]) {
+    const c = resumeFromManifest(id, runs, { host });
+    const outcome = await c.rebaseline();
+    assert.equal(outcome.environmentHash.to, c.environmentHash);
+    assert.ok(outcome.baselineP95Ms !== null);
+    await c.close();
+    const resumed = resumeFromManifest(id, runs, { host });
+    assert.equal((await resumed.run()).status, "succeeded");
+    await resumed.close();
+  }
+  const last = resumeFromManifest(id, runs, { host: b });
+  const settled = await last.rebaseline();
+  assert.deepEqual(await last.rebaseline(), settled, "settled: repeat is a no-op");
+  const rebaselined = (await last.ledger.eventsSince(0, 10_000)).filter(
+    (e) => e.type === "evaluator.rebaselined",
+  );
+  assert.deepEqual(
+    rebaselined.map((e) => (e.payload as { epoch: number }).epoch),
+    [1, 2, 3],
+  );
+  const third = rebaselined[2]!.payload as {
+    previousBestArtifactHash: string | null;
+    environmentHash: { from: string; to: string };
+  };
+  const second = rebaselined[1]!.payload as { environmentHash: { from: string; to: string } };
+  assert.equal(
+    third.environmentHash.from,
+    second.environmentHash.to,
+    "third transition starts from A",
+  );
+  assert.equal(
+    third.environmentHash.to,
+    (rebaselined[0]!.payload as { environmentHash: { to: string } }).environmentHash.to,
+  );
+  const baselines = (await last.ledger.listExperiments(id))
+    .filter((e) => e.taskId === "baseline")
+    .map((e) => e.experimentId)
+    .sort();
+  assert.deepEqual(baselines, [
+    `exp-baseline-${id}`,
+    `exp-baseline-${id}-r1`,
+    `exp-baseline-${id}-r2`,
+    `exp-baseline-${id}-r3`,
+  ]);
+  const r3 = (await last.ledger.listVerifications(id)).filter(
+    (v) => v.experimentId === `exp-baseline-${id}-r3`,
+  );
+  assert.ok(r3.length > 0 && r3.every((v) => v.environmentHash === last.environmentHash));
+  await last.close();
 });
 
 test("an interrupted rebaseline is retried from the ledger instead of being mistaken for complete", async () => {

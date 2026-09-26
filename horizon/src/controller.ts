@@ -122,6 +122,8 @@ export interface PendingAmendment {
 
 /** Payload of `evaluator.rebaselined`: what the mission looked like when the rebaseline began. */
 interface RebaselineStart {
+  /** 1-based count of committed rebaselines; scopes every measurement the transition produces. */
+  epoch: number;
   evaluatorHash: { from: string; to: string };
   environmentHash: { from: string; to: string };
   environment: EnvironmentFingerprint;
@@ -552,23 +554,33 @@ export class MissionController {
         );
       const seed = before.seedArtifactHash;
       if (!seed) throw new Error("mission has no seed artifact");
-      const rebaselineId = this.identityScope;
-      const rebaselineKey = `mission:${this.config.missionId}:rebaselined:${rebaselineId}`;
-      const started = (await this.ledger.findEvent(rebaselineKey))?.payload as
-        | RebaselineStart
-        | undefined;
       const drifted =
         before.evaluatorHash !== this.evaluatorHash ||
         before.environmentHash !== this.environmentHash;
-      const origin: RebaselineStart = started ?? {
-        evaluatorHash: { from: before.evaluatorHash, to: this.evaluatorHash },
-        environmentHash: { from: before.environmentHash, to: this.environmentHash },
-        environment: this.environment,
-        previousBaselineP95Ms: before.baselineP95Ms,
-        previousBestArtifactHash: before.bestArtifactHash,
-        previousBestP95Ms: before.bestP95Ms,
-        previousStatus: before.status,
-      };
+      const committed = await this.rebaselines();
+      const last = committed.at(-1);
+      // The last transition is retried while the mission still carries its target identity but
+      // its measurements are incomplete; anything else that drifted starts a new epoch.
+      const resuming =
+        last !== undefined &&
+        !drifted &&
+        before.evaluatorHash === last.evaluatorHash.to &&
+        before.environmentHash === last.environmentHash.to;
+      const epoch = resuming ? last.epoch : committed.length + 1;
+      const rebaselineId = `r${epoch}`;
+      const rebaselineKey = `mission:${this.config.missionId}:rebaselined:${epoch}`;
+      const origin: RebaselineStart = resuming
+        ? last
+        : {
+            epoch,
+            evaluatorHash: { from: before.evaluatorHash, to: this.evaluatorHash },
+            environmentHash: { from: before.environmentHash, to: this.environmentHash },
+            environment: this.environment,
+            previousBaselineP95Ms: before.baselineP95Ms,
+            previousBestArtifactHash: before.bestArtifactHash,
+            previousBestP95Ms: before.bestP95Ms,
+            previousStatus: before.status,
+          };
       const previousBest = origin.previousBestArtifactHash;
       const remeasureId =
         previousBest && previousBest !== seed
@@ -582,19 +594,19 @@ export class MissionController {
         bestArtifactHash: before.bestArtifactHash ?? seed,
         bestRetained: before.bestArtifactHash === previousBest,
       };
-      if (!drifted && !started) {
+      if (!drifted && !resuming) {
         this.log("rebaseline: evaluator and environment match the frozen mission; nothing to do");
         return outcome;
       }
       if (
-        !drifted &&
+        resuming &&
         before.baselineP95Ms !== null &&
         (!remeasureId || (await this.ledger.findEvent(`${remeasureId}:remeasured`)))
       ) {
         this.log(`rebaseline: ${rebaselineId} already complete; nothing to do`);
         return outcome;
       }
-      if (started)
+      if (resuming)
         this.log(`rebaseline: ${rebaselineId} was interrupted; re-measuring from the ledger`);
       if (this.config.isolation === "container") assertSandboxAvailable(this.config.containerImage);
       await this.transaction(async (tx) => {
@@ -985,35 +997,34 @@ export class MissionController {
     this.log(`mission ${status}${detail ? `: ${detail}` : ""}`);
   }
 
-  /** `<evaluator>-<environment>` of this process; names everything a rebaseline re-measures. */
-  private get identityScope(): string {
-    return `${this.evaluatorHash.slice(0, 12)}-${this.environmentHash.slice(0, 12)}`;
+  /** Committed `evaluator.rebaselined` transitions in order; keyed lookups so compaction cannot hide them. */
+  private async rebaselines(): Promise<RebaselineStart[]> {
+    const out: RebaselineStart[] = [];
+    for (let epoch = 1; ; epoch++) {
+      const event = await this.ledger.findEvent(
+        `mission:${this.config.missionId}:rebaselined:${epoch}`,
+      );
+      if (!event) return out;
+      out.push(event.payload as RebaselineStart);
+    }
   }
 
   /**
-   * Fixed-task experiments (baseline, holdout) are named per verification identity so a
-   * rebaseline never finds, or collides with, reports measured by an earlier evaluator or
-   * runtime. The identity the mission was created under keeps the unsuffixed names.
+   * Fixed-task experiments and their events (baseline, target, holdout) are named per rebaseline
+   * epoch so a re-measurement never finds, or collides with, records from an earlier evaluator or
+   * runtime, even when an identity is revisited. The original run keeps the unsuffixed names.
    */
-  private async identitySuffix(): Promise<string> {
-    const created = await this.ledger.findEvent(`mission:${this.config.missionId}:created`);
-    const origin = created?.payload as
-      | { evaluatorHash?: string; environmentHash?: string }
-      | undefined;
-    if (
-      !origin ||
-      (origin.evaluatorHash === this.evaluatorHash &&
-        origin.environmentHash === this.environmentHash)
-    )
-      return "";
-    return `-${this.identityScope}`;
+  private async epochSuffix(): Promise<string> {
+    const epoch = (await this.rebaselines()).length;
+    return epoch === 0 ? "" : `-r${epoch}`;
   }
 
   private async runBaseline(): Promise<void> {
     const mission = await this.mission();
     const seed = mission.seedArtifactHash;
     if (!seed) throw new Error("mission has no seed artifact");
-    const experimentId = `exp-baseline-${this.config.missionId}${await this.identitySuffix()}`;
+    const suffix = await this.epochSuffix();
+    const experimentId = `exp-baseline-${this.config.missionId}${suffix}`;
     if (!(await this.ledger.getExperiment(experimentId))) {
       await this.ledger.insertExperiment({
         experimentId,
@@ -1099,13 +1110,13 @@ export class MissionController {
       });
       await tx.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "done" });
       await tx.appendEvent(
-        `baseline:${this.config.missionId}`,
+        `baseline:${this.config.missionId}${suffix}`,
         "mission.baseline",
         this.config.missionId,
         { p95: perf.metrics.p95LatencyMs, reportId: perf.reportId },
       );
       await tx.appendEvent(
-        `target:${this.config.missionId}:assessed`,
+        `target:${this.config.missionId}:assessed${suffix}`,
         "target.assessed",
         this.config.missionId,
         {
@@ -1141,7 +1152,7 @@ export class MissionController {
     const mission = await this.mission();
     const best = mission.bestArtifactHash;
     if (!best) throw new Error("no best artifact");
-    const experimentId = `exp-holdout-${this.config.missionId}-${best.slice(0, 12)}${await this.identitySuffix()}`;
+    const experimentId = `exp-holdout-${this.config.missionId}-${best.slice(0, 12)}${await this.epochSuffix()}`;
     if (!(await this.ledger.getExperiment(experimentId))) {
       await this.ledger.insertExperiment({
         experimentId,
