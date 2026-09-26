@@ -23,12 +23,16 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
   indexes, then removes its probe data without printing credentials
 - An LLM API key for the Pi worker (`"worker": "pi"`): `<PROVIDER>_API_KEY` for the configured `model.provider` (`ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`/`GEMINI_API_KEY` for `google`); the `scripted` worker needs none
 
+Pi and Supermemory are consumed as the npm packages pinned in `package.json`
+(`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `supermemory`); the repo carries no
+vendored copy of either project.
+
 ## Setup and checks
 
 ```sh
 npm install
 npm run check          # tsc --noEmit
-npm run lint           # oxlint . + scripts/lint-comments.ts (no section dividers, diff narration, or unjustified suppressions)
+npm run lint           # oxlint --max-warnings 0 . + scripts/lint-comments.ts (no section dividers, diff narration, or unjustified suppressions)
 npm run format:check   # oxfmt --check . (npm run format rewrites in place)
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, ledger contract
 MONGODB_URI=... npm test   # additionally runs the ledger contract and controller runtime tests against MongoDB in throwaway databases
@@ -37,6 +41,12 @@ npm test               # recovery, fault injection, policies, report validation,
                        # pinned image is present (skipped otherwise; HORIZON_REQUIRE_DOCKER=1 makes the skip a failure)
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
+
+`.github/workflows/ci.yml` runs this set on every pull request and push to `main` with no
+provider or service credentials: one job with the sqlite ledger and subprocess isolation, and a
+second job that pulls the digest-pinned `containerImage` from `mission.example.json` and starts a
+MongoDB service so the sandbox-escape tests run under `HORIZON_REQUIRE_DOCKER=1` and the ledger
+contract covers both adapters.
 
 `stagnationLimit` (mission config): once that many optimize-search experiments have concluded since the last accepted one, the worker's packet carries a stagnation directive listing the mechanisms already tried, and a cycle that repeats one of them without first calling `profile_candidate` is rejected without running the verifier.
 

@@ -106,7 +106,8 @@ test("a rate-limited provider parks the mission in waiting with nextWakeAt; resu
   const waiting = (await controller.ledger.eventsSince(0)).find(
     (e) => e.type === "mission.waiting",
   );
-  assert.equal((waiting?.payload as { nextWakeAt: string }).nextWakeAt, row.nextWakeAt);
+  assert.ok(waiting, "mission.waiting event recorded");
+  assert.equal((waiting.payload as { nextWakeAt: string }).nextWakeAt, row.nextWakeAt);
   assert.equal((await controller.ledger.latestCheckpoint("wf-429"))?.missionStatus, "waiting");
   await controller.close();
 

@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+
+defaults:
+  run:
+    working-directory: horizon
+
+jobs:
+  verify:
+    name: check / lint / format / test / smoke / doctor
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: horizon/package-lock.json
+      - run: npm ci
+      - name: No provider or service credentials leak into CI
+        run: |
+          for k in SUPERMEMORY_API_KEY MONGODB_URI OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY; do
+            if [ -n "${!k:-}" ]; then echo "::error::$k is set in the CI environment"; exit 1; fi
+          done
+          test ! -e .env
+      - run: npm run check
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm test
+      - name: Smoke runner
+        run: node scripts/smoke-runner.ts
+      - name: Doctor
+        run: node src/cli.ts doctor
+
+  container-and-mongo:
+    name: container sandbox + mongodb ledger tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MONGODB_URI: mongodb://localhost:27017/?replicaSet=rs0
+      MONGODB_DB: horizon_ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start a single-node MongoDB replica set (mongo:7.0.43, digest-pinned)
+        run: |
+          docker run -d --name mongodb -p 27017:27017 \
+            mongo@sha256:9854f7139445d766a9523571d6f047530c45547460ffcf8259eb2bf4264632ca \
+            --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            if docker exec mongodb mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]}).ok' >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          for i in $(seq 1 30); do
+            if [ "$(docker exec mongodb mongosh --quiet --eval 'db.hello().isWritablePrimary')" = "true" ]; then exit 0; fi
+            sleep 1
+          done
+          echo "::error::mongodb replica set did not become primary"; docker logs mongodb; exit 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: horizon/package-lock.json
+      - run: npm ci
+      - name: Pull the digest-pinned sandbox image from mission.example.json
+        run: |
+          image=$(node -p 'require("./mission.example.json").containerImage')
+          case "$image" in *@sha256:*) ;; *) echo "::error::containerImage is not digest-pinned: $image"; exit 1;; esac
+          docker pull "$image"
+      - name: Tests with container isolation required and both ledger adapters
+        env:
+          HORIZON_REQUIRE_DOCKER: "1"
+        run: npm test
+      - name: Doctor (docker + mongodb reachable)
+        run: node src/cli.ts doctor
