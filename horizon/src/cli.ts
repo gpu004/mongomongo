@@ -36,7 +36,7 @@ const USAGE = `horizon <command> [options]
   doctor [--config mission.json]           check node, sqlite, mongodb, docker, seed, evaluator hash, provider API key
   mission create --config mission.json     freeze identities and import the seed
   run --mission M [--cycles N]             run (or resume) the mission loop; SIGINT/SIGTERM stops it gracefully
-  resume --mission M                       clear a pause, then run
+  resume --mission M                       clear a pending stop/pause, then run
   stop --mission M                         ask the running controller to stop after in-flight work (exit 0)
   pause --mission M                        like stop, but the mission stays paused until \`resume\`
   verify --mission M --artifact A --suite smoke|correctness|performance|holdout|learned|structural
@@ -234,7 +234,11 @@ async function main(): Promise<number> {
     case "run":
     case "resume": {
       const { config, paths } = loadMission();
-      if (command === "resume" && clearControl(paths, "pause")) log("control: pause cleared");
+      if (command === "resume") {
+        const pending = readControl(paths);
+        if (pending && clearControl(paths, pending))
+          log(`control: pending ${pending.command} cleared`);
+      }
       const controller = new MissionController(config, paths, {
         log,
         worker: makeWorker(config, paths),

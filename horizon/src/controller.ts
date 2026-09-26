@@ -38,7 +38,7 @@ import {
   SupermemoryAdapter,
 } from "./memory-adapter.ts";
 import { composeRetrievalQuery, MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
-import { clearControl, readControl } from "./operator-control.ts";
+import { type ControlRequest, clearControl, readControl } from "./operator-control.ts";
 import { contractHash, type MissionConfig } from "./mission-contract.ts";
 import {
   ensureMissionDirs,
@@ -94,6 +94,8 @@ export interface StopRequest {
   intent: "stop" | "pause";
   source: "signal" | "operator";
   reason: string;
+  /** The control-file request being honoured, consumed once its checkpoint commits. */
+  control?: ControlRequest;
 }
 
 /** Thrown at a shutdown boundary inside a cycle; `run()` turns it into the interruption checkpoint. */
@@ -512,8 +514,6 @@ export class MissionController {
           experiment.segmentOrdinal === this.segmentOrdinal && experiment.finishedAt !== null,
       ).length;
       await this.applyRetention();
-      // A `stop` left over from a run that never saw it must not stop this one; `pause` still holds.
-      if (clearControl(this.paths, "stop")) this.log("control: cleared stale stop request");
       await this.honourWakeTime();
       await this.pollControl();
       if (this.stopRequest) {
@@ -591,16 +591,20 @@ export class MissionController {
     if (this.heartbeatError instanceof LeaseError) throw this.heartbeatError;
   }
 
-  /** Between cycles: adopt an operator `stop` (consumed) or `pause` (kept until `horizon resume`). */
+  /**
+   * Between cycles: adopt an operator `stop` or `pause`. The control file stays in place
+   * until the interruption checkpoint has committed (`interrupt()` consumes a `stop`;
+   * `pause` is kept until `horizon resume`), so a crash in between cannot lose the request.
+   */
   private async pollControl(): Promise<void> {
     if (this.stopRequest) return;
     const control = readControl(this.paths);
     if (!control) return;
-    if (control.command === "stop") clearControl(this.paths, "stop");
     await this.requestStop({
       intent: control.command,
       source: "operator",
       reason: `${control.command} requested by ${control.by || "operator"} at ${control.requestedAt}`,
+      control,
     });
   }
 
@@ -643,6 +647,9 @@ export class MissionController {
         `${request.intent}:${request.source}`,
       );
     });
+    // Only now is the operator's stop durable in the ledger; a newer request is left for the next run.
+    if (request.control?.command === "stop" && clearControl(this.paths, request.control))
+      this.log("control: stop request consumed");
     this.log(
       `mission ${status} (${request.source}); checkpointed${activeExperimentId ? ` with ${activeExperimentId} open` : ""}; run \`horizon resume\` to continue`,
     );
@@ -1017,13 +1024,14 @@ export class MissionController {
       });
     } catch (error) {
       broker.terminateChildren();
-      if (error instanceof WorkerUnavailableError)
-        return this.parkOnWorkerFault(error, experimentId);
       if (this.stopRequest) {
-        // The abort we asked for surfaced as the worker's failure; the edit is discarded, the experiment closed.
+        // The abort we asked for surfaced as the worker's failure (possibly dressed as a provider
+        // error); the edit is discarded, the experiment closed, and the stop wins over parking.
         await this.interruptExperiment(experimentId, error);
         throw new MissionInterrupted(null);
       }
+      if (error instanceof WorkerUnavailableError)
+        return this.parkOnWorkerFault(error, experimentId);
       throw error;
     } finally {
       this.activeBroker = undefined;

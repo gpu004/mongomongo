@@ -13,7 +13,8 @@ export interface ControlRequest {
 /**
  * Operator intent for a mission, written by `horizon stop|pause` and polled by the
  * running controller between cycles (and during a rate-limit wait). `stop` is
- * consumed by the controller that honours it; `pause` persists until `horizon resume`.
+ * consumed by the controller that honours it, only after the interruption checkpoint
+ * has committed; `pause` persists until `horizon resume`, which clears either.
  */
 export function readControl(paths: MissionPaths): ControlRequest | undefined {
   if (!existsSync(paths.control)) return undefined;
@@ -35,10 +36,24 @@ export function writeControl(paths: MissionPaths, command: ControlCommand, by: s
   writeJsonAtomic(paths.control, request);
 }
 
-/** Removes the control file when it carries `command` (or any command when omitted). */
-export function clearControl(paths: MissionPaths, command?: ControlCommand): boolean {
+/**
+ * Removes the control file when it carries `match` — a command, or an exact request so a
+ * newer request written meanwhile survives (or any request when omitted).
+ */
+export function clearControl(
+  paths: MissionPaths,
+  match?: ControlCommand | ControlRequest,
+): boolean {
   const current = readControl(paths);
-  if (!current || (command && current.command !== command)) return false;
+  if (!current) return false;
+  if (typeof match === "string" && current.command !== match) return false;
+  if (
+    typeof match === "object" &&
+    (current.command !== match.command ||
+      current.requestedAt !== match.requestedAt ||
+      current.by !== match.by)
+  )
+    return false;
   rmSync(paths.control, { force: true });
   return true;
 }

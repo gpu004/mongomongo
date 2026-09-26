@@ -3,6 +3,8 @@ import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { test } from "node:test";
 import { abortableSleep } from "../src/controller.ts";
+import { openLedger } from "../src/ledger-backend.ts";
+import type { AsyncLedger } from "../src/ledger-contract.ts";
 import { missionPaths } from "../src/mission-paths.ts";
 import { clearControl, readControl, writeControl } from "../src/operator-control.ts";
 import { ScriptedWorker } from "../src/scripted-worker.ts";
@@ -12,7 +14,7 @@ import {
   type WorkerCycleResult,
   WorkerUnavailableError,
 } from "../src/worker.ts";
-import { controllerFor, tempRunsRoot } from "./helpers.ts";
+import { controllerFor, tempRunsRoot, testConfig } from "./helpers.ts";
 
 const CLI = new URL("../src/cli.ts", import.meta.url).pathname;
 
@@ -238,8 +240,6 @@ test("operator stop: a stop written during a cycle is honoured after it, rests t
   await setup.initialize();
   await setup.close();
 
-  // A stop left over from before this run is stale and must not stop it.
-  writeControl(paths, "stop", "stale");
   const worker = new ScriptedWorker();
   const original = worker.runCycle.bind(worker);
   worker.runCycle = async (input) => {
@@ -272,6 +272,118 @@ test("operator stop: a stop written during a cycle is honoured after it, rests t
   await next.close();
 });
 
+test("operator stop written before startup is honoured at the first boundary, never discarded as stale", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "sd-stop-startup";
+  const paths = missionPaths(missionId, runs);
+  const setup = controllerFor(missionId, runs);
+  await setup.initialize();
+  await setup.close();
+
+  writeControl(paths, "stop", "before-start");
+  const controller = controllerFor(missionId, runs);
+  const row = await controller.run();
+  assert.equal(row.status, "interrupted");
+  assert.equal(row.spentExperiments, 0);
+  assert.equal((await controller.ledger.latestCheckpoint(missionId))?.missionStatus, "interrupted");
+  await controller.close();
+  assert.equal(existsSync(paths.control), false, "stop consumed once checkpointed");
+
+  const next = controllerFor(missionId, runs, { maxCycles: 1 });
+  assert.notEqual((await next.run()).status, "interrupted");
+  await next.close();
+});
+
+/** Opens the real ledger but makes the first `mission.interrupted` append fail inside its transaction. */
+function crashingOnInterrupt(missionId: string, runs: string): () => Promise<AsyncLedger> {
+  return async () => {
+    const real = await openLedger(testConfig(missionId), missionPaths(missionId, runs));
+    let crashed = false;
+    const wrapTx = (tx: AsyncLedger): AsyncLedger =>
+      new Proxy(tx, {
+        get(target, key, receiver) {
+          if (key !== "appendEvent") return Reflect.get(target, key, receiver);
+          return (...args: Parameters<AsyncLedger["appendEvent"]>) => {
+            if (args[1] === "mission.interrupted" && !crashed) {
+              crashed = true;
+              throw new Error("simulated crash before the interruption checkpoint committed");
+            }
+            return target.appendEvent(...args);
+          };
+        },
+      });
+    return new Proxy(real, {
+      get(target, key, receiver) {
+        if (key !== "transaction") return Reflect.get(target, key, receiver);
+        return <T>(fn: (tx: AsyncLedger) => Promise<T>) =>
+          target.transaction((tx) => fn(wrapTx(tx)));
+      },
+    });
+  };
+}
+
+test("a crash before the interruption checkpoint commits keeps the operator stop; the restart honours it", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "sd-stop-crash";
+  const paths = missionPaths(missionId, runs);
+  const setup = controllerFor(missionId, runs);
+  await setup.initialize();
+  await setup.close();
+
+  const worker = new ScriptedWorker();
+  const original = worker.runCycle.bind(worker);
+  worker.runCycle = async (input) => {
+    writeControl(paths, "stop", "test");
+    return original(input);
+  };
+  const crashing = controllerFor(missionId, runs, {
+    worker,
+    ledger: crashingOnInterrupt(missionId, runs),
+  });
+  await assert.rejects(crashing.run(), /simulated crash/);
+  await crashing.close();
+  assert.equal(readControl(paths)?.command, "stop", "stop request survives the crash");
+  assert.notEqual((await setupLedger(missionId, runs)).status, "interrupted");
+
+  const restarted = controllerFor(missionId, runs);
+  const row = await restarted.run();
+  assert.equal(row.status, "interrupted");
+  assert.equal(row.spentExperiments, 1, "the completed experiment is not re-run");
+  assert.ok((await restarted.ledger.eventsSince(0)).some((e) => e.type === "mission.interrupted"));
+  await restarted.close();
+  assert.equal(existsSync(paths.control), false, "consumed after the checkpoint committed");
+});
+
+async function setupLedger(missionId: string, runs: string) {
+  const ledger = await openLedger(testConfig(missionId), missionPaths(missionId, runs));
+  try {
+    return (await ledger.getMission(missionId))!;
+  } finally {
+    await ledger.close();
+  }
+}
+
+test("a newer control request written while stopping is not consumed with the one being honoured", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "sd-stop-newer";
+  const paths = missionPaths(missionId, runs);
+  const setup = controllerFor(missionId, runs);
+  await setup.initialize();
+  await setup.close();
+
+  writeControl(paths, "stop", "first");
+  const controller = controllerFor(missionId, runs);
+  const original = controller.requestStop.bind(controller);
+  controller.requestStop = async (request) => {
+    await original(request);
+    writeControl(paths, "pause", "second");
+  };
+  const row = await controller.run();
+  assert.equal(row.status, "interrupted");
+  await controller.close();
+  assert.equal(readControl(paths)?.by, "second", "the later request is still pending");
+});
+
 /** Pi whose in-flight prompt rejects when aborted (as `session.prompt()` does), and fails outright otherwise. */
 class AbortRejectingWorker implements Worker {
   readonly mode = "pi" as const;
@@ -294,8 +406,11 @@ class AbortRejectingWorker implements Worker {
     });
   }
   async closeSegment() {}
+  protected fail(error: Error) {
+    this.reject?.(error);
+  }
   async abort() {
-    this.reject?.(new Error("prompt aborted"));
+    this.fail(new Error("prompt aborted"));
   }
 }
 
@@ -380,5 +495,77 @@ test("SIGTERM during the baseline phase: interruption is checkpointed between su
     (e) => e.taskId === "baseline",
   );
   assert.equal(baselines.length, 1);
+  await resumed.close();
+});
+
+/** Pi whose in-flight prompt, when aborted, surfaces the abort dressed as a provider fault. */
+class UnavailableOnAbortWorker extends AbortRejectingWorker {
+  override async abort() {
+    this.fail(new WorkerUnavailableError("rate_limited", "429 during abort", 60 * 60 * 1000));
+  }
+}
+
+test("a stop wins over a provider fault raised by the aborted worker: interrupted, not parked as waiting", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "sd-abort-unavailable";
+  const worker = new UnavailableOnAbortWorker();
+  const controller = controllerFor(missionId, runs, { worker });
+  await controller.initialize();
+  const running = controller.run();
+  await worker.prompting;
+  await controller.requestStop({ intent: "stop", source: "signal", reason: "SIGTERM" });
+  const row = await running;
+  assert.equal(row.status, "interrupted");
+  assert.equal(row.nextWakeAt, null);
+  const events = await controller.ledger.eventsSince(0);
+  assert.ok(events.some((e) => e.type === "mission.interrupted"));
+  assert.ok(!events.some((e) => e.type === "mission.waiting"), "no rate-limit parking");
+  assert.equal((await controller.ledger.latestCheckpoint(missionId))?.missionStatus, "interrupted");
+  await controller.close();
+
+  // Without a stop the same fault still parks the mission.
+  const parked = controllerFor("sd-unavailable-plain", runs, { worker: new RateLimitedWorker() });
+  await parked.initialize();
+  assert.equal((await parked.run()).status, "waiting");
+  await parked.close();
+});
+
+test("SIGTERM during the holdout phase: checkpoint + mission.interrupted, lease released; resume finishes without repeating experiments", async () => {
+  const runs = tempRunsRoot();
+  const missionId = "sd-holdout";
+  const controller = controllerFor(missionId, runs);
+  await controller.initialize();
+  const running = controller.run();
+  const untilHoldout = new Promise<void>((resolve) => {
+    const tick = setInterval(() => {
+      void controller.ledger.listExperiments(missionId).then((rows) => {
+        if (rows.some((e) => e.taskId === "holdout" && e.status === "evaluating")) {
+          clearInterval(tick);
+          resolve();
+        }
+      });
+    }, 5);
+  });
+  await untilHoldout;
+  await controller.requestStop({ intent: "stop", source: "signal", reason: "SIGTERM" });
+  const row = await running;
+  assert.equal(row.status, "interrupted");
+  const before = await controller.ledger.listExperiments(missionId);
+  const holdouts = before.filter((e) => e.taskId === "holdout");
+  assert.equal(holdouts.length, 1);
+  const events = await controller.ledger.eventsSince(0);
+  assert.ok(events.some((e) => e.type === "mission.interrupted"));
+  assert.equal((await controller.ledger.latestCheckpoint(missionId))?.missionStatus, "interrupted");
+  assert.equal(controller.lease, undefined, "lease released");
+  await controller.close();
+
+  const resumed = controllerFor(missionId, runs);
+  const done = await resumed.run();
+  assert.equal(done.status, "succeeded");
+  assert.equal(done.spentExperiments, row.spentExperiments, "no optimize experiment re-spent");
+  const after = await resumed.ledger.listExperiments(missionId);
+  assert.equal(after.length, before.length, "no experiment planned twice");
+  assert.equal(after.filter((e) => e.taskId === "holdout").length, 1);
+  assert.equal(after.find((e) => e.taskId === "holdout")!.status, "accepted");
   await resumed.close();
 });
