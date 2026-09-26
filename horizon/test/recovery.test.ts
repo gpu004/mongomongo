@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { SimulatedCrash } from "../src/controller.ts";
+import { Ledger } from "../src/ledger.ts";
 import { missionPaths } from "../src/mission-paths.ts";
 import { controllerFor, tempRunsRoot } from "./helpers.ts";
 
@@ -162,6 +163,27 @@ test("drift in frozen identities is refused on resume", async () => {
   const drifted = controllerFor("rec-drift", runs, {}, { targetP95Reduction: 0.5 });
   await assert.rejects(drifted.run(), /contract hash drift/);
   drifted.close();
+});
+
+test("ledger: containers registered within the same millisecond list in registration order", () => {
+  const ledger = new Ledger(join(tempRunsRoot(), "state.sqlite"));
+  // Lexical order is the reverse of registration order, so a name tie-break would misorder them.
+  const names = ["horizon-cand-zzz", "horizon-cand-mmm", "horizon-cand-aaa"];
+  ledger.transaction(() => {
+    for (const name of names) ledger.registerContainer(name, "led-order", `exp-${name}`);
+  });
+  ledger.db.exec("UPDATE container SET created_at = '2026-01-01T00:00:00.000Z'");
+  ledger.releaseContainer("horizon-cand-mmm");
+
+  assert.deepEqual(
+    ledger.listContainers("led-order").map((c) => c.containerName),
+    names,
+  );
+  assert.deepEqual(
+    ledger.listLiveContainers("led-order").map((c) => c.containerName),
+    ["horizon-cand-zzz", "horizon-cand-aaa"],
+  );
+  ledger.close();
 });
 
 test("container names are durable before launch and orphans are removed on resume", async () => {
