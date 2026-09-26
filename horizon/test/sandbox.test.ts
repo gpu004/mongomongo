@@ -69,7 +69,11 @@ test("sandbox: docker run is non-root, capability-less, read-only, bounded and l
   assert.deepEqual(flag(args, "--cpus"), ["1"]);
   assert.deepEqual(flag(args, "--pids-limit"), ["128"]);
   assert.match(flag(args, "--tmpfs")[0]!, /^\/tmp:.*noexec.*size=/);
-  assert.deepEqual(flag(args, "-v"), ["/host/candidate:/workspace:ro"], "only the candidate dir, read-only");
+  assert.deepEqual(
+    flag(args, "-v"),
+    ["/host/candidate:/workspace:ro"],
+    "only the candidate dir, read-only",
+  );
   assert.deepEqual(flag(args, "-w"), ["/workspace"]);
   assert.ok(!args.some((a) => a.includes("docker.sock")), "docker socket never mounted");
   assert.ok(!args.includes("--privileged"));
@@ -96,7 +100,10 @@ test("sandbox: ordinary execution has no network; candidates get the mission's i
   );
   assert.deepEqual(flag(candidate, "--network"), [net]);
   assert.deepEqual(flag(candidate, "-e").sort(), ["HOST=0.0.0.0", "PORT=8080"]);
-  assert.ok(!candidate.some((a) => /API_KEY|TOKEN|SECRET|HOME=/.test(a)), "no host credentials passed");
+  assert.ok(
+    !candidate.some((a) => /API_KEY|TOKEN|SECRET|HOME=/.test(a)),
+    "no host credentials passed",
+  );
 });
 
 test("sandbox: an unreachable Docker daemon fails explicitly instead of falling back to the host", () => {
@@ -118,7 +125,12 @@ test("mission contract: container isolation requires a digest-pinned image", () 
   const example = loadMissionConfig(EXAMPLE_CONFIG);
   assert.ok(isDigestPinnedImage(example.containerImage), "example config ships a pinned image");
   assert.throws(
-    () => validateMissionConfig({ ...example, isolation: "container", containerImage: "node:24-alpine" }),
+    () =>
+      validateMissionConfig({
+        ...example,
+        isolation: "container",
+        containerImage: "node:24-alpine",
+      }),
     /pinned by digest/,
   );
   assert.doesNotThrow(() =>
