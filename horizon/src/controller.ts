@@ -217,14 +217,17 @@ export class MissionController {
 			this.finish("blocked", infra ? "baseline could not be measured (infrastructure)" : "seed does not satisfy the contract; fix the seed before optimizing");
 			throw new BaselineError("baseline not established");
 		}
+		const noiseFloor = relativeSpread(perf.metrics.repetitionP95Ms ?? []);
+		const targetWithinNoise = noiseFloor >= this.config.targetP95Reduction;
 		this.ledger.transaction(() => {
 			this.ledger.updateExperiment(experimentId, { status: "accepted", verdict: `baseline p95 ${perf.metrics.p95LatencyMs}ms`, finishedAt: new Date().toISOString() });
 			this.ledger.updateMission(this.config.missionId, { baselineP95Ms: perf.metrics.p95LatencyMs ?? null, bestP95Ms: perf.metrics.p95LatencyMs ?? null, bestArtifactHash: seed });
 			this.ledger.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "done" });
-			this.ledger.appendEvent(`baseline:${this.config.missionId}`, "mission.baseline", this.config.missionId, { p95: perf.metrics.p95LatencyMs, reportId: perf.reportId });
+			this.ledger.appendEvent(`baseline:${this.config.missionId}`, "mission.baseline", this.config.missionId, { p95: perf.metrics.p95LatencyMs, repetitionP95Ms: perf.metrics.repetitionP95Ms ?? [], noiseFloor, targetWithinNoise, reportId: perf.reportId });
 			this.checkpoint("running", "optimize-search", null, "baseline-complete");
 		});
-		this.log(`baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms)`);
+		this.log(`baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms; repetition spread ${(noiseFloor * 100).toFixed(1)}%)`);
+		if (targetWithinNoise) this.log(`warning: target reduction ${(this.config.targetP95Reduction * 100).toFixed(0)}% is within the measured baseline spread; increase repetitions/measuredRequests or lower the target`);
 	}
 
 	private async runHoldout(): Promise<void> {
@@ -323,7 +326,7 @@ export class MissionController {
 			return this.conclude(experiment, kind, `performance ${perf?.status ?? "missing"}: ${perf?.infraMessage ?? perf?.assertions.filter((a) => !a.passed).map((a) => a.id).join(", ") ?? ""}`, [...gate, ...(perf ? [perf] : [])], story, mission);
 		}
 		const decision = this.compareToBest(perf, mission);
-		if (!decision.accept) return this.conclude(experiment, "rejected", decision.reason, [...gate, perf], story, mission);
+		if (decision.verdict !== "accepted") return this.conclude(experiment, decision.verdict, decision.reason, [...gate, perf], story, mission);
 		this.ledger.transaction(() => {
 			this.ledger.updateMission(this.config.missionId, { bestArtifactHash: hash, bestP95Ms: perf.metrics.p95LatencyMs ?? null });
 			this.ledger.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, { p95: perf.metrics.p95LatencyMs, previous: mission.bestP95Ms });
@@ -337,20 +340,19 @@ export class MissionController {
 		return verdict;
 	}
 
-	private compareToBest(perf: VerificationReport, mission: MissionRow): { accept: boolean; reason: string } {
-		const p95 = perf.metrics.p95LatencyMs;
-		const best = mission.bestP95Ms;
-		if (p95 === undefined || best === null) return { accept: false, reason: "no comparable p95" };
-		const required = best * (1 - this.config.acceptanceMargin);
-		if (p95 > required) return { accept: false, reason: `p95 ${p95}ms not below ${required.toFixed(2)}ms (best ${best}ms minus margin)` };
-		const bestReport = this.bestPerformanceReport(mission);
-		const candidateReps = perf.metrics.repetitionP95Ms ?? [];
-		const bestReps = bestReport?.metrics.repetitionP95Ms ?? [];
-		const improved = candidateReps.filter((value, index) => bestReps[index] !== undefined && value < bestReps[index]!).length;
-		if (bestReps.length > 0 && improved < this.config.requiredImprovedRepetitions) {
-			return { accept: false, reason: `only ${improved}/${candidateReps.length} paired repetitions improved; ${this.config.requiredImprovedRepetitions} required` };
-		}
-		return { accept: true, reason: `p95 ${p95}ms vs best ${best}ms; ${improved}/${candidateReps.length} paired repetitions improved` };
+	/**
+	 * Acceptance policy. A candidate is accepted only when it beats the best by the
+	 * margin on the median p95 and on enough paired repetitions. A candidate whose
+	 * p95 lands inside the +/- margin band around the best is "ambiguous timing":
+	 * neither a demonstrated improvement nor a demonstrated regression, so it is
+	 * inconclusive rather than rejected and must not count as a failed hypothesis.
+	 */
+	private compareToBest(perf: VerificationReport, mission: MissionRow): AcceptanceDecision {
+		return decideAcceptance(
+			{ p95: perf.metrics.p95LatencyMs, repetitionP95Ms: perf.metrics.repetitionP95Ms ?? [] },
+			{ p95: mission.bestP95Ms, repetitionP95Ms: this.bestPerformanceReport(mission)?.metrics.repetitionP95Ms ?? [] },
+			this.config,
+		);
 	}
 
 	private bestPerformanceReport(mission: MissionRow): VerificationReport | undefined {
@@ -405,6 +407,7 @@ export class MissionController {
 
 	private nextActionAfter(verdict: Verdict, reason: string, mission: MissionRow): string {
 		if (verdict === "accepted") return "profile the new best artifact and look for the next bottleneck";
+		if (verdict === "inconclusive" && reason.startsWith("ambiguous timing")) return "re-measure with more repetitions or a larger workload before deciding; the difference is inside the noise band";
 		if (verdict === "inconclusive") return "retry the same change; the failure was infrastructure, not product";
 		if (reason.startsWith("correctness")) return "read the failing assertion evidence, then restore invalidation before optimizing again";
 		if (mission.bestP95Ms !== null) return "the change did not beat the current best by the margin; try a different mechanism";
@@ -712,6 +715,37 @@ export class MissionController {
 	private crash(point: string): void {
 		if (this.crashAt === point) throw new SimulatedCrash(point);
 	}
+}
+
+export interface AcceptanceDecision {
+	verdict: Verdict;
+	reason: string;
+}
+
+export function decideAcceptance(
+	candidate: { p95: number | undefined; repetitionP95Ms: number[] },
+	best: { p95: number | null; repetitionP95Ms: number[] },
+	policy: Pick<MissionConfig, "acceptanceMargin" | "requiredImprovedRepetitions">,
+): AcceptanceDecision {
+	const { p95 } = candidate;
+	if (p95 === undefined || best.p95 === null) return { verdict: "inconclusive", reason: "no comparable p95" };
+	const required = best.p95 * (1 - policy.acceptanceMargin);
+	const upper = best.p95 * (1 + policy.acceptanceMargin);
+	if (p95 > upper) return { verdict: "rejected", reason: `p95 ${p95}ms not below ${required.toFixed(2)}ms (best ${best.p95}ms minus margin)` };
+	if (p95 > required) return { verdict: "inconclusive", reason: `ambiguous timing: p95 ${p95}ms within +/-${(policy.acceptanceMargin * 100).toFixed(0)}% of best ${best.p95}ms` };
+	const improved = candidate.repetitionP95Ms.filter((value, index) => best.repetitionP95Ms[index] !== undefined && value < best.repetitionP95Ms[index]!).length;
+	if (best.repetitionP95Ms.length > 0 && improved < policy.requiredImprovedRepetitions) {
+		return { verdict: "inconclusive", reason: `ambiguous timing: only ${improved}/${candidate.repetitionP95Ms.length} paired repetitions improved; ${policy.requiredImprovedRepetitions} required` };
+	}
+	return { verdict: "accepted", reason: `p95 ${p95}ms vs best ${best.p95}ms; ${improved}/${candidate.repetitionP95Ms.length} paired repetitions improved` };
+}
+
+/** (max - min) / median of the per-repetition p95s: the run-to-run spread the target must clear to be measurable. */
+export function relativeSpread(values: number[]): number {
+	if (values.length < 2) return 0;
+	const sorted = [...values].sort((a, b) => a - b);
+	const median = sorted[Math.floor(sorted.length / 2)]!;
+	return median > 0 ? (sorted[sorted.length - 1]! - sorted[0]!) / median : 0;
 }
 
 export class SimulatedCrash extends Error {

@@ -17,7 +17,7 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ```sh
 npm install
 npm run check          # tsc --noEmit
-npm test               # recovery, report validation, memory scope, lesson policy, context budget
+npm test               # recovery, report validation, memory scope, lesson policy, context budget, acceptance policy
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
 

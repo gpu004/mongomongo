@@ -39,6 +39,9 @@ Baseline measurements the prompt asks for that are **not** available: cost in cu
 | 5 | Validated correction materialization (`src/lesson-policy.ts`) | A learned check catches the known mistake without prose | `lesson-policy.test.ts`; learned scenario `learned-update-then-repeat-search` fails the stale-cache fixture and passes the seed | A bad check could block valid work; mitigated by fixture validation and additivity | Tests | Set `materializeCorrections=false`; scenarios are versioned |
 | 6 | Docker isolation | Real resource limits | Docker mission succeeded with `Isolation: observed container` | Docker availability | Manual run | `isolation=subprocess` (reported as weaker) |
 | 7 | Comparison harness (`horizon compare`) | Measures configurations per mission, not per request | This report §5 | Sample size | Repeats flag | none |
+| 8 | Incremental index reconciliation in the scripted worker's correct candidate (`src/scripted-worker.ts`) | Removes the full-rebuild latency spike that dominated p95 under a 5% mutation ratio | Before: 3/3 diagnostic missions on this VM missed the target (2.72→2.51 ms, 2.71→3.07 ms, 2.50→2.52 ms) and `recovery.test.ts` failed 3/6; after: 2.58→0.89 ms, 3/3 paired repetitions, all tests pass | none (candidate code only; the evaluator is unchanged) | Diagnostic missions + full suite | Revert the constant |
+| 9 | Ambiguous-timing verdict (`decideAcceptance`) | A candidate inside the ±margin band of the best is `inconclusive`, not `rejected`, so noise is not recorded as a failed hypothesis | `acceptance-policy.test.ts`; `compare` reports an `inconclusive` column | Fewer hard rejections for genuinely neutral changes | Tests | Restore the two-way verdict |
+| 10 | Baseline noise floor recorded before the target is frozen | The `mission.baseline` event carries `repetitionP95Ms`, `noiseFloor` ((max−min)/median) and `targetWithinNoise`; the controller warns when the target is inside the spread | Measured 16.4% spread on this VM for the example workload | none | `relativeSpread` test | none |
 
 Not done, kept as separate proposals: multi-worker orchestration, model changes, unrestricted self-modification, deployments.
 
@@ -48,7 +51,7 @@ Code: everything under `horizon/` (see PR https://github.com/gpu004/mongomongo/p
 
 ```
 npm run check                      # tsc --noEmit: clean
-npm test                           # 31 tests, 31 pass (after lowering the test-only p95 target to 10% for noise)
+npm test                           # 37 tests, 37 pass (31 originally; +6 acceptance-policy tests)
 node scripts/smoke-runner.ts       # seed pass/pass/pass; stale-cache smoke pass, correctness fail, perf fail; bypass structural fail
 node src/cli.ts mission create --config mission.example.json && node src/cli.ts run --mission search-p95-demo   # succeeded
 (Docker) mission search-p95-docker status=succeeded, observed container
@@ -60,7 +63,9 @@ Not run: Pi worker against a live model; hosted Supermemory; any workload larger
 ## 5. Results
 
 ### Before/after (single mission, subprocess)
-Baseline p95 1.83 ms → accepted candidate 1.25 ms (3/3 paired repetitions improved, holdout passed). Docker: 2.57 ms → 1.68 ms.
+Original run: baseline p95 1.83 ms → accepted candidate 1.25 ms (3/3 paired repetitions improved, holdout passed). Docker: 2.57 ms → 1.68 ms.
+
+After the incremental-index change (second VM, slower baseline): baseline 1.90 ms (repetition spread 16.4%) → accepted candidate 0.75 ms (−60%, 3/3 paired repetitions improved, holdout passed, 2 experiments, 11 s wall). The root cause of the earlier near-miss was measured, not assumed: with a 5% mutation ratio roughly every twentieth search followed a write and paid a full O(n) re-normalization, so the 95th percentile *was* the rebuild cost. Reconciling only changed documents removes that spike; the evaluator, workload and contract are unchanged.
 
 ### Configuration comparison (`horizon compare`, one run each, identical seed `b6502a00934a`, evaluator `7cae47a2f268`, schedule: crash at `snapshot_ready`, then resume; segment rotation every cycle so that "recent history" is genuinely bounded)
 
@@ -70,7 +75,17 @@ Baseline p95 1.83 ms → accepted candidate 1.25 ms (3/3 paired repetitions impr
 | durable+retrieval | succeeded | reached | 2 | 1 | 0 | 1/2 | 1 | 1886 | 6 | 0 |
 | durable+retrieval+correction | blocked | missed | 3 | 1 | 0 | 1/2 | 3 | 2232 | 7 | 1 |
 
-Reading: with bounded recent history alone, after the segment rotated the worker re-tried the already-rejected stale-cache idea (one wasted experiment). Retrieval brought the older episode back and avoided the repeat. The third configuration's "blocked" is a **timing miss, not a correctness or memory failure**: its accepted candidate measured 1.33 ms against a required 1.14 ms (only 2/3 repetitions improved) — the 30% target is close to the noise floor of this workload on this VM. The scripted worker is deterministic, so the experiment-count difference is real but small; the honest claim is "retrieval prevents the one scripted repeat", not a general effect size.
+Reading: with bounded recent history alone, after the segment rotated the worker re-tried the already-rejected stale-cache idea (one wasted experiment). Retrieval brought the older episode back and avoided the repeat. The third configuration's "blocked" was a **timing miss, not a correctness or memory failure**: its accepted candidate measured 1.33 ms against a required 1.14 ms (only 2/3 repetitions improved) — the 30% target was close to the noise floor of this workload on this VM. The scripted worker is deterministic, so the experiment-count difference is real but small; the honest claim is "retrieval prevents the one scripted repeat", not a general effect size.
+
+Re-run after changes 8–10 (same seed `b6502a00934a`, evaluator `7cae47a2f268`, same schedule, one run each):
+
+| configuration | status | target | baseline p95 | best p95 | experiments | rejected | inconclusive | repeated failures | crashes/recoveries | retrieved | max packet tokens | memory ops | materialized checks |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| durable-only | succeeded | reached | 1.819ms | 0.732ms | 3 | 2 | 0 | **1** | 1/2 | 0 | 1555 | 0 | 0 |
+| durable+retrieval | succeeded | reached | 2.009ms | 0.921ms | 2 | 1 | 0 | 0 | 1/2 | 1 | 1887 | 6 | 0 |
+| durable+retrieval+correction | succeeded | reached | 1.924ms | 0.727ms | 2 | 1 | 0 | 0 | 1/2 | 1 | 1892 | 6 | 1 |
+
+All three configurations now reach the target; the retrieval effect (one avoided repeat) is unchanged.
 
 ### Interruption tests (all pass, `test/recovery.test.ts`)
 Crash during edits → experiment interrupted, workspace restored; crash after snapshot → same snapshot evaluated; crash between report file and ledger commit → report reconciled from disk, not rerun; checkpoints/segments committed; idempotent rerun under lock; frozen-identity drift refused.
@@ -98,7 +113,7 @@ Every report under `runs/<mission>/reports/` carries `missionId`, `experimentId`
 ## 7. Remaining failures, unmeasured claims, limits, next experiment
 
 - **Unmeasured**: live LLM worker behaviour (the whole "model repeats mistakes" story is exercised only through the scripted worker); hosted Supermemory indexing lag and retrieval latency; any history longer than ~10 episodes; token cost (estimated only). No billion-token or multi-hour claim is made.
-- **Known weakness**: the 30% p95 target on the example workload is near the noise floor of this VM (one of three comparison runs missed it with a correct, faster candidate). Either lengthen `measuredRequests`/`repetitions` or lower the target when running on shared hardware.
+- **Addressed weakness**: the 30% p95 target was previously near the noise floor because the scripted candidate's full index rebuild landed in the top 5% of samples. That is fixed in the candidate, the baseline now records its own spread, and near-neutral timings are classified `inconclusive` instead of `rejected`. The residual risk is still shared-hardware noise: lengthen `measuredRequests`/`repetitions` when the baseline warning fires.
 - **Isolation**: `subprocess` mode is cooperative; only `container` mode enforces limits, and it was run manually, not in tests.
 - **Learning**: this is evidence-based strategy selection with materialized checks, not reinforcement learning; no weights change.
 - **Next experiment**: run `horizon compare --repeats 5` with the Pi worker on a real model and a seeded distractor set (irrelevant and stale episodes injected into the memory scope) to measure stale-fact errors and retrieval precision per mission — the harness records `filteredOut` reasons and injected IDs per packet already, so only the distractor generator and a credential are missing.
