@@ -7,6 +7,7 @@ import type { Suite } from "../verification/reports.ts";
 import {
   computeEnvironmentHash,
   computeEvaluatorHash,
+  environmentFingerprint,
   hashDirectory,
   runSuite,
 } from "../verification/runner.ts";
@@ -14,7 +15,13 @@ import { loadScenarios } from "../verification/scenarios/index.ts";
 import { checkImportBoundaries } from "../verification/structural.ts";
 import { ArtifactStore, SEED_DIR } from "./artifact-store.ts";
 import { compareConfigurations, renderComparison } from "./compare.ts";
-import { BaselineError, MissionController, RESOURCES_DIR, SimulatedCrash } from "./controller.ts";
+import {
+  BaselineError,
+  MissionController,
+  type MissionManifest,
+  RESOURCES_DIR,
+  SimulatedCrash,
+} from "./controller.ts";
 import { loadFeatureMap, validateFeatureMap } from "./feature-map.ts";
 import { Ledger } from "./ledger.ts";
 import { describeLedgerSelection, openLedger, selectLedgerBackend } from "./ledger-backend.ts";
@@ -22,18 +29,29 @@ import { readMongoEnv } from "./mongo-env.ts";
 import { probeMongo, renderMongoProbe } from "./mongo-probe.ts";
 import { evaluateLiveGate, exportLiveGate, renderLiveGate } from "./live-gate.ts";
 import { renderMemoryBench, runMemoryBench, type MemoryBenchResult } from "./memory-bench.ts";
-import { loadMissionConfig, type MissionConfig } from "./mission-contract.ts";
+import {
+  contractHash,
+  legacyContractHash,
+  loadMissionConfig,
+  type MissionConfig,
+} from "./mission-contract.ts";
 import { FileEvidenceStore, missionPaths, RUNS_ROOT } from "./mission-paths.ts";
 import { PiWorker, resolveProviderApiKey } from "./pi-worker.ts";
 import { exportMission, renderProgress, summarize } from "./progress.ts";
+import { classifyEnvironmentDrift } from "./recovery.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
 import { renderSkillEval, runSkillEval } from "./skill-eval.ts";
 import { providerApiKeyEnv, type Worker } from "./worker.ts";
 
 const USAGE = `horizon <command> [options]
 
-  doctor [--config mission.json]           check node, sqlite, mongodb, docker, seed, evaluator hash, provider API key
+  doctor [--config mission.json] [--mission M]
+                                           check node, sqlite, mongodb, docker, seed, evaluator hash, provider API key;
+                                           with --mission, report drift against the mission's frozen identities
   mission create --config mission.json     freeze identities and import the seed
+  amend --config mission.json              replace a mission's operating parameters (budget, model, worker, rotation,
+                                           stagnation, memory); the objective stays frozen; audited as mission.amended
+  rebaseline --mission M                   adopt a changed evaluator/runtime: re-measure the seed and the best artifact
   run --mission M [--cycles N]             run (or resume) the mission loop
   resume --mission M                       alias of run
   verify --mission M --artifact A --suite smoke|correctness|performance|holdout|learned|structural
@@ -75,6 +93,7 @@ const log = (line: string) => console.log(line);
 function loadMission(): {
   config: MissionConfig;
   paths: ReturnType<typeof missionPaths>;
+  manifest: MissionManifest;
 } {
   const missionId = values.mission;
   if (!missionId) throw new Error("--mission is required");
@@ -83,10 +102,42 @@ function loadMission(): {
     throw new Error(
       `mission ${missionId} not found under ${runsRoot}; run 'horizon mission create'`,
     );
-  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8")) as {
-    config: MissionConfig;
-  };
-  return { config: manifest.config, paths };
+  const manifest = JSON.parse(readFileSync(paths.manifest, "utf8")) as MissionManifest;
+  return { config: manifest.config, paths, manifest };
+}
+
+/** Drift of this process against a mission's frozen identities, one line per identity. */
+function driftNotes(manifest: MissionManifest): string[] {
+  const config = manifest.config;
+  const notes: string[] = [];
+  const contract = contractHash(config);
+  notes.push(
+    contract === manifest.contractHash
+      ? `contract ${contract.slice(0, 12)} matches`
+      : legacyContractHash(config) === manifest.contractHash
+        ? `contract ${manifest.contractHash.slice(0, 12)} -> ${contract.slice(0, 12)}: frozen before the objective/operating split; resume migrates it and records contract.migrated`
+        : `contract ${manifest.contractHash.slice(0, 12)} -> ${contract.slice(0, 12)}: the persisted config no longer hashes to the frozen objective; resume will refuse`,
+  );
+  if (manifest.pendingAmendment)
+    notes.push(
+      `amendment ${manifest.pendingAmendment.amendmentId} pending: resume adopts it if the ledger holds it, else discards it`,
+    );
+  const evaluator = computeEvaluatorHash();
+  notes.push(
+    evaluator === manifest.evaluatorHash
+      ? `evaluator ${evaluator.slice(0, 12)} matches`
+      : `evaluator ${manifest.evaluatorHash.slice(0, 12)} -> ${evaluator.slice(0, 12)}: resume will refuse; run 'horizon rebaseline --mission ${config.missionId}'`,
+  );
+  const environment = environmentFingerprint(config.isolation, config.containerImage);
+  const drift = classifyEnvironmentDrift(manifest.environment, environment);
+  notes.push(
+    !drift
+      ? `environment ${manifest.environmentHash.slice(0, 12)} matches`
+      : drift.severity === "warning"
+        ? `environment drift (warning): ${drift.reason}; resume continues and records environment.drifted`
+        : `environment drift (invalidating): ${drift.reason}; resume will refuse; run 'horizon rebaseline --mission ${config.missionId}'`,
+  );
+  return notes;
 }
 
 function makeWorker(config: MissionConfig, paths: ReturnType<typeof missionPaths>): Worker {
@@ -173,8 +224,44 @@ async function main(): Promise<number> {
           : `no ${providerEnv} (required for "worker": "pi"; the scripted worker needs none)`,
       ]);
       checks.push(["runsRoot", runsRoot]);
+      if (values.mission) {
+        const { manifest } = loadMission();
+        for (const note of driftNotes(manifest)) checks.push([`mission(${values.mission})`, note]);
+      }
       for (const [k, v] of checks) log(`${k.padEnd(28)} ${v}`);
       return 0;
+    }
+    case "amend": {
+      if (!values.config) throw new Error("--config is required");
+      const next = loadMissionConfig(resolve(values.config));
+      values.mission ??= next.missionId;
+      const { config, paths } = loadMission();
+      const controller = new MissionController(config, paths, { log });
+      try {
+        const amendment = await controller.amend(next);
+        log(
+          `mission ${config.missionId}: ${amendment.changes.length} operating parameter(s) amended, ${amendment.budgetExtensions.length} budget limit(s) extended; contract ${controller.contractHash.slice(0, 12)} unchanged`,
+        );
+      } finally {
+        await controller.close();
+      }
+      return 0;
+    }
+    case "rebaseline": {
+      const { config, paths } = loadMission();
+      const controller = new MissionController(config, paths, { log });
+      try {
+        const outcome = await controller.rebaseline();
+        log(
+          `mission ${config.missionId}: evaluator ${outcome.evaluatorHash.to.slice(0, 12)} env ${outcome.environmentHash.to.slice(0, 12)} baseline p95 ${outcome.baselineP95Ms ?? "n/a"}ms best ${outcome.bestArtifactHash.slice(0, 12)}${outcome.previousBest && outcome.previousBest !== outcome.bestArtifactHash ? ` (previous best ${outcome.previousBest.slice(0, 12)} demoted)` : ""}`,
+        );
+        return 0;
+      } catch (error) {
+        if (error instanceof BaselineError) return 2;
+        throw error;
+      } finally {
+        await controller.close();
+      }
     }
     case "mission": {
       if (sub !== "create") throw new Error(USAGE);
