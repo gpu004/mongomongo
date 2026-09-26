@@ -38,8 +38,8 @@
   "segmentRotationCycles": 2,
   "stagnationLimit": 3,
   "model": {
-    "provider": "anthropic",
-    "id": "claude-sonnet-4-5"
+    "provider": "google",
+    "id": "gemini-3.1-flash-lite"
   },
   "worker": "pi",
   "memory": {

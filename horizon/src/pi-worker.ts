@@ -226,6 +226,10 @@ export class PiWorker implements Worker {
           `provider ${this.options.provider} unavailable after in-session retries: ${providerError}`,
           parseRetryAfterMs(providerError) ?? DEFAULT_RATE_LIMIT_RETRY_MS,
         );
+      if (last?.role === "assistant" && last.stopReason === "error")
+        throw new Error(
+          `Pi model request failed (${this.options.provider}/${this.options.modelId}); inspect the Pi session for details`,
+        );
     }
     const after = this.session.getSessionStats().tokens;
     const usage = this.session.getContextUsage();
