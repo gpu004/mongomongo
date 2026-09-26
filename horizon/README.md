@@ -10,6 +10,9 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 - Node >= 24 (uses `node:sqlite` and type-stripped `.ts` execution)
 - Docker (optional) for `"isolation": "container"`; `subprocess` mode needs nothing extra
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
+- `MONGODB_URI` / `MONGODB_DB` (optional) for the Atlas ledger adapter; see `.env.example`.
+  `doctor` probes connectivity, a disposable write/read, a transaction, and the required
+  indexes, then removes its probe data without printing credentials
 - An LLM API key for the Pi worker (`"worker": "pi"`); the `scripted` worker needs none
 
 ## Setup and checks
@@ -17,7 +20,8 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
 ```sh
 npm install
 npm run check          # tsc --noEmit
-npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget
+npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, ledger contract
+MONGODB_URI=... npm test   # additionally runs the ledger contract tests against MongoDB in a throwaway database
 node scripts/smoke-runner.ts   # seed passes; stale-cache fails correctness; bypass fixture is rejected
 ```
 
