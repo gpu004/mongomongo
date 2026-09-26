@@ -67,28 +67,42 @@ export function validateMissionConfig(value: unknown): MissionConfig {
   const fail = (msg: string): never => {
     throw new Error(`invalid mission config: ${msg}`);
   };
+  const positiveFinite = (name: string, v: unknown): void => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0)
+      fail(`${name} must be a finite number > 0`);
+  };
+  const positiveInteger = (name: string, v: unknown): void => {
+    if (typeof v !== "number" || !Number.isInteger(v) || v < 1)
+      fail(`${name} must be an integer >= 1`);
+  };
   if (c.schemaVersion !== 1) fail("schemaVersion must be 1");
   if (typeof c.missionId !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(c.missionId))
     fail("missionId must be a lowercase slug");
-  if (typeof c.contractVersion !== "number") fail("contractVersion required");
+  positiveInteger("contractVersion", c.contractVersion);
   if (typeof c.objective !== "string") fail("objective required");
   if (
     typeof c.targetP95Reduction !== "number" ||
+    !Number.isFinite(c.targetP95Reduction) ||
     c.targetP95Reduction <= 0 ||
     c.targetP95Reduction >= 1
   )
     fail("targetP95Reduction must be in (0,1)");
-  if (typeof c.acceptanceMargin !== "number" || c.acceptanceMargin < 0.05)
-    fail("acceptanceMargin floor is 0.05");
+  if (
+    typeof c.acceptanceMargin !== "number" ||
+    !Number.isFinite(c.acceptanceMargin) ||
+    c.acceptanceMargin < 0.05 ||
+    c.acceptanceMargin >= 1
+  )
+    fail("acceptanceMargin must be in [0.05,1)");
   if (
     c.maxRepetitionSpread !== undefined &&
     (typeof c.maxRepetitionSpread !== "number" ||
+      !Number.isFinite(c.maxRepetitionSpread) ||
       c.maxRepetitionSpread <= 0 ||
       c.maxRepetitionSpread > 1)
   )
     fail("maxRepetitionSpread must be in (0,1]");
-  if (typeof c.requiredImprovedRepetitions !== "number")
-    fail("requiredImprovedRepetitions required");
+  positiveInteger("requiredImprovedRepetitions", c.requiredImprovedRepetitions);
   if (!c.workload || !c.holdoutWorkload) fail("workload and holdoutWorkload required");
   if (c.workload!.repetitions < 2) fail("workload.repetitions must be >= 2");
   if (c.requiredImprovedRepetitions! > c.workload!.repetitions)
@@ -101,19 +115,29 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     fail("containerImage required (may be empty for subprocess)");
   if (c.isolation === "container" && !isDigestPinnedImage(c.containerImage!))
     fail("containerImage must be pinned by digest (repo@sha256:...) under container isolation");
-  if (typeof c.memoryLimitBytes !== "number" || c.memoryLimitBytes <= 0)
-    fail("memoryLimitBytes required");
-  if (typeof c.startupTimeoutMs !== "number" || typeof c.requestTimeoutMs !== "number")
-    fail("timeouts required");
+  positiveInteger("memoryLimitBytes", c.memoryLimitBytes);
+  positiveFinite("startupTimeoutMs", c.startupTimeoutMs);
+  positiveFinite("requestTimeoutMs", c.requestTimeoutMs);
+  if (typeof c.budget !== "object" || c.budget === null) fail("budget incomplete");
+  const b = c.budget as Partial<MissionConfig["budget"]>;
+  positiveFinite("budget.maxWallMs", b.maxWallMs);
+  positiveInteger("budget.maxExperiments", b.maxExperiments);
+  positiveInteger("budget.maxInputTokens", b.maxInputTokens);
+  positiveInteger("budget.maxOutputTokens", b.maxOutputTokens);
+  positiveInteger("budget.maxMemoryOperations", b.maxMemoryOperations);
+  positiveFinite("budget.cycleTimeoutMs", b.cycleTimeoutMs);
   if (
-    !c.budget ||
-    typeof c.budget.maxWallMs !== "number" ||
-    typeof c.budget.maxExperiments !== "number"
+    typeof c.segmentRotationCycles !== "number" ||
+    !Number.isInteger(c.segmentRotationCycles) ||
+    c.segmentRotationCycles < 1
   )
-    fail("budget incomplete");
-  if (typeof c.segmentRotationCycles !== "number" || c.segmentRotationCycles < 1)
-    fail("segmentRotationCycles >= 1");
-  if (typeof c.stagnationLimit !== "number" || c.stagnationLimit < 1) fail("stagnationLimit >= 1");
+    fail("segmentRotationCycles >= 1 (integer)");
+  if (
+    typeof c.stagnationLimit !== "number" ||
+    !Number.isInteger(c.stagnationLimit) ||
+    c.stagnationLimit < 1
+  )
+    fail("stagnationLimit >= 1 (integer)");
   if (!c.model || typeof c.model.provider !== "string" || typeof c.model.id !== "string")
     fail("model required");
   if (c.worker !== "scripted" && c.worker !== "pi") fail("worker must be scripted|pi");
