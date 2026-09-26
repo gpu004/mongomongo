@@ -96,3 +96,7 @@ runs the demo sequence — `mission create`, `run` interrupted at the crash poin
 ## Configuration comparison and report
 
 `node src/cli.ts compare --config mission.example.json [--repeats N]` runs the three memory configurations (durable only, +retrieval, +validated correction) from the same seed under one crash schedule and writes `comparison.{json,md}`. It honours `worker` and memory settings from the config: `"worker": "pi"` runs the Pi worker (and fails up front without the provider API key), and a `SUPERMEMORY_API_KEY` selects the hosted adapter for the memory-enabled configurations. Findings and limitations against `LONG_HORIZON_AGENT_PROMPT.md` are in `REPORT.md`.
+
+## Scripted soak
+
+`node scripts/soak.ts --config mission.example.json --out runs/soak-evidence --experiments 1000 --hours 4` runs successive scripted missions until either limit is reached. Use `--missions N` to cap the mission count, `--fault-every N` to inject a crash in every Nth mission, and `--max-runs N` to bound retries per mission. With no limits, it runs ten missions. Each mission exercises a crash and resume where scheduled, two worker experiments, and segment rotation. The runner uses local SQLite and memory rather than hosted services. It writes each sample immediately to `samples.jsonl` and, on completion, writes `samples.json` and `report.json` under the output directory. These runs measure repeated short missions, not one uninterrupted long mission or Pi session growth.
