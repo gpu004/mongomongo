@@ -43,6 +43,7 @@ import {
   type TaskRow,
   type VerificationRow,
 } from "./ledger.ts";
+import { decodeEvents, encodeEvents, SNAPSHOT_BATCH_SIZE } from "./event-snapshot.ts";
 import type { MongoEnv } from "./mongo-env.ts";
 
 export const SCHEMA_VERSION = 1;
@@ -63,6 +64,7 @@ export const COLLECTIONS = {
   checkpoints: "checkpoints",
   segments: "segments",
   events: "events",
+  eventSnapshots: "eventSnapshots",
   outbox: "outbox",
   leases: "leases",
   counters: "counters",
@@ -70,6 +72,10 @@ export const COLLECTIONS = {
 
 /** Indexes every Atlas ledger database must carry; `doctor` reports any that are missing. */
 export const REQUIRED_INDEXES: Record<string, IndexDescription[]> = {
+  [COLLECTIONS.eventSnapshots]: [
+    { key: { missionId: 1, fromSeq: 1 }, name: "mission_snapshot_order" },
+    { key: { missionId: 1, eventKeys: 1 }, name: "snapshot_event_key" },
+  ],
   [COLLECTIONS.tasks]: [{ key: { missionId: 1, ordinal: 1 }, name: "mission_ordinal" }],
   [COLLECTIONS.experiments]: [
     { key: { missionId: 1, createdAt: 1, _id: 1 }, name: "mission_history" },
@@ -281,14 +287,41 @@ export class MongoLedger implements AsyncLedger {
 
   /**
    * Writes made while holding a lease are fenced: if the lease document no
-   * longer carries this owner's fencing token, the write is rejected.
+   * longer carries this owner's fencing token, the write is rejected. The
+   * check is a conditional write so that, inside a transaction, a concurrent
+   * takeover of the lease document conflicts with the mutation.
    */
   private async assertLease(): Promise<void> {
     const lease = this.ctx.lease;
     if (!lease) return;
-    const current = await this.getLease(lease.missionId);
-    if (!current || current.owner !== lease.owner || current.fencingToken !== lease.fencingToken)
-      throw new LeaseError(`mission ${lease.missionId} lease lost by ${lease.owner}`, current);
+    const result = await this.col(COLLECTIONS.leases).updateOne(
+      { _id: lease.missionId, owner: lease.owner, fencingToken: lease.fencingToken },
+      { $inc: { fencedWrites: 1 } },
+      this.opts,
+    );
+    if (result.matchedCount === 0)
+      throw new LeaseError(
+        `mission ${lease.missionId} lease lost by ${lease.owner}`,
+        await this.getLease(lease.missionId),
+      );
+  }
+
+  /**
+   * Runs a mutation in the same transaction as the lease check. The check is
+   * itself a conditional write on the lease document, so a takeover that lands
+   * between check and mutation conflicts with the transaction instead of
+   * letting the stale owner's write through.
+   */
+  private async fenced<T>(fn: (tx: MongoLedger) => Promise<T>): Promise<T> {
+    if (!this.ctx.lease || this.session) {
+      await this.assertLease();
+      return fn(this);
+    }
+    return this.transaction(async (tx) => {
+      const ledger = tx as MongoLedger;
+      await ledger.assertLease();
+      return fn(ledger);
+    });
   }
 
   async claimLease(
@@ -378,10 +411,29 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async eventsSince(seq: number, limit = 1000): Promise<EventRow[]> {
-    const docs = await this.col(COLLECTIONS.events)
-      .find(this.scoped({ seq: { $gt: seq } }), { sort: { seq: 1 }, limit, ...this.opts })
+    const snapshots = await this.col(COLLECTIONS.eventSnapshots)
+      .find(
+        { missionId: this.missionId, throughSeq: { $gt: seq } },
+        { sort: { fromSeq: 1 }, ...this.opts },
+      )
       .toArray();
-    return docs.map(toEvent);
+    const archived: EventRow[] = [];
+    for (const snapshot of snapshots) {
+      archived.push(
+        ...decodeEvents(Buffer.from(String(snapshot.events), "base64")).filter(
+          (event) => event.seq > seq,
+        ),
+      );
+      if (archived.length >= limit) return archived.slice(0, limit);
+    }
+    const docs = await this.col(COLLECTIONS.events)
+      .find(this.scoped({ seq: { $gt: seq } }), {
+        sort: { seq: 1 },
+        limit: limit - archived.length,
+        ...this.opts,
+      })
+      .toArray();
+    return archived.concat(docs.map(toEvent));
   }
 
   async findEvent(eventKey: string): Promise<EventRow | undefined> {
@@ -389,29 +441,73 @@ export class MongoLedger implements AsyncLedger {
       this.scoped({ _id: eventKey }),
       this.opts,
     );
-    return doc ? toEvent(doc) : undefined;
+    if (doc) return toEvent(doc);
+    const snapshot = await this.col(COLLECTIONS.eventSnapshots).findOne(
+      { missionId: this.missionId, eventKeys: eventKey },
+      this.opts,
+    );
+    return snapshot
+      ? decodeEvents(Buffer.from(String(snapshot.events), "base64")).find(
+          (item) => item.eventKey === eventKey,
+        )
+      : undefined;
   }
 
   async lastEventSeq(): Promise<number> {
     return this.currentSeq("event");
   }
 
+  async compactEventsBefore(seq: number): Promise<number> {
+    return this.fenced(async (tx) => {
+      const docs = await tx
+        .col(COLLECTIONS.events)
+        .find(tx.scoped({ seq: { $lte: seq } }), {
+          sort: { seq: 1 },
+          limit: SNAPSHOT_BATCH_SIZE,
+          ...tx.opts,
+        })
+        .toArray();
+      if (docs.length === 0) return 0;
+      const events = docs.map(toEvent);
+      await tx.col(COLLECTIONS.eventSnapshots).insertOne(
+        {
+          _id: `${tx.missionId}:${events[0]!.seq}`,
+          missionId: tx.missionId,
+          schemaVersion: SCHEMA_VERSION,
+          fromSeq: events[0]!.seq,
+          throughSeq: events.at(-1)!.seq,
+          eventKeys: events.map((event) => event.eventKey),
+          events: encodeEvents(events).toString("base64"),
+        },
+        tx.opts,
+      );
+      await tx
+        .col(COLLECTIONS.events)
+        .deleteMany(
+          tx.scoped({ seq: { $gte: events[0]!.seq, $lte: events.at(-1)!.seq } }),
+          tx.opts,
+        );
+      return events.length;
+    });
+  }
+
   async createMission(row: NewMissionRow): Promise<void> {
-    await this.assertLease();
-    const doc: Doc<MissionRow> = {
-      _id: row.missionId,
-      schemaVersion: SCHEMA_VERSION,
-      ...row,
-      spentExperiments: 0,
-      spentInputTokens: 0,
-      spentOutputTokens: 0,
-      spentMemoryOperations: 0,
-      spentWallMs: 0,
-      usageUncertain: 0,
-      learnedSuiteVersion: 0,
-      createdAt: now(),
-    };
-    await this.col(COLLECTIONS.missions).insertOne(doc, this.opts);
+    return this.fenced(async (tx) => {
+      const doc: Doc<MissionRow> = {
+        _id: row.missionId,
+        schemaVersion: SCHEMA_VERSION,
+        ...row,
+        spentExperiments: 0,
+        spentInputTokens: 0,
+        spentOutputTokens: 0,
+        spentMemoryOperations: 0,
+        spentWallMs: 0,
+        usageUncertain: 0,
+        learnedSuiteVersion: 0,
+        createdAt: now(),
+      };
+      await tx.col(COLLECTIONS.missions).insertOne(doc, tx.opts);
+    });
   }
 
   async getMission(missionId: string): Promise<MissionRow | undefined> {
@@ -423,21 +519,23 @@ export class MongoLedger implements AsyncLedger {
   async updateMission(missionId: string, patch: MissionPatch): Promise<void> {
     const $set = definedEntries(patch);
     if (Object.keys($set).length === 0) return;
-    await this.assertLease();
-    await this.col(COLLECTIONS.missions).updateOne({ _id: missionId }, { $set }, this.opts);
+    return this.fenced(async (tx) => {
+      await tx.col(COLLECTIONS.missions).updateOne({ _id: missionId }, { $set }, tx.opts);
+    });
   }
 
   async upsertTask(task: TaskRow): Promise<void> {
-    await this.assertLease();
-    const { taskId, status, hypothesis, nextAction, ...rest } = task;
-    await this.col(COLLECTIONS.tasks).updateOne(
-      { _id: taskId },
-      {
-        $set: { status, hypothesis, nextAction },
-        $setOnInsert: { ...rest, taskId, schemaVersion: SCHEMA_VERSION },
-      },
-      { upsert: true, ...this.opts },
-    );
+    return this.fenced(async (tx) => {
+      const { taskId, status, hypothesis, nextAction, ...rest } = task;
+      await tx.col(COLLECTIONS.tasks).updateOne(
+        { _id: taskId },
+        {
+          $set: { status, hypothesis, nextAction },
+          $setOnInsert: { ...rest, taskId, schemaVersion: SCHEMA_VERSION },
+        },
+        { upsert: true, ...tx.opts },
+      );
+    });
   }
 
   async listTasks(missionId: string): Promise<TaskRow[]> {
@@ -448,26 +546,28 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async insertExperiment(e: NewExperimentRow): Promise<void> {
-    await this.assertLease();
-    const doc: Doc<ExperimentRow> = {
-      _id: e.experimentId,
-      schemaVersion: SCHEMA_VERSION,
-      ...e,
-      candidateArtifactHash: null,
-      verdict: null,
-      failureSignature: null,
-      reportIds: [],
-      createdAt: now(),
-      finishedAt: null,
-    };
-    await this.col(COLLECTIONS.experiments).insertOne(doc, this.opts);
+    return this.fenced(async (tx) => {
+      const doc: Doc<ExperimentRow> = {
+        _id: e.experimentId,
+        schemaVersion: SCHEMA_VERSION,
+        ...e,
+        candidateArtifactHash: null,
+        verdict: null,
+        failureSignature: null,
+        reportIds: [],
+        createdAt: now(),
+        finishedAt: null,
+      };
+      await tx.col(COLLECTIONS.experiments).insertOne(doc, tx.opts);
+    });
   }
 
   async updateExperiment(experimentId: string, patch: ExperimentPatch): Promise<void> {
     const $set = definedEntries(patch);
     if (Object.keys($set).length === 0) return;
-    await this.assertLease();
-    await this.col(COLLECTIONS.experiments).updateOne({ _id: experimentId }, { $set }, this.opts);
+    return this.fenced(async (tx) => {
+      await tx.col(COLLECTIONS.experiments).updateOne({ _id: experimentId }, { $set }, tx.opts);
+    });
   }
 
   async getExperiment(experimentId: string): Promise<ExperimentRow | undefined> {
@@ -484,8 +584,9 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async insertArtifact(a: ArtifactRow): Promise<void> {
-    await this.assertLease();
-    await this.insertIgnore(COLLECTIONS.artifacts, { _id: a.hash }, a);
+    return this.fenced(async (tx) => {
+      await tx.insertIgnore(COLLECTIONS.artifacts, { _id: a.hash }, a);
+    });
   }
 
   async getArtifact(hash: string): Promise<ArtifactRow | undefined> {
@@ -495,33 +596,34 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async insertVerification(report: VerificationReport, path: string): Promise<void> {
-    await this.assertLease();
-    const row: VerificationRow = {
-      reportId: report.reportId,
-      reportHash: reportHash(report),
-      missionId: report.missionId,
-      experimentId: report.experimentId,
-      artifactHash: report.artifactHash,
-      suite: report.suite,
-      status: report.status,
-      evaluatorHash: report.evaluatorHash,
-      workloadHash: report.workloadHash,
-      environmentHash: report.environmentHash,
-      p95LatencyMs: report.metrics.p95LatencyMs ?? null,
-      path,
-    };
-    await this.insertIgnore(
-      COLLECTIONS.verifications,
-      {
-        experimentId: row.experimentId,
-        artifactHash: row.artifactHash,
-        suite: row.suite,
-        evaluatorHash: row.evaluatorHash,
-        workloadHash: row.workloadHash,
-        environmentHash: row.environmentHash,
-      },
-      { _id: row.reportId, ...row, createdOrdinal: await this.nextSeq("verification") },
-    );
+    return this.fenced(async (tx) => {
+      const row: VerificationRow = {
+        reportId: report.reportId,
+        reportHash: reportHash(report),
+        missionId: report.missionId,
+        experimentId: report.experimentId,
+        artifactHash: report.artifactHash,
+        suite: report.suite,
+        status: report.status,
+        evaluatorHash: report.evaluatorHash,
+        workloadHash: report.workloadHash,
+        environmentHash: report.environmentHash,
+        p95LatencyMs: report.metrics.p95LatencyMs ?? null,
+        path,
+      };
+      await tx.insertIgnore(
+        COLLECTIONS.verifications,
+        {
+          experimentId: row.experimentId,
+          artifactHash: row.artifactHash,
+          suite: row.suite,
+          evaluatorHash: row.evaluatorHash,
+          workloadHash: row.workloadHash,
+          environmentHash: row.environmentHash,
+        },
+        { _id: row.reportId, ...row, createdOrdinal: await tx.nextSeq("verification") },
+      );
+    });
   }
 
   async findVerification(experimentId: string, artifactHash: string, suite: string) {
@@ -541,8 +643,9 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async insertEpisode(e: EpisodeRow): Promise<void> {
-    await this.assertLease();
-    await this.insertIgnore(COLLECTIONS.episodes, { _id: e.episodeId }, e);
+    return this.fenced(async (tx) => {
+      await tx.insertIgnore(COLLECTIONS.episodes, { _id: e.episodeId }, e);
+    });
   }
 
   async isIndexed(episodeId: string): Promise<boolean> {
@@ -643,30 +746,31 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async upsertLesson(l: LessonRow): Promise<void> {
-    await this.assertLease();
-    const {
-      lessonId,
-      state,
-      positiveEvidenceId,
-      negativeEvidenceId,
-      materializedScenarioId,
-      transitions,
-      ...rest
-    } = l;
-    await this.col(COLLECTIONS.lessons).updateOne(
-      { _id: lessonId },
-      {
-        $set: {
-          state,
-          positiveEvidenceId,
-          negativeEvidenceId,
-          materializedScenarioId,
-          transitions,
+    return this.fenced(async (tx) => {
+      const {
+        lessonId,
+        state,
+        positiveEvidenceId,
+        negativeEvidenceId,
+        materializedScenarioId,
+        transitions,
+        ...rest
+      } = l;
+      await tx.col(COLLECTIONS.lessons).updateOne(
+        { _id: lessonId },
+        {
+          $set: {
+            state,
+            positiveEvidenceId,
+            negativeEvidenceId,
+            materializedScenarioId,
+            transitions,
+          },
+          $setOnInsert: { ...rest, lessonId, schemaVersion: SCHEMA_VERSION, createdAt: now() },
         },
-        $setOnInsert: { ...rest, lessonId, schemaVersion: SCHEMA_VERSION, createdAt: now() },
-      },
-      { upsert: true, ...this.opts },
-    );
+        { upsert: true, ...tx.opts },
+      );
+    });
   }
 
   async listLessons(missionId: string): Promise<LessonRow[]> {
@@ -687,19 +791,20 @@ export class MongoLedger implements AsyncLedger {
     suiteVersion: number,
     path: string,
   ): Promise<void> {
-    await this.assertLease();
-    await this.col(COLLECTIONS.learnedScenarios).insertOne(
-      {
-        _id: scenarioId,
-        missionId,
-        schemaVersion: SCHEMA_VERSION,
-        scenarioId,
-        lessonId,
-        suiteVersion,
-        path,
-      },
-      this.opts,
-    );
+    return this.fenced(async (tx) => {
+      await tx.col(COLLECTIONS.learnedScenarios).insertOne(
+        {
+          _id: scenarioId,
+          missionId,
+          schemaVersion: SCHEMA_VERSION,
+          scenarioId,
+          lessonId,
+          suiteVersion,
+          path,
+        },
+        tx.opts,
+      );
+    });
   }
 
   async listLearnedScenarios(missionId: string): Promise<LearnedScenarioRow[]> {
@@ -719,29 +824,33 @@ export class MongoLedger implements AsyncLedger {
     missionId: string,
     experimentId: string,
   ): Promise<void> {
-    await this.assertLease();
-    await this.insertIgnore(
-      COLLECTIONS.containers,
-      { _id: containerName },
-      {
-        _id: containerName,
-        missionId,
-        containerName,
-        experimentId,
-        state: "launching",
-        createdAt: now(),
-        releasedAt: null,
-      },
-    );
+    return this.fenced(async (tx) => {
+      await tx.insertIgnore(
+        COLLECTIONS.containers,
+        { _id: containerName },
+        {
+          _id: containerName,
+          missionId,
+          containerName,
+          experimentId,
+          state: "launching",
+          createdAt: now(),
+          releasedAt: null,
+        },
+      );
+    });
   }
 
   async releaseContainer(containerName: string, state: ContainerState = "released"): Promise<void> {
-    await this.assertLease();
-    await this.col(COLLECTIONS.containers).updateOne(
-      { _id: containerName, state: "launching" },
-      { $set: { state, releasedAt: now() } },
-      this.opts,
-    );
+    return this.fenced(async (tx) => {
+      await tx
+        .col(COLLECTIONS.containers)
+        .updateOne(
+          { _id: containerName, state: "launching" },
+          { $set: { state, releasedAt: now() } },
+          tx.opts,
+        );
+    });
   }
 
   async listLiveContainers(missionId: string): Promise<ContainerRow[]> {
@@ -795,34 +904,40 @@ export class MongoLedger implements AsyncLedger {
     sessionPath: string | null,
     sessionId: string | null,
   ): Promise<void> {
-    await this.assertLease();
-    const row: SegmentRow = {
-      missionId,
-      ordinal,
-      sessionPath,
-      sessionId,
-      checkpointId: null,
-      startedAt: now(),
-      closedAt: null,
-      firstEventSeq: await this.lastEventSeq(),
-      lastEventSeq: null,
-      archiveHash: null,
-      committed: 0,
-    };
-    await this.col(COLLECTIONS.segments).replaceOne(
-      { _id: segmentId(missionId, ordinal) },
-      { schemaVersion: SCHEMA_VERSION, ...row },
-      { upsert: true, ...this.opts },
-    );
+    return this.fenced(async (tx) => {
+      const row: SegmentRow = {
+        missionId,
+        ordinal,
+        sessionPath,
+        sessionId,
+        checkpointId: null,
+        startedAt: now(),
+        closedAt: null,
+        firstEventSeq: await tx.lastEventSeq(),
+        lastEventSeq: null,
+        archiveHash: null,
+        committed: 0,
+      };
+      await tx
+        .col(COLLECTIONS.segments)
+        .replaceOne(
+          { _id: segmentId(missionId, ordinal) },
+          { schemaVersion: SCHEMA_VERSION, ...row },
+          { upsert: true, ...tx.opts },
+        );
+    });
   }
 
   async commitSegment(missionId: string, ordinal: number, checkpointId: string): Promise<void> {
-    await this.assertLease();
-    await this.col(COLLECTIONS.segments).updateOne(
-      { _id: segmentId(missionId, ordinal) },
-      { $set: { committed: 1, checkpointId } },
-      this.opts,
-    );
+    return this.fenced(async (tx) => {
+      await tx
+        .col(COLLECTIONS.segments)
+        .updateOne(
+          { _id: segmentId(missionId, ordinal) },
+          { $set: { committed: 1, checkpointId } },
+          tx.opts,
+        );
+    });
   }
 
   async closeSegment(
@@ -830,12 +945,31 @@ export class MongoLedger implements AsyncLedger {
     ordinal: number,
     archiveHash: string | null,
   ): Promise<void> {
-    await this.assertLease();
-    await this.col(COLLECTIONS.segments).updateOne(
-      { _id: segmentId(missionId, ordinal) },
-      { $set: { closedAt: now(), lastEventSeq: await this.lastEventSeq(), archiveHash } },
-      this.opts,
-    );
+    return this.fenced(async (tx) => {
+      await tx
+        .col(COLLECTIONS.segments)
+        .updateOne(
+          { _id: segmentId(missionId, ordinal) },
+          { $set: { closedAt: now(), lastEventSeq: await tx.lastEventSeq(), archiveHash } },
+          tx.opts,
+        );
+    });
+  }
+
+  async setSegmentArchive(missionId: string, ordinal: number, archiveHash: string): Promise<void> {
+    return this.fenced(async (tx) => {
+      const result = await tx.col(COLLECTIONS.segments).updateOne(
+        {
+          _id: segmentId(missionId, ordinal),
+          closedAt: { $ne: null },
+          committed: 1,
+          archiveHash: { $in: [null, archiveHash] },
+        },
+        { $set: { archiveHash } },
+        tx.opts,
+      );
+      if (result.matchedCount !== 1) throw new Error(`segment ${ordinal} cannot be archived`);
+    });
   }
 
   async activeSegment(missionId: string): Promise<SegmentRow | undefined> {
@@ -855,39 +989,40 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async discardUncommittedSegments(missionId: string): Promise<number> {
-    await this.assertLease();
-    const result = await this.col(COLLECTIONS.segments).deleteMany(
-      { missionId, committed: 0 },
-      this.opts,
-    );
-    return result.deletedCount;
+    return this.fenced(async (tx) => {
+      const result = await tx
+        .col(COLLECTIONS.segments)
+        .deleteMany({ missionId, committed: 0 }, tx.opts);
+      return result.deletedCount;
+    });
   }
 
   async enqueueOutbox(episodeId: string, payload: unknown): Promise<string> {
-    await this.assertLease();
-    const payloadHash = sha256(canonicalJson(payload));
-    const idempotencyKey = `${episodeId}:${payloadHash.slice(0, 16)}`;
-    const at = now();
-    await this.insertIgnore(
-      COLLECTIONS.outbox,
-      { _id: idempotencyKey },
-      {
-        missionId: this.missionId,
-        idempotencyKey,
-        episodeId,
-        payloadHash,
-        payload: JSON.stringify(payload),
-        remoteDocumentId: null,
-        state: "pending",
-        retries: 0,
-        nextAttemptAt: at,
-        lastError: null,
-        updatedAt: at,
-        createdAt: at,
-        createdOrdinal: await this.nextSeq("outbox"),
-      },
-    );
-    return idempotencyKey;
+    return this.fenced(async (tx) => {
+      const payloadHash = sha256(canonicalJson(payload));
+      const idempotencyKey = `${episodeId}:${payloadHash.slice(0, 16)}`;
+      const at = now();
+      await tx.insertIgnore(
+        COLLECTIONS.outbox,
+        { _id: idempotencyKey },
+        {
+          missionId: tx.missionId,
+          idempotencyKey,
+          episodeId,
+          payloadHash,
+          payload: JSON.stringify(payload),
+          remoteDocumentId: null,
+          state: "pending",
+          retries: 0,
+          nextAttemptAt: at,
+          lastError: null,
+          updatedAt: at,
+          createdAt: at,
+          createdOrdinal: await tx.nextSeq("outbox"),
+        },
+      );
+      return idempotencyKey;
+    });
   }
 
   async outboxPayloadForEpisode(episodeId: string): Promise<unknown> {
@@ -908,12 +1043,11 @@ export class MongoLedger implements AsyncLedger {
   }
 
   async updateOutbox(key: string, patch: OutboxPatch): Promise<void> {
-    await this.assertLease();
-    await this.col(COLLECTIONS.outbox).updateOne(
-      { _id: key },
-      { $set: { ...definedEntries(patch), updatedAt: now() } },
-      this.opts,
-    );
+    return this.fenced(async (tx) => {
+      await tx
+        .col(COLLECTIONS.outbox)
+        .updateOne({ _id: key }, { $set: { ...definedEntries(patch), updatedAt: now() } }, tx.opts);
+    });
   }
 
   async listOutbox(states?: OutboxState[]): Promise<OutboxRow[]> {

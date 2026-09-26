@@ -29,6 +29,7 @@ export class SqliteLedger implements AsyncLedger {
   readonly backend = "sqlite" as const;
   readonly inner: Ledger;
   private lease: LeaseRow | undefined;
+  private inTransaction = false;
 
   constructor(pathOrLedger: string | Ledger) {
     this.inner = typeof pathOrLedger === "string" ? new Ledger(pathOrLedger) : pathOrLedger;
@@ -47,8 +48,34 @@ export class SqliteLedger implements AsyncLedger {
       throw new LeaseError(`mission ${lease.missionId} lease lost by ${lease.owner}`, current);
   }
 
-  async transaction<T>(fn: (tx: AsyncLedger) => Promise<T>): Promise<T> {
+  /**
+   * Runs `guard` and the write under one `BEGIN IMMEDIATE`, so no other
+   * process can take the lease between the check and the write.
+   */
+  private fenced<T>(write: () => T): T {
+    if (!this.lease || this.inTransaction) {
+      this.guard();
+      return write();
+    }
     this.inner.db.exec("BEGIN IMMEDIATE");
+    this.inTransaction = true;
+    try {
+      this.guard();
+      const result = write();
+      this.inner.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.inner.db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.inTransaction = false;
+    }
+  }
+
+  async transaction<T>(fn: (tx: AsyncLedger) => Promise<T>): Promise<T> {
+    if (this.inTransaction) return fn(this);
+    this.inner.db.exec("BEGIN IMMEDIATE");
+    this.inTransaction = true;
     try {
       const result = await fn(this);
       this.inner.db.exec("COMMIT");
@@ -56,6 +83,8 @@ export class SqliteLedger implements AsyncLedger {
     } catch (error) {
       this.inner.db.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.inTransaction = false;
     }
   }
 
@@ -78,8 +107,7 @@ export class SqliteLedger implements AsyncLedger {
   }
 
   async appendEvent(eventKey: string, type: string, entityId: string, payload: unknown) {
-    this.guard();
-    return this.inner.appendEvent(eventKey, type, entityId, payload);
+    return this.fenced(() => this.inner.appendEvent(eventKey, type, entityId, payload));
   }
   async eventsSince(seq: number, limit?: number) {
     return this.inner.eventsSince(seq, limit);
@@ -90,34 +118,32 @@ export class SqliteLedger implements AsyncLedger {
   async lastEventSeq() {
     return this.inner.lastEventSeq();
   }
+  async compactEventsBefore(seq: number) {
+    return this.fenced(() => this.inner.compactEventsBefore(seq));
+  }
 
   async createMission(row: NewMissionRow) {
-    this.guard();
-    this.inner.createMission(row);
+    this.fenced(() => this.inner.createMission(row));
   }
   async getMission(missionId: string) {
     return this.inner.getMission(missionId);
   }
   async updateMission(missionId: string, patch: MissionPatch) {
-    this.guard();
-    this.inner.updateMission(missionId, patch);
+    this.fenced(() => this.inner.updateMission(missionId, patch));
   }
 
   async upsertTask(task: TaskRow) {
-    this.guard();
-    this.inner.upsertTask(task);
+    this.fenced(() => this.inner.upsertTask(task));
   }
   async listTasks(missionId: string) {
     return this.inner.listTasks(missionId);
   }
 
   async insertExperiment(e: NewExperimentRow) {
-    this.guard();
-    this.inner.insertExperiment(e);
+    this.fenced(() => this.inner.insertExperiment(e));
   }
   async updateExperiment(experimentId: string, patch: ExperimentPatch) {
-    this.guard();
-    this.inner.updateExperiment(experimentId, patch);
+    this.fenced(() => this.inner.updateExperiment(experimentId, patch));
   }
   async getExperiment(experimentId: string) {
     return this.inner.getExperiment(experimentId);
@@ -127,15 +153,13 @@ export class SqliteLedger implements AsyncLedger {
   }
 
   async insertArtifact(a: ArtifactRow) {
-    this.guard();
-    this.inner.insertArtifact(a);
+    this.fenced(() => this.inner.insertArtifact(a));
   }
   async getArtifact(hash: string) {
     return this.inner.getArtifact(hash);
   }
   async insertVerification(report: VerificationReport, path: string) {
-    this.guard();
-    this.inner.insertVerification(report, path);
+    this.fenced(() => this.inner.insertVerification(report, path));
   }
   async findVerification(experimentId: string, artifactHash: string, suite: string) {
     return this.inner.findVerification(experimentId, artifactHash, suite);
@@ -145,8 +169,7 @@ export class SqliteLedger implements AsyncLedger {
   }
 
   async insertEpisode(e: EpisodeRow) {
-    this.guard();
-    this.inner.insertEpisode(e);
+    this.fenced(() => this.inner.insertEpisode(e));
   }
   async isIndexed(episodeId: string) {
     return this.inner.isIndexed(episodeId);
@@ -175,8 +198,7 @@ export class SqliteLedger implements AsyncLedger {
     return this.inner.listEpisodes(missionId);
   }
   async upsertLesson(l: LessonRow) {
-    this.guard();
-    this.inner.upsertLesson(l);
+    this.fenced(() => this.inner.upsertLesson(l));
   }
   async listLessons(missionId: string) {
     return this.inner.listLessons(missionId);
@@ -188,20 +210,19 @@ export class SqliteLedger implements AsyncLedger {
     suiteVersion: number,
     path: string,
   ) {
-    this.guard();
-    this.inner.insertLearnedScenario(scenarioId, missionId, lessonId, suiteVersion, path);
+    this.fenced(() =>
+      this.inner.insertLearnedScenario(scenarioId, missionId, lessonId, suiteVersion, path),
+    );
   }
   async listLearnedScenarios(missionId: string) {
     return this.inner.listLearnedScenarios(missionId);
   }
 
   async registerContainer(containerName: string, missionId: string, experimentId: string) {
-    this.guard();
-    this.inner.registerContainer(containerName, missionId, experimentId);
+    this.fenced(() => this.inner.registerContainer(containerName, missionId, experimentId));
   }
   async releaseContainer(containerName: string, state: ContainerState = "released") {
-    this.guard();
-    this.inner.releaseContainer(containerName, state);
+    this.fenced(() => this.inner.releaseContainer(containerName, state));
   }
   async listLiveContainers(missionId: string) {
     return this.inner.listLiveContainers(missionId);
@@ -211,8 +232,7 @@ export class SqliteLedger implements AsyncLedger {
   }
 
   async writeCheckpoint(c: NewCheckpointRow) {
-    this.guard();
-    return this.inner.writeCheckpoint(c);
+    return this.fenced(() => this.inner.writeCheckpoint(c));
   }
   async latestCheckpoint(missionId: string) {
     return this.inner.latestCheckpoint(missionId);
@@ -226,16 +246,16 @@ export class SqliteLedger implements AsyncLedger {
     sessionPath: string | null,
     sessionId: string | null,
   ) {
-    this.guard();
-    this.inner.openSegment(missionId, ordinal, sessionPath, sessionId);
+    this.fenced(() => this.inner.openSegment(missionId, ordinal, sessionPath, sessionId));
   }
   async commitSegment(missionId: string, ordinal: number, checkpointId: string) {
-    this.guard();
-    this.inner.commitSegment(missionId, ordinal, checkpointId);
+    this.fenced(() => this.inner.commitSegment(missionId, ordinal, checkpointId));
   }
   async closeSegment(missionId: string, ordinal: number, archiveHash: string | null) {
-    this.guard();
-    this.inner.closeSegment(missionId, ordinal, archiveHash);
+    this.fenced(() => this.inner.closeSegment(missionId, ordinal, archiveHash));
+  }
+  async setSegmentArchive(missionId: string, ordinal: number, archiveHash: string) {
+    this.fenced(() => this.inner.setSegmentArchive(missionId, ordinal, archiveHash));
   }
   async activeSegment(missionId: string) {
     return this.inner.activeSegment(missionId);
@@ -244,12 +264,10 @@ export class SqliteLedger implements AsyncLedger {
     return this.inner.listSegments(missionId);
   }
   async discardUncommittedSegments(missionId: string) {
-    this.guard();
-    return this.inner.discardUncommittedSegments(missionId);
+    return this.fenced(() => this.inner.discardUncommittedSegments(missionId));
   }
   async enqueueOutbox(episodeId: string, payload: unknown) {
-    this.guard();
-    return this.inner.enqueueOutbox(episodeId, payload);
+    return this.fenced(() => this.inner.enqueueOutbox(episodeId, payload));
   }
   async outboxPayloadForEpisode(episodeId: string) {
     return this.inner.outboxPayloadForEpisode(episodeId);
@@ -258,8 +276,7 @@ export class SqliteLedger implements AsyncLedger {
     return this.inner.outboxPayload(key);
   }
   async updateOutbox(key: string, patch: OutboxPatch) {
-    this.guard();
-    this.inner.updateOutbox(key, patch);
+    this.fenced(() => this.inner.updateOutbox(key, patch));
   }
   async listOutbox(states?: OutboxState[]) {
     return this.inner.listOutbox(states);

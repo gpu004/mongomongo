@@ -95,16 +95,15 @@ test("controller composes the packet retrieval query from the previous cycle's s
     worker: new HypothesisWorker(),
     maxCycles: 3,
   });
-  controller.initialize();
+  await controller.initialize();
   await controller.run();
-  const queries = controller.ledger
-    .eventsSince(0, 10_000)
+  const queries = (await controller.ledger.eventsSince(0, 10_000))
     .filter((e) => e.type === "packet.built")
     .map((e) => (e.payload as { query: string }).query);
-  const firstVerdict = controller.ledger
-    .listExperiments("retrieval-query")
-    .filter((e) => e.taskId === "optimize-search")[0]!.verdict;
-  controller.close();
+  const firstVerdict = (await controller.ledger.listExperiments("retrieval-query")).filter(
+    (e) => e.taskId === "optimize-search",
+  )[0]!.verdict;
+  await controller.close();
 
   assert.ok(queries.length >= 2, `expected >=2 packets, got ${queries.length}`);
   assert.match(queries[0]!, /optimize search reduce read path p95/);

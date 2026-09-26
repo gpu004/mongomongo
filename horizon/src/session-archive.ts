@@ -59,7 +59,11 @@ export function removeArchivedSession(
   evidenceDir: string,
   hash: string,
 ): void {
-  if (!existsSync(sessionPath)) return;
+  if (!existsSync(sessionPath)) {
+    if (sha256(gunzipSync(readFileSync(archivePath(evidenceDir, hash)))) !== hash)
+      throw new Error(`session archive failed verification: ${hash}`);
+    return;
+  }
   const path = sessionFile(sessionPath, sessionsDir);
   const sourceHash = sha256(readFileSync(path));
   if (

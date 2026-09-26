@@ -28,6 +28,7 @@ test("session archive verifies bytes before deleting closed Pi session files", (
   removeArchivedSession(file, sessions, evidence, hash);
   assert.equal(existsSync(file), false);
   assert.equal(existsSync(archive), true);
+  removeArchivedSession(file, sessions, evidence, hash);
 
   const outside = join(root, "other.jsonl");
   writeFileSync(outside, text);

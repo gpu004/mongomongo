@@ -38,6 +38,8 @@ test("scripted soak resumes an injected crash without resending the experiment a
   const samples = JSON.parse(readFileSync(join(out, "samples.json"), "utf8")) as {
     exitCode: number;
     spentExperiments: number;
+    workerInputTokens: number;
+    usageUncertain: boolean;
     segments: number;
     packetTokens: number[];
     retrievalMs: number[];
@@ -61,4 +63,6 @@ test("scripted soak resumes an injected crash without resending the experiment a
   );
   assert.ok(samples.every((sample) => sample.recoveryMs !== null && sample.recoveryMs >= 0));
   assert.ok(samples.every((sample) => sample.ledgerBytes > 0 && sample.artifactBytes > 0));
+  assert.ok(samples.some((sample) => sample.workerInputTokens > 0));
+  assert.ok(samples.every((sample) => sample.usageUncertain));
 });

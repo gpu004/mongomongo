@@ -1,6 +1,7 @@
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { EventRow, Ledger } from "./ledger.ts";
+import type { EventRow } from "./ledger.ts";
+import type { AsyncLedger } from "./ledger-contract.ts";
 import type { MissionConfig } from "./mission-contract.ts";
 import type { MissionPaths } from "./mission-paths.ts";
 import { writeJsonAtomic } from "./mission-paths.ts";
@@ -32,11 +33,11 @@ export interface LiveGateResult {
   checks: GateCheck[];
 }
 
-function allEvents(ledger: Ledger): EventRow[] {
+async function allEvents(ledger: AsyncLedger): Promise<EventRow[]> {
   const out: EventRow[] = [];
   let seq = 0;
   for (;;) {
-    const batch = ledger.eventsSince(seq, 1000);
+    const batch = await ledger.eventsSince(seq, 1000);
     if (batch.length === 0) return out;
     out.push(...batch);
     seq = batch[batch.length - 1]!.seq;
@@ -47,14 +48,17 @@ function payload<T extends object>(event: EventRow): Partial<T> {
   return (event.payload ?? {}) as Partial<T>;
 }
 
-export function evaluateLiveGate(ledger: Ledger, config: MissionConfig): LiveGateResult {
+export async function evaluateLiveGate(
+  ledger: AsyncLedger,
+  config: MissionConfig,
+): Promise<LiveGateResult> {
   const missionId = config.missionId;
-  const mission = ledger.getMission(missionId);
-  const tasks = ledger.listTasks(missionId);
-  const experiments = ledger.listExperiments(missionId);
-  const verifications = ledger.listVerifications(missionId);
-  const episodes = ledger.listEpisodes(missionId);
-  const events = allEvents(ledger);
+  const mission = await ledger.getMission(missionId);
+  const tasks = await ledger.listTasks(missionId);
+  const experiments = await ledger.listExperiments(missionId);
+  const verifications = await ledger.listVerifications(missionId);
+  const episodes = await ledger.listEpisodes(missionId);
+  const events = await allEvents(ledger);
   const checks: GateCheck[] = [];
 
   const workerExperiments = experiments.filter((e) => e.taskId === "optimize-search");

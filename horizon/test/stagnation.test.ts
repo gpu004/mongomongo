@@ -66,11 +66,11 @@ test("after stagnationLimit experiments without improvement the controller requi
     { worker, maxCycles: 4 },
     { stagnationLimit: 2 },
   );
-  controller.initialize();
+  await controller.initialize();
   await controller.run();
-  const experiments = controller.ledger
-    .listExperiments("stagnation")
-    .filter((e) => e.taskId === "optimize-search");
+  const experiments = (await controller.ledger.listExperiments("stagnation")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
   assert.equal(experiments.length, 4);
   const [first, second, third, fourth] = experiments as [
     (typeof experiments)[0],
@@ -81,14 +81,14 @@ test("after stagnationLimit experiments without improvement the controller requi
 
   // Below the limit: no stagnation directive; both experiments go through verification.
   for (const e of [first, second]) {
-    assert.equal(controller.ledger.findEvent(`${e.experimentId}:stagnation`), undefined);
+    assert.equal(await controller.ledger.findEvent(`${e.experimentId}:stagnation`), undefined);
     assert.match(e.verdict ?? "", /^correctness failed/);
   }
   assert.doesNotMatch(worker.packets[0]!, /Stagnation:/);
   assert.doesNotMatch(worker.packets[1]!, /Stagnation:/);
 
   // At the limit: the packet carries the directive and the repeated, unprofiled mechanism is rejected without verification.
-  const detected = controller.ledger.findEvent(`${third.experimentId}:stagnation`);
+  const detected = await controller.ledger.findEvent(`${third.experimentId}:stagnation`);
   assert.ok(detected, "stagnation.detected recorded for the third experiment");
   assert.deepEqual(detected.payload, {
     count: 2,
@@ -101,24 +101,24 @@ test("after stagnationLimit experiments without improvement the controller requi
   assert.match(third.verdict ?? "", /^stagnation: repeated an already-tried mechanism/);
   assert.equal(third.candidateArtifactHash, null);
   assert.equal(
-    controller.ledger
-      .listVerifications("stagnation")
-      .filter((v) => v.experimentId === third.experimentId).length,
+    (await controller.ledger.listVerifications("stagnation")).filter(
+      (v) => v.experimentId === third.experimentId,
+    ).length,
     0,
     "no verifier run for the stagnation-rejected experiment",
   );
-  const episode = controller.ledger.getEpisode(`ep-${third.experimentId}-v1`);
+  const episode = await controller.ledger.getEpisode(`ep-${third.experimentId}-v1`);
   assert.ok(episode);
   assert.match(episode.summary, /profile the current best artifact before editing/);
 
   // Still stagnated, but the worker profiled first: the same mechanism is allowed through to the verifier.
-  assert.ok(controller.ledger.findEvent(`${fourth.experimentId}:stagnation`));
+  assert.ok(await controller.ledger.findEvent(`${fourth.experimentId}:stagnation`));
   assert.match(fourth.verdict ?? "", /^correctness failed/);
   assert.ok(
-    controller.ledger
-      .listVerifications("stagnation")
-      .some((v) => v.experimentId === fourth.experimentId && v.suite === "performance"),
+    (await controller.ledger.listVerifications("stagnation")).some(
+      (v) => v.experimentId === fourth.experimentId && v.suite === "performance",
+    ),
     "profiling ran the performance suite under the fourth experiment",
   );
-  controller.close();
+  await controller.close();
 });

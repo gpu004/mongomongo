@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { Ledger } from "../src/ledger.ts";
+import { SqliteLedger } from "../src/sqlite-ledger.ts";
 import {
   type EpisodePayload,
   episodeMetadata,
@@ -41,13 +42,14 @@ const scope = { missionId, containerTag, contractVersion: 1 };
 
 const dir = mkdtempSync(join(tmpdir(), "horizon-smprobe-"));
 const ledger = new Ledger(join(dir, "mission.sqlite"));
+const asyncLedger = new SqliteLedger(ledger);
 const evidence = new FileEvidenceStore(join(dir, "evidence"));
 const evidenceId = evidence.write("probe", { runId });
 const adapter = new SupermemoryAdapter(apiKey, 30_000);
 const payloads = new Map<string, EpisodePayload>();
 let operations = 0;
 const outbox = new MemoryOutbox(
-  ledger,
+  asyncLedger,
   adapter,
   containerTag,
   (id) => payloads.get(id),
@@ -122,7 +124,7 @@ function add(p: EpisodePayload): void {
     summary: renderEpisode(p),
     createdAt: new Date().toISOString(),
   });
-  outbox.enqueue(p);
+  ledger.enqueueOutbox(p.episodeId, p);
 }
 const pct = (xs: number[], p: number) =>
   xs.length
@@ -139,7 +141,7 @@ async function ask(
   const started = performance.now();
   const selection = await retrieveEpisodes(
     adapter,
-    ledger,
+    asyncLedger,
     evidence,
     scope,
     `${code} verdict`,

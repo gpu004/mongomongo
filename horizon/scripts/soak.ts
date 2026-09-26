@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { Ledger } from "../src/ledger.ts";
+import { openLedger } from "../src/ledger-backend.ts";
 import { loadMissionConfig, type MissionConfig } from "../src/mission-contract.ts";
 import { missionPaths, writeJsonAtomic } from "../src/mission-paths.ts";
 
@@ -94,6 +94,8 @@ interface SoakSample {
   faultInjected: boolean;
   runMs: number;
   spentExperiments: number;
+  workerInputTokens: number;
+  usageUncertain: boolean;
   packetTokens: number[];
   retrievalMs: number[];
   recoveryMs: number | null;
@@ -117,8 +119,14 @@ for (let i = 0; i < missionCount; i++) {
   const config: MissionConfig = {
     ...base,
     missionId,
+    ledger: { backend: "sqlite" },
     isolation: "subprocess",
     segmentRotationCycles: 1,
+    retention: base.retention ?? {
+      keepRecentCandidates: 3,
+      keepRecentSegments: 2,
+      compactEventsAfter: 100,
+    },
     memory: { ...base.memory, enabled: true, containerTag: `horizon-${missionId}` },
   };
   const paths = missionPaths(missionId, runsRoot);
@@ -126,6 +134,7 @@ for (let i = 0; i < missionCount; i++) {
   writeJsonAtomic(missionConfigPath, config);
   run(["mission", "create", "--config", missionConfigPath, "--runs-root", runsRoot], [0]);
   let lastSeq = 0;
+  let lastInputTokens = 0;
   let finished = false;
   for (let attempt = 1; attempt <= maxRuns; attempt++) {
     const faultInjected = i % faultEvery === 0 && attempt === 1;
@@ -142,10 +151,10 @@ for (let i = 0; i < missionCount; i++) {
       ],
       faultInjected ? [3] : [0, 2],
     );
-    const ledger = new Ledger(paths.db);
-    const mission = ledger.getMission(missionId);
-    const events = ledger.eventsSince(lastSeq, 100_000);
-    lastSeq = ledger.lastEventSeq();
+    const ledger = await openLedger(config, paths);
+    const mission = await ledger.getMission(missionId);
+    const events = await ledger.eventsSince(lastSeq, 100_000);
+    lastSeq = await ledger.lastEventSeq();
     const packetTokens = events
       .filter((event) => event.type === "packet.built")
       .map((event) => Number((event.payload as { tokens: number }).tokens));
@@ -166,14 +175,16 @@ for (let i = 0; i < missionCount; i++) {
       faultInjected,
       runMs: result.ms,
       spentExperiments: mission?.spentExperiments ?? 0,
+      workerInputTokens: (mission?.spentInputTokens ?? 0) - lastInputTokens,
+      usageUncertain: (mission?.usageUncertain ?? 0) !== 0,
       packetTokens,
       retrievalMs,
       recoveryMs,
       ledgerBytes: bytes(paths.db),
       sessionBytes: bytes(paths.sessions),
       artifactBytes: bytes(paths.artifacts),
-      segments: ledger.listSegments(missionId).length,
-      checkpoints: ledger.countCheckpoints(missionId),
+      segments: (await ledger.listSegments(missionId)).length,
+      checkpoints: await ledger.countCheckpoints(missionId),
       replayedFault: events.some(
         (event) =>
           event.type === "controller.recovered" &&
@@ -182,7 +193,8 @@ for (let i = 0; i < missionCount; i++) {
           ),
       ),
     };
-    ledger.close();
+    await ledger.close();
+    lastInputTokens = mission?.spentInputTokens ?? 0;
     samples.push(sample);
     console.log(JSON.stringify(sample));
     appendFileSync(join(out, "samples.jsonl"), `${JSON.stringify(sample)}\n`);
@@ -205,7 +217,10 @@ const report = {
   elapsedMs: Date.now() - startedAt,
   injectedFaults: samples.filter((sample) => sample.faultInjected).length,
   replayedFaults: samples.filter((sample) => sample.replayedFault).length,
-  maxPacketTokens: samples.reduce((max, sample) => Math.max(max, ...sample.packetTokens), 0),
+  maxPacketTokens: samples.reduce(
+    (max, sample) => sample.packetTokens.reduce((peak, tokens) => Math.max(peak, tokens), max),
+    0,
+  ),
   maxRecoveryMs: samples.reduce((max, sample) => Math.max(max, sample.recoveryMs ?? 0), 0),
   maxLedgerBytes: samples.reduce((max, sample) => Math.max(max, sample.ledgerBytes), 0),
   maxSessionBytes: samples.reduce((max, sample) => Math.max(max, sample.sessionBytes), 0),

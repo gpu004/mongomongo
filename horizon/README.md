@@ -15,8 +15,11 @@ ledger, and a scoped memory layer keep the mission honest and resumable. See
   before `docker run` and every container is labelled with its mission, so `resume` removes any
   candidate or worker container orphaned by a controller crash
 - `SUPERMEMORY_API_KEY` (optional); without it the local memory adapter is used
-- `MONGODB_URI` / `MONGODB_DB` (optional) for the Atlas ledger adapter; see `.env.example`.
-  `doctor` probes connectivity, a disposable write/read, a transaction, and the required
+- `MONGODB_URI` / `MONGODB_DB` (optional) for the MongoDB ledger; see `.env.example`. When set,
+  missions use MongoDB unless the mission config pins `"ledger": { "backend": "sqlite" }`;
+  `"backend": "mongodb"` refuses to start without `MONGODB_URI`. Every controller run claims a
+  fenced lease (monotonic fencing token, heartbeat-renewed) so a stale controller's writes are
+  rejected instead of corrupting the mission. `doctor` probes connectivity, a disposable write/read, a transaction, and the required
   indexes, then removes its probe data without printing credentials
 - An LLM API key for the Pi worker (`"worker": "pi"`): `<PROVIDER>_API_KEY` for the configured `model.provider` (`ANTHROPIC_API_KEY`, or `GOOGLE_API_KEY`/`GEMINI_API_KEY` for `google`); the `scripted` worker needs none
 
@@ -32,7 +35,7 @@ npm run check          # tsc --noEmit
 npm run lint           # oxlint --max-warnings 0 . + scripts/lint-comments.ts (no section dividers, diff narration, or unjustified suppressions)
 npm run format:check   # oxfmt --check . (npm run format rewrites in place)
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, ledger contract
-MONGODB_URI=... npm test   # additionally runs the ledger contract tests against MongoDB in a throwaway database
+MONGODB_URI=... npm test   # additionally runs the ledger contract and controller runtime tests against MongoDB in throwaway databases
 npm test               # recovery, fault injection, policies, report validation, memory scope, lesson policy, context budget, sandbox
                        # test/sandbox-escape.test.ts runs the adversarial escape-probe fixture against Docker when the
                        # pinned image is present (skipped otherwise; HORIZON_REQUIRE_DOCKER=1 makes the skip a failure)
@@ -72,7 +75,7 @@ itself (rounded up to 0.1%). Spread at or above `maxRepetitionSpread` (default `
 blocks the mission before optimization so the workload or environment can be repaired. The frozen
 value is stored on the mission row and in the `target.assessed` event.
 
-Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger), `artifacts/<hash>/`
+Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger; MongoDB when selected), `artifacts/<hash>/`
 (immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`.
 
 ## Layout
@@ -100,3 +103,5 @@ runs the demo sequence — `mission create`, `run` interrupted at the crash poin
 ## Scripted soak
 
 `node scripts/soak.ts --config mission.example.json --out runs/soak-evidence --experiments 1000 --hours 4` runs successive scripted missions until either limit is reached. Use `--missions N` to cap the mission count, `--fault-every N` to inject a crash in every Nth mission, and `--max-runs N` to bound retries per mission. With no limits, it runs ten missions. Each mission exercises a crash and resume where scheduled, two worker experiments, and segment rotation. The runner uses local SQLite and memory rather than hosted services. It writes a sample after each single-cycle run with packet tokens, retrieval and recovery duration, ledger, session and artifact sizes; it appends to `samples.jsonl` immediately and, on completion, writes `samples.json` and `report.json` under the output directory. These runs measure repeated short missions, not one uninterrupted long mission or Pi session growth.
+
+The runner enables retention by default; a config can override `retention.keepRecentCandidates`, `retention.keepRecentSegments`, and `retention.compactEventsAfter`. The controller retains the seed, accepted artifacts, active recovery inputs, and the last K distinct candidates; archives older closed Pi sessions as verified gzip files in `evidence/` before deleting the originals; and compresses older ledger events into indexed snapshots. Event pagination, idempotency, and live-gate evidence still include archived events. `workerInputTokens` in soak samples comes from mission budget usage; `packetTokens` estimates only the context packet, not the full model request. The scripted worker marks usage uncertain. The pinned Pi SDK exposes provider-reported response usage (including cache reads and writes), but no provider tokenizer for preflight packet construction, so packet sizing still uses a character estimate. The 10,000-episode memory benchmark in `REPORT.md` is synthetic local retrieval; hosted Supermemory has only been probed at 12 and 20 episodes.

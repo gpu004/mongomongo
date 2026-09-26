@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Ledger, type EpisodeRow } from "../src/ledger.ts";
+import { SqliteLedger } from "../src/sqlite-ledger.ts";
 import {
   type EpisodePayload,
   LocalMemoryAdapter,
@@ -66,25 +67,26 @@ function row(p: EpisodePayload, evidenceIds: string[] = []): EpisodeRow {
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "horizon-mem-"));
   const ledger = new Ledger(join(dir, "state.sqlite"));
+  const asyncLedger = new SqliteLedger(ledger);
   const evidence = new FileEvidenceStore(join(dir, "evidence"));
   const adapter = new LocalMemoryAdapter();
   const payloads = new Map<string, EpisodePayload>();
   const outbox = new MemoryOutbox(
-    ledger,
+    asyncLedger,
     adapter,
     TAG,
     (id) => payloads.get(id),
     () => {},
   );
-  return { ledger, evidence, adapter, payloads, outbox };
+  return { ledger, asyncLedger, evidence, adapter, payloads, outbox };
 }
 
 test("retrieval only injects episodes from this mission's scope with local evidence", async () => {
-  const { ledger, evidence, adapter, payloads, outbox } = fixture();
+  const { ledger, asyncLedger, evidence, adapter, payloads, outbox } = fixture();
   const ours = payload("ep-1", { evidenceIds: [evidence.write("timing", { p95: 1 })] });
   payloads.set(ours.episodeId, ours);
   ledger.insertEpisode(row(ours, ours.evidenceIds));
-  outbox.enqueue(ours);
+  await outbox.enqueue(ours);
   await outbox.drain();
   await outbox.drain();
 
@@ -116,7 +118,7 @@ test("retrieval only injects episodes from this mission's scope with local evide
 
   const selection = await retrieveEpisodes(
     adapter,
-    ledger,
+    asyncLedger,
     evidence,
     SCOPE,
     "cache normalized documents",
@@ -135,19 +137,19 @@ test("retrieval only injects episodes from this mission's scope with local evide
 });
 
 test("superseded episodes and episodes whose evidence is gone are filtered out", async () => {
-  const { ledger, evidence, adapter, payloads, outbox } = fixture();
+  const { ledger, asyncLedger, evidence, adapter, payloads, outbox } = fixture();
   const v1 = payload("ep-v1");
   const v2 = payload("ep-v2", { version: 2, supersedes: "ep-v1" });
   const missing = payload("ep-missing", { evidenceIds: ["ev-timing-0123456789abcdef"] });
   for (const p of [v1, v2, missing]) {
     payloads.set(p.episodeId, p);
     ledger.insertEpisode(row(p, p.evidenceIds));
-    outbox.enqueue(p);
+    await outbox.enqueue(p);
   }
   await outbox.drain();
   const selection = await retrieveEpisodes(
     adapter,
-    ledger,
+    asyncLedger,
     evidence,
     SCOPE,
     "cache normalized documents",
@@ -163,12 +165,12 @@ test("superseded episodes and episodes whose evidence is gone are filtered out",
 });
 
 test("outbox: acceptance is not readiness; retries reuse the same customId; outage falls back to local cache", async () => {
-  const { ledger, evidence, adapter, payloads, outbox } = fixture();
+  const { ledger, asyncLedger, evidence, adapter, payloads, outbox } = fixture();
   const p = payload("ep-retry");
   payloads.set(p.episodeId, p);
   ledger.insertEpisode(row(p));
-  const key = outbox.enqueue(p);
-  assert.equal(outbox.enqueue(p), key, "re-enqueue of the same payload is idempotent");
+  const key = await outbox.enqueue(p);
+  assert.equal(await outbox.enqueue(p), key, "re-enqueue of the same payload is idempotent");
   assert.equal(ledger.listOutbox().length, 1);
 
   adapter.unavailable = true;
@@ -180,7 +182,7 @@ test("outbox: acceptance is not readiness; retries reuse the same customId; outa
   // Degraded retrieval uses the local ledger cache and says so.
   const degraded = await retrieveEpisodes(
     adapter,
-    ledger,
+    asyncLedger,
     evidence,
     SCOPE,
     "cache normalized documents",
