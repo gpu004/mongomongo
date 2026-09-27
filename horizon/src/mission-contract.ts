@@ -204,8 +204,105 @@ export function validateMissionConfig(value: unknown): MissionConfig {
   return c as MissionConfig;
 }
 
-/** Where the ledger lives is deployment, not contract: pinning the backend never changes the hash. */
+/**
+ * Operating parameters: knobs a long mission is expected to outlive. They are
+ * amendable through an audited `mission.amended` transition and never feed the
+ * contract hash. Everything else in the config is the frozen objective.
+ */
+export const OPERATING_FIELDS = [
+  "budget",
+  "segmentRotationCycles",
+  "stagnationLimit",
+  "model",
+  "worker",
+  "memory",
+  "retention",
+] as const satisfies readonly (keyof MissionConfig)[];
+
+export type OperatingField = (typeof OPERATING_FIELDS)[number];
+export type OperatingParameters = Pick<MissionConfig, OperatingField>;
+export type MissionObjective = Omit<MissionConfig, OperatingField | "ledger">;
+
+export function objectiveOf(config: MissionConfig): MissionObjective {
+  const objective: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (key === "ledger" || (OPERATING_FIELDS as readonly string[]).includes(key)) continue;
+    objective[key] = value;
+  }
+  return objective as unknown as MissionObjective;
+}
+
+export function operatingOf(config: MissionConfig): OperatingParameters {
+  const operating: Partial<OperatingParameters> = {};
+  for (const key of OPERATING_FIELDS) Object.assign(operating, { [key]: config[key] });
+  return operating as OperatingParameters;
+}
+
+/** Hash of the frozen objective only; budgets, model, worker and the ledger backend never change it. */
 export function contractHash(config: MissionConfig): string {
+  return sha256(canonicalJson(objectiveOf(config)));
+}
+
+/** Hash frozen by missions created before operating parameters were split out: every field but `ledger`. */
+export function legacyContractHash(config: MissionConfig): string {
   const { ledger: _ledger, ...contract } = config;
   return sha256(canonicalJson(contract));
+}
+
+export interface ParameterChange {
+  /** Dotted path, e.g. `budget.maxExperiments` or `model.id`. */
+  path: string;
+  from: unknown;
+  to: unknown;
+}
+
+/** Leaf-level differences between two values, as dotted paths. */
+export function diffParameters(from: unknown, to: unknown, prefix = ""): ParameterChange[] {
+  if (isPlainObject(from) && isPlainObject(to)) {
+    const keys = [...new Set([...Object.keys(from), ...Object.keys(to)])].sort();
+    return keys.flatMap((key) =>
+      diffParameters(from[key], to[key], prefix ? `${prefix}.${key}` : key),
+    );
+  }
+  if (canonicalJson(from) === canonicalJson(to)) return [];
+  return [{ path: prefix, from, to }];
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export interface Amendment {
+  /** Operating-parameter changes, in dotted-path order. */
+  changes: ParameterChange[];
+  /** Budget fields whose limit was raised; each one is recorded as `budget.extended`. */
+  budgetExtensions: ParameterChange[];
+}
+
+/**
+ * Validates `next` as the replacement operating parameters for a mission frozen
+ * from `current`. The objective must hash identically and the ledger backend is
+ * a deployment pin that cannot move; every other difference is an amendment.
+ */
+export function planAmendment(current: MissionConfig, next: MissionConfig): Amendment {
+  const objectiveDrift = diffParameters(objectiveOf(current), objectiveOf(next));
+  if (objectiveDrift.length > 0)
+    throw new Error(
+      `amendment changes the frozen objective (${objectiveDrift.map((c) => c.path).join(", ")}); start a new mission with a new missionId instead`,
+    );
+  const currentBackend = current.ledger?.backend ?? null;
+  const nextBackend = next.ledger?.backend ?? currentBackend;
+  if (currentBackend !== null && nextBackend !== currentBackend)
+    throw new Error(
+      `amendment moves the ledger backend from ${currentBackend} to ${nextBackend}; the backend is pinned for the life of the mission`,
+    );
+  const changes = diffParameters(operatingOf(current), operatingOf(next));
+  const budgetExtensions = changes.filter(
+    (c) =>
+      c.path.startsWith("budget.") &&
+      typeof c.from === "number" &&
+      typeof c.to === "number" &&
+      c.to > c.from,
+  );
+  return { changes, budgetExtensions };
 }

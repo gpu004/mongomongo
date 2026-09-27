@@ -57,6 +57,9 @@ npm run horizon -- doctor
 npm run horizon -- mission create --config mission.example.json
 npm run horizon -- run --mission search-p95-demo
 npm run horizon -- resume --mission search-p95-demo      # after an interruption
+npm run horizon -- amend --config mission.example.json    # raise budgets / change model, worker, rotation, stagnation, memory
+npm run horizon -- rebaseline --mission search-p95-demo  # after the evaluator (or an invalidating runtime change) drifted
+npm run horizon -- doctor --mission search-p95-demo      # contract / evaluator / environment drift notes for a frozen mission
 npm run horizon -- inspect --mission search-p95-demo
 npm run horizon -- export --mission search-p95-demo       # runs/<mission>/exports/summary.{json,md}
 npm run horizon -- live-gate --mission search-p95-demo    # plan.md live-mission criteria -> exports/live-gate.{json,md}; exit 0 only when all met
@@ -76,7 +79,34 @@ blocks the mission before optimization so the workload or environment can be rep
 value is stored on the mission row and in the `target.assessed` event.
 
 Mission state lives under `runs/<mission>/`: `state.sqlite` (WAL ledger; MongoDB when selected), `artifacts/<hash>/`
-(immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`.
+(immutable snapshots), `reports/`, `evidence/`, `learned-scenarios/`, `exports/`. `manifest.json` holds the
+config the CLI resumes from plus the identities frozen in the ledger; it is rewritten whenever they change.
+
+### Amending a long mission
+
+The contract hash covers the frozen objective only: target, workloads, acceptance settings, isolation and
+image, timeouts. Budgets, `model`, `worker`, `segmentRotationCycles`, `stagnationLimit` and `memory` are
+operating parameters, and the ledger backend is a deployment pin. `amend --config` replaces the operating
+parameters of an existing mission (same `missionId`): every leaf change is recorded as `mission.amended`
+(`{path, from, to}`), each raised budget limit also as `budget.extended`, the manifest is rewritten, and a
+mission stopped on `budget_exhausted` becomes resumable. Changing any objective field or the ledger backend
+is refused; start a new mission instead.
+
+On resume the ledger's frozen identities are compared with the current process. A different host runtime
+(Node patch or minor, or any Node change under container isolation) is accepted: the mission continues,
+the environment hash is refrozen and `environment.drifted` records the old and new fingerprints. Drift that
+changes what the frozen reports measured is refused: isolation mode or image, platform or architecture, or a
+Node major change under subprocess isolation (the candidate runs on the host). A changed evaluator is always
+refused. Both point to `rebaseline --mission`, which adopts the current evaluator and runtime, re-measures
+the seed (new baseline and acceptance margin), re-measures the previous best against it (kept only if it
+still clears the margin, otherwise the seed becomes the best), resets the holdout, and records
+`evaluator.rebaselined`. Earlier reports stay in the ledger as history under their own hashes and are
+never reused: every committed rebaseline is a numbered epoch (`mission:<id>:rebaselined:<n>`), and the
+baseline, target, holdout and re-measurement experiments and events of epoch `n` carry a `-r<n>` suffix
+(the original run keeps the plain names), so even revisiting an earlier evaluator or runtime measures
+afresh. A stored report is additionally only reused when it cites the current hashes. A rebaseline that
+fails or is interrupted after `evaluator.rebaselined` is committed is retried within the same epoch on the
+next `rebaseline` (it is only a no-op once the baseline and the previous best are measured under it).
 
 ## Layout
 
