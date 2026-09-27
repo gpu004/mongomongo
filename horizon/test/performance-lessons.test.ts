@@ -5,7 +5,7 @@ import { SEED_DIR } from "../src/artifact-store.ts";
 import { buildPacket, DEFAULT_PACKET_BUDGET } from "../src/context-packet.ts";
 import { LocalMemoryAdapter } from "../src/memory-adapter.ts";
 import { retrieveCrossMissionEpisodes } from "../src/memory-outbox.ts";
-import { validateMissionConfig } from "../src/mission-contract.ts";
+import { contractHash, OPERATING_FIELDS, validateMissionConfig } from "../src/mission-contract.ts";
 import {
   decidePerformancePolicy,
   decodePerformanceLesson,
@@ -19,7 +19,7 @@ import {
   renderPerformanceLessons,
 } from "../src/performance-lesson.ts";
 import type { Worker, WorkerCycleInput } from "../src/worker.ts";
-import { controllerFor, EXAMPLE_CONFIG, tempRunsRoot } from "./helpers.ts";
+import { controllerFor, EXAMPLE_CONFIG, tempRunsRoot, testConfig } from "./helpers.ts";
 
 const SEED_ENGINE = readFileSync(`${SEED_DIR}src/search/search-engine.ts`, "utf8");
 /** Correct but measurably slower: a fixed busy-wait on every query so the verdict is a measured p95 rejection, never a correctness one. */
@@ -597,4 +597,48 @@ test("mission contract: cross-mission tags are codebase-scoped and never the mis
     validateMissionConfig({ ...base, performanceRejectionLimit: 3 }).performanceRejectionLimit,
     3,
   );
+});
+
+test("performanceRejectionLimit is an amendable operating parameter: outside the contract hash, and the amended value drives the policy", async () => {
+  assert.ok((OPERATING_FIELDS as readonly string[]).includes("performanceRejectionLimit"));
+  const id = "perf-limit-amend";
+  const strict = testConfig(id, { performanceRejectionLimit: 2 });
+  const lenient = testConfig(id, { performanceRejectionLimit: 5 });
+  assert.equal(contractHash(strict), contractHash(lenient));
+
+  const runs = tempRunsRoot();
+  const controller = controllerFor(id, runs, {}, { performanceRejectionLimit: 2 });
+  await controller.initialize();
+  let lesson: PerformanceLesson | undefined;
+  for (const exp of ["exp-1", "exp-2"])
+    lesson = recordPerformanceObservation(lesson, {
+      kind: "performance_negative",
+      mechanism: "batch the scan",
+      hypothesis: "batch the scan",
+      featureIds: ["search-matching"],
+      observation: observation(exp, 12, 10),
+    });
+  await controller.ledger.upsertLesson(encodePerformanceLesson(id, lesson!));
+  assert.equal((await controller.performancePolicy()).blockedMechanisms.length, 1);
+  await controller.close();
+
+  const amender = controllerFor(id, runs, {}, { performanceRejectionLimit: 2 });
+  const plan = await amender.amend(lenient);
+  assert.deepEqual(plan.changes, [{ path: "performanceRejectionLimit", from: 2, to: 5 }]);
+  assert.equal(amender.config.performanceRejectionLimit, 5);
+  assert.equal(
+    (await amender.performancePolicy()).blockedMechanisms.length,
+    0,
+    "two measured rejections no longer reach the amended limit",
+  );
+  const amended = (await amender.ledger.eventsSince(0, 10_000)).filter(
+    (e) => e.type === "mission.amended",
+  );
+  assert.equal(amended.length, 1);
+  assert.equal(
+    (payloadOf(amended[0]).operating as { performanceRejectionLimit: number })
+      .performanceRejectionLimit,
+    5,
+  );
+  await amender.close();
 });

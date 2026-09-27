@@ -213,6 +213,7 @@ export const OPERATING_FIELDS = [
   "budget",
   "segmentRotationCycles",
   "stagnationLimit",
+  "performanceRejectionLimit",
   "model",
   "worker",
   "memory",

@@ -85,7 +85,7 @@ config the CLI resumes from plus the identities frozen in the ledger; it is rewr
 ### Amending a long mission
 
 The contract hash covers the frozen objective only: target, workloads, acceptance settings, isolation and
-image, timeouts. Budgets, `model`, `worker`, `segmentRotationCycles`, `stagnationLimit` and `memory` are
+image, timeouts. Budgets, `model`, `worker`, `segmentRotationCycles`, `stagnationLimit`, `performanceRejectionLimit` and `memory` are
 operating parameters, and the ledger backend is a deployment pin. `amend --config` replaces the operating
 parameters of an existing mission (same `missionId`): every leaf change is recorded as `mission.amended`
 (`{path, from, to}`), each raised budget limit also as `budget.extended`, the manifest is rewritten, and a
