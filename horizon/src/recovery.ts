@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { validateReport, type VerificationReport } from "../verification/reports.ts";
+import { type EnvironmentFingerprint, hashEnvironment } from "../verification/runner.ts";
 import type { ArtifactStore } from "./artifact-store.ts";
 import type { CheckpointRow, ExperimentRow } from "./ledger.ts";
 import type { AsyncLedger } from "./ledger-contract.ts";
@@ -16,9 +17,74 @@ export interface RecoveryAction {
     | "finish_report_commit"
     | "drain_outbox"
     | "discarded_uncommitted_segment"
-    | "removed_orphaned_container";
+    | "removed_orphaned_container"
+    | "environment_drift_accepted";
   experimentId?: string;
   detail: string;
+}
+
+/** Frozen identities the resuming process is compared against. */
+export interface ExpectedIdentities {
+  evaluatorHash: string;
+  contractHash: string;
+  /** Runtime facts of the resuming process. */
+  environment: EnvironmentFingerprint;
+  /** Runtime facts recorded when the mission's environment hash was last frozen, if known. */
+  frozenEnvironment?: EnvironmentFingerprint | undefined;
+}
+
+export type EnvironmentDriftSeverity = "warning" | "invalidating";
+
+export interface EnvironmentDrift {
+  severity: EnvironmentDriftSeverity;
+  /** Fields of the fingerprint that differ; empty when only the hash is known to differ. */
+  changed: (keyof EnvironmentFingerprint)[];
+  reason: string;
+}
+
+function nodeMajor(version: string): string {
+  return version.replace(/^v/, "").split(".")[0] ?? version;
+}
+
+/**
+ * A host runtime that differs from the frozen one is a warning: under container
+ * isolation the candidate never runs on the host, and a Node patch or minor
+ * upgrade does not change what the evaluator measures. Drift is invalidating
+ * only when it changes what the frozen reports measured: isolation mode or
+ * image (which the contract already pins), platform or architecture, or the
+ * Node major under subprocess isolation, where the candidate runs on the host.
+ */
+export function classifyEnvironmentDrift(
+  frozen: EnvironmentFingerprint | undefined,
+  current: EnvironmentFingerprint,
+): EnvironmentDrift | undefined {
+  if (frozen && hashEnvironment(frozen) === hashEnvironment(current)) return undefined;
+  if (!frozen)
+    return {
+      severity: "warning",
+      changed: [],
+      reason:
+        "environment hash differs from the frozen mission; the frozen runtime facts were not recorded",
+    };
+  const changed = (Object.keys(current) as (keyof EnvironmentFingerprint)[]).filter(
+    (key) => frozen[key] !== current[key],
+  );
+  const describe = changed.map((k) => `${k} ${frozen[k]} -> ${current[k]}`).join(", ");
+  if (changed.includes("isolation") || changed.includes("containerImage"))
+    return { severity: "invalidating", changed, reason: `sandbox changed (${describe})` };
+  if (changed.includes("platform") || changed.includes("arch"))
+    return { severity: "invalidating", changed, reason: `host platform changed (${describe})` };
+  if (
+    changed.includes("node") &&
+    current.isolation === "subprocess" &&
+    nodeMajor(frozen.node) !== nodeMajor(current.node)
+  )
+    return {
+      severity: "invalidating",
+      changed,
+      reason: `Node major changed under subprocess isolation, where the candidate runs on the host (${describe})`,
+    };
+  return { severity: "warning", changed, reason: `host runtime changed (${describe})` };
 }
 
 /** Minimal container runtime surface used by resume to remove orphans; injectable for tests. */
@@ -57,7 +123,7 @@ export async function recover(
   artifacts: ArtifactStore,
   missionId: string,
   reportsDir: string,
-  expected: { evaluatorHash: string; environmentHash: string; contractHash: string },
+  expected: ExpectedIdentities,
   runtime: ContainerRuntime = dockerRuntime,
 ): Promise<RecoveryOutcome> {
   const actions: RecoveryAction[] = [];
@@ -90,16 +156,44 @@ export async function recover(
 
   if (mission.contractHash !== expected.contractHash)
     throw new Error(
-      `contract hash drift: ledger ${mission.contractHash.slice(0, 12)} vs config ${expected.contractHash.slice(0, 12)}`,
+      `contract hash drift: ledger ${mission.contractHash.slice(0, 12)} vs config ${expected.contractHash.slice(0, 12)}; the frozen objective cannot be amended (operating parameters can, with 'horizon amend')`,
     );
   if (mission.evaluatorHash !== expected.evaluatorHash)
     throw new Error(
-      "evaluator hash drift: the verification runner changed since the mission was frozen",
+      `evaluator hash drift: the verification runner changed since the mission was frozen (${mission.evaluatorHash.slice(0, 12)} -> ${expected.evaluatorHash.slice(0, 12)}); run 'horizon rebaseline --mission ${missionId}' to re-measure the seed and best artifact under the new evaluator`,
     );
-  if (mission.environmentHash !== expected.environmentHash)
-    throw new Error(
-      "environment hash drift: node/platform/isolation differs from the frozen mission environment",
-    );
+  const environmentHash = hashEnvironment(expected.environment);
+  if (mission.environmentHash !== environmentHash) {
+    const drift = classifyEnvironmentDrift(expected.frozenEnvironment, expected.environment) ?? {
+      severity: "warning" as const,
+      changed: [],
+      reason: "environment hash differs from the frozen mission",
+    };
+    if (drift.severity === "invalidating")
+      throw new Error(
+        `environment drift invalidates the frozen measurements: ${drift.reason}; run 'horizon rebaseline --mission ${missionId}' to re-measure under the current runtime`,
+      );
+    await ledger.transaction(async (tx) => {
+      await tx.updateMission(missionId, { environmentHash });
+      await tx.appendEvent(
+        `environment:${missionId}:${environmentHash}`,
+        "environment.drifted",
+        missionId,
+        {
+          from: mission.environmentHash,
+          to: environmentHash,
+          frozenEnvironment: expected.frozenEnvironment ?? null,
+          environment: expected.environment,
+          changed: drift.changed,
+          reason: drift.reason,
+        },
+      );
+    });
+    actions.push({
+      kind: "environment_drift_accepted",
+      detail: `${drift.reason}; environment hash refrozen ${mission.environmentHash.slice(0, 12)} -> ${environmentHash.slice(0, 12)}`,
+    });
+  }
 
   const checkpoint = await ledger.latestCheckpoint(missionId);
   const replayed = checkpoint
