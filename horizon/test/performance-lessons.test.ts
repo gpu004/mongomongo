@@ -609,6 +609,20 @@ test("cross-mission retrieval is read-only, post-filtered and degrades to nothin
   );
   assert.equal(selection.degraded, false);
 
+  let operations = 0;
+  const capped = await retrieveCrossMissionEpisodes(
+    memory,
+    { missionId: "me", readTags: [tag, "horizon-codebase-unused"], contractVersion: 1 },
+    "prenormalize documents",
+    10,
+    1,
+    () => {
+      operations += 1;
+    },
+  );
+  assert.equal(capped.injected.length, 1);
+  assert.equal(operations, 1);
+
   memory.unavailable = true;
   const degraded = await retrieveCrossMissionEpisodes(
     memory,

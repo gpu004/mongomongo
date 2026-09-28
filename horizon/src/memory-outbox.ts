@@ -227,6 +227,7 @@ export async function retrieveCrossMissionEpisodes(
   const selection: RetrievalSelection = { injected: [], filteredOut: [], degraded: false };
   const seen = new Set<string>();
   for (const containerTag of scope.readTags) {
+    if (selection.injected.length >= select) break;
     let hits: MemoryHit[] = [];
     try {
       await onOperation();

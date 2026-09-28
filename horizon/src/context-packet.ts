@@ -101,7 +101,7 @@ export function buildPacket(
     "## Recent results and hypothesis",
     recent,
     ...(lessons ? ["## Performance lessons (ranked, measured, with evidence)", lessons] : []),
-    "## Retrieved episodes (historical, scoped to this mission)",
+    "## Retrieved episodes (historical, with provenance for cross-mission priors)",
     retrievedParts.length > 0 ? retrievedParts.join("\n\n") : "(none)",
     "## Evidence pointers and next action",
     next,
