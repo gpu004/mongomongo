@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "slug-ascii",
+  "description": "ASCII text lowercases and joins alphanumeric runs with single dashes.",
+  "suite": "correctness",
+  "invariantIds": ["TK-SLUG-ASCII"],
+  "cases": [
+    {
+      "fn": "slugify",
+      "args": ["Hello World"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["  Leading and trailing  "]
+    },
+    {
+      "fn": "slugify",
+      "args": ["Already-slugged-text"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["Symbols & Punctuation!!"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["MiXeD 123 Numbers"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["---"]
+    },
+    {
+      "fn": "slugify",
+      "args": [""]
+    }
+  ]
+}

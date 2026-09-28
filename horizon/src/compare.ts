@@ -2,9 +2,10 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MissionController, SimulatedCrash } from "./controller.ts";
 import { LocalMemoryAdapter, type MemoryAdapter, SupermemoryAdapter } from "./memory-adapter.ts";
-import type { MissionConfig } from "./mission-contract.ts";
+import { type MissionConfig, targetImprovementOf } from "./mission-contract.ts";
+import { improvedBound, reaches } from "./objective-metric.ts";
+import { missionSpecFor } from "./objectives/index.ts";
 import { type MissionPaths, missionPaths, writeJsonAtomic } from "./mission-paths.ts";
-import { ScriptedWorker } from "./scripted-worker.ts";
 import type { Worker } from "./worker.ts";
 
 /** The three configurations from the plan, differing only in memory features. */
@@ -111,7 +112,8 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
     throw new Error(
       `compare: config requests worker "${options.base.worker}" but no workerFactory was provided`,
     );
-  const workerFactory = options.workerFactory ?? (() => new ScriptedWorker());
+  const spec = missionSpecFor(options.base);
+  const workerFactory = options.workerFactory ?? (() => spec.scriptedWorker());
   const memoryFactory =
     options.memoryFactory ?? ((_c: Configuration, cfg: MissionConfig) => defaultMemoryAdapter(cfg));
   const measurements: MissionMeasurement[] = [];
@@ -162,7 +164,7 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
         seedHash = mission.seedArtifactHash;
         evaluatorHash = mission.evaluatorHash;
         const experiments = (await controller.ledger.listExperiments(missionId)).filter(
-          (e) => e.taskId === "optimize-search",
+          (e) => e.taskId === spec.tasks.optimize.taskId,
         );
         const signatures = experiments
           .map((e) => e.failureSignature)
@@ -181,14 +183,16 @@ export async function compareConfigurations(options: CompareOptions): Promise<Co
           );
         const required =
           mission.baselineP95Ms !== null
-            ? mission.baselineP95Ms * (1 - config.targetP95Reduction)
+            ? improvedBound(mission.baselineP95Ms, targetImprovementOf(config), spec.metric)
             : null;
         measurements.push({
           configuration,
           missionId,
           status: mission.status,
           targetReached:
-            required !== null && mission.bestP95Ms !== null && mission.bestP95Ms <= required,
+            required !== null &&
+            mission.bestP95Ms !== null &&
+            reaches(mission.bestP95Ms, required, spec.metric),
           baselineP95Ms: mission.baselineP95Ms,
           bestP95Ms: mission.bestP95Ms,
           experiments: experiments.length,

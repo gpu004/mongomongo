@@ -18,7 +18,17 @@ export interface ReportMetrics {
   measuredRequests?: number;
   failedRequests?: number;
   repetitionP95Ms?: number[];
+  /** Objective-specific metrics (e.g. `bundleBytes`) named by the mission's metric keys. */
+  [metric: string]: number | number[] | undefined;
 }
+
+/** The performance metric a passed performance report must carry; defaults to request-driven p95. */
+export interface PerformanceMetricKey {
+  key: string;
+  requestDriven: boolean;
+}
+
+const P95_REPORT_METRIC: PerformanceMetricKey = { key: "p95LatencyMs", requestDriven: true };
 
 export interface VerificationReport {
   schemaVersion: 1;
@@ -83,6 +93,7 @@ export type ReportValidation = { ok: true } | { ok: false; reason: string };
 export function validateReport(
   report: unknown,
   expected: FrozenIdentities & { missionId: string; experimentId: string; suite: Suite },
+  metric: PerformanceMetricKey = P95_REPORT_METRIC,
 ): ReportValidation {
   if (typeof report !== "object" || report === null)
     return { ok: false, reason: "report is not an object" };
@@ -113,15 +124,18 @@ export function validateReport(
     return { ok: false, reason: "status passed but an assertion failed" };
   }
   if (r.suite === "performance" && r.status === "passed") {
-    const m = r.metrics ?? {};
-    if (typeof m.p95LatencyMs !== "number" || !Number.isFinite(m.p95LatencyMs)) {
-      return { ok: false, reason: "performance report lacks p95LatencyMs" };
+    const m: ReportMetrics = r.metrics ?? {};
+    const value = m[metric.key];
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return { ok: false, reason: `performance report lacks ${metric.key}` };
     }
-    if (!m.measuredRequests || m.measuredRequests <= 0) {
-      return { ok: false, reason: "performance report measured zero requests" };
+    if (metric.requestDriven) {
+      if (!m.measuredRequests || m.measuredRequests <= 0) {
+        return { ok: false, reason: "performance report measured zero requests" };
+      }
+      if ((m.failedRequests ?? 0) > 0)
+        return { ok: false, reason: "performance report has failed requests" };
     }
-    if ((m.failedRequests ?? 0) > 0)
-      return { ok: false, reason: "performance report has failed requests" };
   }
   return { ok: true };
 }

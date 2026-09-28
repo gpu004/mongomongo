@@ -48,7 +48,7 @@ second job that pulls the digest-pinned `containerImage` from `mission.example.j
 MongoDB service so the sandbox-escape tests run under `HORIZON_REQUIRE_DOCKER=1` and the ledger
 contract covers both adapters.
 
-`stagnationLimit` (mission config): once that many optimize-search experiments have concluded since the last accepted one, the worker's packet carries a stagnation directive listing the mechanisms already tried, and a cycle that repeats one of them without first calling `profile_candidate` is rejected without running the verifier.
+`stagnationLimit` (mission config): once that many optimize-task experiments have concluded since the last accepted one, the worker's packet carries a stagnation directive listing the mechanisms already tried, and a cycle that repeats one of them without first calling `profile_candidate` is rejected without running the verifier.
 
 ## Reproduction
 
@@ -110,12 +110,55 @@ afresh. A stored report is additionally only reused when it cites the current ha
 fails or is interrupted after `evaluator.rebaselined` is committed is retried within the same epoch on the
 next `rebaseline` (it is only a no-op once the baseline and the previous best are measured under it).
 
+## Objectives (MissionSpec)
+
+A mission's objective is a `MissionSpec` plugin (`src/mission-spec.ts`) selected by the optional
+`missionSpec` field of the mission config; a config without it (every mission created before the field
+existed, `mission.example.json`) is `search-p95`, so its contract hash is unchanged. `missionSpec` is part
+of the frozen objective: `amend` refuses to change it. Two objectives ship:
+
+| `missionSpec`          | seed                   | metric                                                           | tasks                                        | example                            |
+| ---------------------- | ---------------------- | ---------------------------------------------------------------- | -------------------------------------------- | ---------------------------------- |
+| `search-p95` (default) | `demo/search-service/` | `p95LatencyMs`, minimize, 3 request-driven repetitions           | `baseline` -> `optimize-search` -> `holdout` | `mission.example.json`             |
+| `bundle-size`          | `demo/text-kit/`       | `bundleBytes` (bytes under `src/`), minimize, 1 exact repetition | `baseline` -> `shrink-bundle` -> `holdout`   | `mission.bundle-size.example.json` |
+
+The controller, context packet, lesson policy, progress/export, live gate, compare, `verify`/`profile`,
+`features check` and `doctor` only reach the objective through the spec: its task graph, metric (key,
+per-repetition series key, unit, direction, lesson metric), evaluator (`id`, `hash()`, `run(request,
+suite)`), seed directory, scenarios and feature map, verification skill, the objective paragraph of the Pi
+system prompt, the pinned constraint line and correction hint, whether learned regressions are accepted
+(and against which negative fixture), config validation, and the deterministic scripted worker. Frozen
+ledger columns keep their original names (`baselineP95Ms`, `bestP95Ms`) and hold the spec's metric in its
+unit; persisted p95 lessons are read unchanged, and lessons of other metrics carry `metric`.
+
+To author another objective:
+
+1. Add a seed artifact directory whose editable code lives under `src/` (the worker can only edit there).
+2. Write an evaluator under `verification/<objective>/` that returns `VerificationReport`s for the suites
+   the controller runs (`structural`, `smoke`, `correctness`, `performance`, `holdout`; `learned` only
+   when it accepts regressions). It must check the snapshot hash against the artifact and its own hash
+   against the frozen one, record evidence ids, and put the metric in `metrics[metric.key]` and the
+   per-repetition values in `metrics[metric.repetitionsKey]`. Its hash must cover its code, reference and
+   every fixed and held-out scenario, so an edit to any of them is evaluator drift (resume refuses, and
+   `rebaseline` re-measures the seed and best under the new hash).
+3. Add fixed scenarios and held-out scenarios, each naming the invariants it protects, and
+   `resources/<objective>/features.json` mapping features to invariants and scenarios, plus a verification
+   skill for the Pi worker. `features check --config <mission.json>` validates the map.
+4. Define the `MissionSpec` in `src/objectives/<objective>.ts` (metric with `direction`, `requestDriven`
+   and a `lessonMetric` id; `baseline`/`optimize`/`holdout` tasks; `validateConfig` naming the target field
+   — `targetImprovement` for new objectives — and rejecting fields that do not apply; `repetitions`), and
+   register it in `src/objectives/index.ts`.
+5. Provide a scripted worker that drives the objective offline through the tool broker, and a test that
+   runs `initialize()` -> `run()` to `succeeded` with a rejected and an accepted candidate and a passed
+   holdout (see `test/mission-spec.test.ts`).
+
 ## Layout
 
-- `demo/search-service/` seed service (frozen contract in `src/domain/contracts.ts`)
-- `verification/` independent reference model, fixed scenarios, workloads, runner, report schema, fixtures
+- `demo/search-service/` seed service (frozen contract in `src/domain/contracts.ts`); `demo/text-kit/` bundle-size seed
+- `verification/` independent reference model, fixed scenarios, workloads, runner, report schema, fixtures; `verification/bundle-size/` bundle evaluator, reference and scenarios
+- `src/objectives/` MissionSpec registry and the `search-p95` and `bundle-size` objectives
 - `src/` ledger, artifact store, recovery, controller, tool broker, Pi/scripted workers, memory, lesson policy, CLI
-- `resources/` versioned feature map and verification skill
+- `resources/` versioned feature map and verification skill; `resources/bundle-size/` for the bundle objective
 - `test/` deterministic tests
 
 ## Live Pi mission (plan.md §5 acceptance gate)

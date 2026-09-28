@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "slug-diacritics",
+  "description": "Latin diacritics fold to base letters; letters without an ASCII decomposition become separators.",
+  "suite": "correctness",
+  "invariantIds": ["TK-SLUG-DIACRITICS"],
+  "cases": [
+    {
+      "fn": "slugify",
+      "args": ["Crème Brûlée"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["Ångström Über Ñandú"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["Ça va, garçon?"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["Łódź and Kraków"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["ÀÉÎÕÜ àéîõü"]
+    }
+  ]
+}

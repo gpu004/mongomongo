@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { EventRow } from "./ledger.ts";
 import type { AsyncLedger } from "./ledger-contract.ts";
 import type { MissionConfig } from "./mission-contract.ts";
+import { missionSpecFor } from "./objectives/index.ts";
 import type { MissionPaths } from "./mission-paths.ts";
 import { writeJsonAtomic } from "./mission-paths.ts";
 
@@ -61,7 +62,10 @@ export async function evaluateLiveGate(
   const events = await allEvents(ledger);
   const checks: GateCheck[] = [];
 
-  const workerExperiments = experiments.filter((e) => e.taskId === "optimize-search");
+  const spec = missionSpecFor(config);
+  const unit = (value: number | null | undefined) =>
+    `${spec.metric.label} ${value ?? "n/a"}${spec.metric.unit}`;
+  const workerExperiments = experiments.filter((e) => e.taskId === spec.tasks.optimize.taskId);
   const modelExperiments = workerExperiments.filter((e) => e.strategy === "pi");
   const scriptedExperiments = workerExperiments.filter((e) => e.strategy !== "pi");
   checks.push({
@@ -82,9 +86,9 @@ export async function evaluateLiveGate(
   checks.push({
     id: "baseline_measured",
     passed:
-      tasks.find((t) => t.taskId === "baseline")?.status === "done" &&
+      tasks.find((t) => t.taskId === spec.tasks.baseline.taskId)?.status === "done" &&
       mission?.baselineP95Ms != null,
-    detail: `baseline task ${tasks.find((t) => t.taskId === "baseline")?.status ?? "missing"}; baseline p95 ${mission?.baselineP95Ms ?? "n/a"}ms`,
+    detail: `baseline task ${tasks.find((t) => t.taskId === spec.tasks.baseline.taskId)?.status ?? "missing"}; baseline ${unit(mission?.baselineP95Ms)}`,
   });
 
   const seeded = new Set(
@@ -165,7 +169,7 @@ export async function evaluateLiveGate(
         : `${rotations.length} rotation(s); no packet injected an episode from an earlier segment`,
   });
 
-  const holdout = tasks.find((t) => t.taskId === "holdout");
+  const holdout = tasks.find((t) => t.taskId === spec.tasks.holdout.taskId);
   const holdoutReports = verifications.filter(
     (v) => v.suite === "holdout" && v.status === "passed",
   );
@@ -178,7 +182,7 @@ export async function evaluateLiveGate(
   checks.push({
     id: "mission_succeeded",
     passed: mission?.status === "succeeded",
-    detail: `mission status ${mission?.status ?? "n/a"}; best p95 ${mission?.bestP95Ms ?? "n/a"}ms vs baseline ${mission?.baselineP95Ms ?? "n/a"}ms`,
+    detail: `mission status ${mission?.status ?? "n/a"}; best ${unit(mission?.bestP95Ms)} vs baseline ${unit(mission?.baselineP95Ms)}`,
   });
 
   return {

@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "product": "horizon-demo-text-kit",
+  "contractVersion": 1,
+  "layers": {
+    "api": "src/index.ts: the public API; re-exports exactly slugify, titleCase, wordCount and truncate",
+    "slug": "src/slug.ts: URL slugs",
+    "case": "src/case.ts: title case",
+    "words": "src/words.ts: word counting",
+    "truncate": "src/truncate.ts: code-point truncation"
+  },
+  "features": [
+    {
+      "id": "F-API",
+      "name": "Public API",
+      "invariants": ["TK-API", "STRUCT-SELF-CONTAINED"],
+      "scenarios": ["smoke-api-round-trip"]
+    },
+    {
+      "id": "F-SLUG",
+      "name": "Slugs",
+      "invariants": ["TK-SLUG-ASCII", "TK-SLUG-DIACRITICS"],
+      "scenarios": ["slug-ascii", "slug-diacritics"]
+    },
+    {
+      "id": "F-TITLE",
+      "name": "Title case",
+      "invariants": ["TK-TITLE-CASE"],
+      "scenarios": ["title-case"]
+    },
+    {
+      "id": "F-WORDS",
+      "name": "Word count",
+      "invariants": ["TK-WORD-COUNT"],
+      "scenarios": ["word-count", "holdout-unicode-text"]
+    },
+    {
+      "id": "F-TRUNCATE",
+      "name": "Truncation",
+      "invariants": ["TK-TRUNCATE", "TK-TRUNCATE-RANGE", "TK-TRUNCATE-CODE-POINTS"],
+      "scenarios": ["truncate-limits", "holdout-truncate-code-points"]
+    }
+  ],
+  "invariants": {
+    "TK-API": "src/index.ts exports slugify, titleCase, wordCount and truncate as functions",
+    "STRUCT-SELF-CONTAINED": "the bundle is src/ only: relative imports inside src/, no packages, runtime modules or dynamic code",
+    "TK-SLUG-ASCII": "slugify lowercases and joins ASCII letter/digit runs with single dashes, no leading or trailing dash",
+    "TK-SLUG-DIACRITICS": "slugify folds characters by NFKD and drops combining marks before slugging",
+    "TK-TITLE-CASE": "titleCase lowercases, then uppercases the first character at the start or after whitespace; whitespace is preserved",
+    "TK-WORD-COUNT": "wordCount counts maximal runs of Unicode letters or digits",
+    "TK-TRUNCATE": "truncate returns fitting text unchanged, otherwise max-1 code points plus an ellipsis; max 0 yields empty",
+    "TK-TRUNCATE-RANGE": "truncate throws RangeError for a negative or non-integer max",
+    "TK-TRUNCATE-CODE-POINTS": "truncate counts Unicode code points, never splitting a surrogate pair"
+  },
+  "verificationOrder": ["structural", "smoke", "correctness", "performance"],
+  "performance": {
+    "metric": "bundleBytes: total bytes of every file under src/ (deterministic; one repetition)",
+    "acceptance": "correctness passes and bundleBytes shrinks below the current best by at least the acceptance margin"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "missionId": "bundle-size-demo",
+  "contractVersion": 1,
+  "missionSpec": "bundle-size",
+  "objective": "Reduce the shipped source bytes of demo/text-kit by 40% without changing slugify, titleCase, wordCount or truncate.",
+  "targetImprovement": 0.4,
+  "acceptanceMargin": 0.05,
+  "requiredImprovedRepetitions": 1,
+  "isolation": "subprocess",
+  "containerImage": "node@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1",
+  "memoryLimitBytes": 536870912,
+  "startupTimeoutMs": 15000,
+  "requestTimeoutMs": 5000,
+  "budget": {
+    "maxWallMs": 1800000,
+    "maxExperiments": 8,
+    "maxInputTokens": 2000000,
+    "maxOutputTokens": 400000,
+    "maxMemoryOperations": 200,
+    "cycleTimeoutMs": 300000
+  },
+  "segmentRotationCycles": 3,
+  "stagnationLimit": 3,
+  "model": { "provider": "anthropic", "id": "claude-sonnet-4-5" },
+  "worker": "scripted",
+  "memory": {
+    "enabled": true,
+    "containerTag": "horizon-bundle-size-demo",
+    "materializeCorrections": true
+  }
+}

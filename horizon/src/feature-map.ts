@@ -11,6 +11,9 @@ export interface FeatureMap {
   verificationOrder: string[];
 }
 
+/** What the feature map needs of a scenario, whatever the objective's scenario format. */
+export type FeatureScenario = Pick<Scenario, "scenarioId" | "invariantIds" | "origin">;
+
 const SUITES = new Set(["structural", "smoke", "correctness", "learned", "performance", "holdout"]);
 
 export function loadFeatureMap(path: string): FeatureMap {
@@ -26,7 +29,7 @@ export function loadFeatureMap(path: string): FeatureMap {
  */
 export function validateFeatureMap(
   map: FeatureMap,
-  scenarios: Scenario[],
+  scenarios: FeatureScenario[],
   seedDir: string,
 ): string[] {
   const issues: string[] = [];

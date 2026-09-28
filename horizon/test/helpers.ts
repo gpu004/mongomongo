@@ -24,14 +24,14 @@ export function testConfig(
     // The small workload is deliberately noisy; the noise-floor policy itself is covered by noise-floor.test.ts.
     maxRepetitionSpread: 1,
     workload: {
-      ...base.workload,
+      ...base.workload!,
       corpusSize: 3000,
       warmupRequests: 30,
       measuredRequests: 150,
       repetitions: 3,
     },
     holdoutWorkload: {
-      ...base.holdoutWorkload,
+      ...base.holdoutWorkload!,
       corpusSize: 3000,
       warmupRequests: 30,
       measuredRequests: 150,

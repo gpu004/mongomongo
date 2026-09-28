@@ -64,7 +64,10 @@ test("contract hash covers the frozen objective only; operating parameters and t
     }),
     hash,
   );
-  assert.notEqual(contractHash({ ...base, targetP95Reduction: base.targetP95Reduction / 2 }), hash);
+  assert.notEqual(
+    contractHash({ ...base, targetP95Reduction: base.targetP95Reduction! / 2 }),
+    hash,
+  );
   for (const field of OPERATING_FIELDS) assert.equal(field in objectiveOf(base), false);
   assert.equal("ledger" in objectiveOf(base), false);
   assert.equal("objective" in objectiveOf(base), true);
