@@ -750,6 +750,8 @@ export class MongoLedger implements AsyncLedger {
       const {
         lessonId,
         state,
+        sourceEpisodeIds,
+        proposal,
         positiveEvidenceId,
         negativeEvidenceId,
         materializedScenarioId,
@@ -761,6 +763,8 @@ export class MongoLedger implements AsyncLedger {
         {
           $set: {
             state,
+            sourceEpisodeIds,
+            proposal,
             positiveEvidenceId,
             negativeEvidenceId,
             materializedScenarioId,

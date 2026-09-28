@@ -990,8 +990,9 @@ export class Ledger {
       .prepare(
         `INSERT INTO lesson (lesson_id, mission_id, source_episode_ids, invariant_id, state, proposal, positive_evidence_id, negative_evidence_id, materialized_scenario_id, transitions)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-				 ON CONFLICT(lesson_id) DO UPDATE SET state = excluded.state, positive_evidence_id = excluded.positive_evidence_id,
-				 negative_evidence_id = excluded.negative_evidence_id, materialized_scenario_id = excluded.materialized_scenario_id, transitions = excluded.transitions`,
+				 ON CONFLICT(lesson_id) DO UPDATE SET state = excluded.state, source_episode_ids = excluded.source_episode_ids, proposal = excluded.proposal,
+				 positive_evidence_id = excluded.positive_evidence_id, negative_evidence_id = excluded.negative_evidence_id,
+				 materialized_scenario_id = excluded.materialized_scenario_id, transitions = excluded.transitions`,
       )
       .run(
         l.lessonId,

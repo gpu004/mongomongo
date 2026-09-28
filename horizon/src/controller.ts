@@ -44,7 +44,12 @@ import {
   renderEpisode,
   SupermemoryAdapter,
 } from "./memory-adapter.ts";
-import { composeRetrievalQuery, MemoryOutbox, retrieveEpisodes } from "./memory-outbox.ts";
+import {
+  composeRetrievalQuery,
+  MemoryOutbox,
+  retrieveCrossMissionEpisodes,
+  retrieveEpisodes,
+} from "./memory-outbox.ts";
 import { type ControlRequest, clearControl, readControl } from "./operator-control.ts";
 import {
   type Amendment,
@@ -54,6 +59,20 @@ import {
   operatingOf,
   planAmendment,
 } from "./mission-contract.ts";
+import {
+  decidePerformancePolicy,
+  decodePerformanceLesson,
+  deltaFraction,
+  encodePerformanceLesson,
+  isMeasuredP95Comparison,
+  type PerformanceLesson,
+  type PerformanceLessonKind,
+  performanceLessonId,
+  type PerformancePolicy,
+  rankPerformanceLessons,
+  recordPerformanceObservation,
+  renderPerformanceLessons,
+} from "./performance-lesson.ts";
 import {
   ensureMissionDirs,
   FileEvidenceStore,
@@ -183,16 +202,30 @@ export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 
 export type Verdict = "accepted" | "rejected" | "inconclusive";
 
+/** A lesson computed from a measured verdict, committed together with that verdict in `conclude()`. */
+interface PlannedPerformanceLesson {
+  lesson: PerformanceLesson;
+  event: Record<string, unknown>;
+}
+
 interface Story {
   hypothesis: string;
   whatChanged: string;
   claim: string;
   seededFixture: string | null;
   claimIssues?: string[];
+  /** Whether the worker ran profile_candidate before editing in this cycle. */
+  profiled?: boolean;
 }
 
+const DEFAULT_PERFORMANCE_REJECTION_LIMIT = 2;
+
 /** Per-field character limits for worker prose kept in events, episodes and packets; full text goes to evidence. */
-const WORKER_TEXT_LIMITS = { hypothesis: 400, whatChanged: 800, claim: 800 } as const;
+const WORKER_TEXT_LIMITS = {
+  hypothesis: 400,
+  whatChanged: 800,
+  claim: 800,
+} as const;
 
 /** Collapses case, whitespace and punctuation so reworded repeats of one mechanism compare equal. */
 export function normalizeHypothesis(text: string): string {
@@ -427,7 +460,11 @@ export class MissionController {
         createdAt: new Date().toISOString(),
       });
       for (const task of TASKS)
-        await tx.upsertTask({ ...task, missionId: this.config.missionId, status: "pending" });
+        await tx.upsertTask({
+          ...task,
+          missionId: this.config.missionId,
+          status: "pending",
+        });
       await tx.appendEvent(
         `mission:${this.config.missionId}:created`,
         "mission.created",
@@ -500,7 +537,10 @@ export class MissionController {
     if (manifest.pendingAmendment) {
       const { amendmentId, eventKey, config } = manifest.pendingAmendment;
       if (await this.ledger.findEvent(eventKey)) {
-        this.currentConfig = { ...config, ledger: { backend: this.ledger.backend } };
+        this.currentConfig = {
+          ...config,
+          ledger: { backend: this.ledger.backend },
+        };
         this.log(`recovery: amendment ${amendmentId} committed; manifest reconciled from ledger`);
       } else this.log(`recovery: amendment ${amendmentId} never committed; discarded`);
       dirty = true;
@@ -514,9 +554,15 @@ export class MissionController {
           `mission:${this.config.missionId}:contract-migrated:${mission.contractHash}`,
           "contract.migrated",
           this.config.missionId,
-          { from: mission.contractHash, to: this.contractHash, reason: "objective-only hash" },
+          {
+            from: mission.contractHash,
+            to: this.contractHash,
+            reason: "objective-only hash",
+          },
         );
-        await tx.updateMission(this.config.missionId, { contractHash: this.contractHash });
+        await tx.updateMission(this.config.missionId, {
+          contractHash: this.contractHash,
+        });
       });
       this.log(
         `recovery: contract hash migrated ${mission.contractHash.slice(0, 12)} -> ${this.contractHash.slice(0, 12)} (objective-only)`,
@@ -560,7 +606,10 @@ export class MissionController {
         16,
       );
       const eventKey = `mission:${this.config.missionId}:amended:${amendmentId}`;
-      const amended: MissionConfig = { ...next, ledger: { backend: this.ledger.backend } };
+      const amended: MissionConfig = {
+        ...next,
+        ledger: { backend: this.ledger.backend },
+      };
       const reopened =
         mission.status === "budget_exhausted" && amendment.budgetExtensions.length > 0;
       this.syncManifest(mission, { amendmentId, eventKey, config: amended });
@@ -581,7 +630,10 @@ export class MissionController {
             { amendmentId, ...extension },
           );
         if (reopened)
-          await tx.updateMission(this.config.missionId, { status: "ready", nextWakeAt: null });
+          await tx.updateMission(this.config.missionId, {
+            status: "ready",
+            nextWakeAt: null,
+          });
       });
       this.crash("amendment_committed");
       this.currentConfig = amended;
@@ -636,8 +688,14 @@ export class MissionController {
         ? last
         : {
             epoch,
-            evaluatorHash: { from: before.evaluatorHash, to: this.evaluatorHash },
-            environmentHash: { from: before.environmentHash, to: this.environmentHash },
+            evaluatorHash: {
+              from: before.evaluatorHash,
+              to: this.evaluatorHash,
+            },
+            environmentHash: {
+              from: before.environmentHash,
+              to: this.environmentHash,
+            },
             environment: this.environment,
             previousBaselineP95Ms: before.baselineP95Ms,
             previousBestArtifactHash: before.bestArtifactHash,
@@ -683,10 +741,20 @@ export class MissionController {
           activeTaskId: null,
           nextWakeAt: null,
         });
-        await tx.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "pending" });
-        await tx.upsertTask({ ...TASKS[2]!, missionId: this.config.missionId, status: "pending" });
+        await tx.upsertTask({
+          ...TASKS[0]!,
+          missionId: this.config.missionId,
+          status: "pending",
+        });
+        await tx.upsertTask({
+          ...TASKS[2]!,
+          missionId: this.config.missionId,
+          status: "pending",
+        });
         if (previousBest && before.bestArtifactHash !== seed)
-          await tx.updateMission(this.config.missionId, { bestArtifactHash: seed });
+          await tx.updateMission(this.config.missionId, {
+            bestArtifactHash: seed,
+          });
         await tx.appendEvent(rebaselineKey, "evaluator.rebaselined", this.config.missionId, origin);
         await this.checkpoint(tx, "ready", "baseline", null, `rebaselined:${rebaselineId}`);
       });
@@ -714,9 +782,13 @@ export class MissionController {
             attempt: 1,
             segmentOrdinal: this.segmentOrdinal,
           });
-          await this.ledger.updateExperiment(experimentId, { candidateArtifactHash: previousBest });
+          await this.ledger.updateExperiment(experimentId, {
+            candidateArtifactHash: previousBest,
+          });
         }
-        await this.ledger.updateExperiment(experimentId, { status: "evaluating" });
+        await this.ledger.updateExperiment(experimentId, {
+          status: "evaluating",
+        });
         const reports = await this.runSuites(experimentId, previousBest, [
           "smoke",
           "correctness",
@@ -733,7 +805,10 @@ export class MissionController {
                 baselineReport?.metrics.repetitionP95Ms,
                 this.timingPolicy(measured),
               )
-            : { kind: "reject" as const, reason: "previous best failed the fixed suites" };
+            : {
+                kind: "reject" as const,
+                reason: "previous best failed the fixed suites",
+              };
         const retained = decision.kind === "accept";
         await this.transaction(async (tx) => {
           await tx.updateExperiment(experimentId, {
@@ -1153,7 +1228,10 @@ export class MissionController {
 
   private async finish(status: MissionStatus, detail = ""): Promise<void> {
     await this.transaction(async (tx) => {
-      await tx.updateMission(this.config.missionId, { status, nextWakeAt: null });
+      await tx.updateMission(this.config.missionId, {
+        status,
+        nextWakeAt: null,
+      });
       await tx.appendEvent(
         `mission:${this.config.missionId}:finish:${Date.now()}`,
         "mission.finished",
@@ -1205,7 +1283,9 @@ export class MissionController {
         attempt: 1,
         segmentOrdinal: this.segmentOrdinal,
       });
-      await this.ledger.updateExperiment(experimentId, { candidateArtifactHash: seed });
+      await this.ledger.updateExperiment(experimentId, {
+        candidateArtifactHash: seed,
+      });
     }
     await this.ledger.updateExperiment(experimentId, { status: "evaluating" });
     const reports = await this.runSuites(experimentId, seed, [
@@ -1276,7 +1356,11 @@ export class MissionController {
         bestP95Ms: perf.metrics.p95LatencyMs ?? null,
         bestArtifactHash: seed,
       });
-      await tx.upsertTask({ ...TASKS[0]!, missionId: this.config.missionId, status: "done" });
+      await tx.upsertTask({
+        ...TASKS[0]!,
+        missionId: this.config.missionId,
+        status: "done",
+      });
       await tx.appendEvent(
         `baseline:${this.config.missionId}${suffix}`,
         "mission.baseline",
@@ -1333,7 +1417,9 @@ export class MissionController {
         attempt: 1,
         segmentOrdinal: this.segmentOrdinal,
       });
-      await this.ledger.updateExperiment(experimentId, { candidateArtifactHash: best });
+      await this.ledger.updateExperiment(experimentId, {
+        candidateArtifactHash: best,
+      });
     }
     await this.ledger.updateExperiment(experimentId, { status: "evaluating" });
     const [report] = await this.runSuites(experimentId, best, ["holdout"]);
@@ -1417,7 +1503,24 @@ export class MissionController {
         `  stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}); requiring a new mechanism or a profiling step`,
       );
     }
-    const packet = await this.buildPacket(mission, experimentId, stagnation);
+    const policy = await this.performancePolicy();
+    if (policy.blockedMechanisms.length > 0) {
+      await this.ledger.appendEvent(
+        `${experimentId}:performance-policy`,
+        "policy.performance",
+        experimentId,
+        {
+          limit: policy.limit,
+          blocked: policy.blockedMechanisms,
+          preferred: policy.preferredMechanisms,
+          focusFeatureIds: policy.focusFeatureIds,
+        },
+      );
+      this.log(
+        `  performance policy: ${policy.blockedMechanisms.length} mechanism(s) blocked after >= ${policy.limit} measured rejections; requiring a profile or a different mechanism`,
+      );
+    }
+    const packet = await this.buildPacket(mission, experimentId, stagnation, policy);
     this.cycleDeadline = Date.now() + this.config.budget.cycleTimeoutMs;
     const broker = new ToolBroker(
       this.paths.candidate,
@@ -1491,6 +1594,37 @@ export class MissionController {
       );
       return "continue";
     }
+    const blocked = policy.blockedMechanisms.find(
+      (b) => b.mechanism === normalizeHypothesis(result.hypothesis),
+    );
+    if (blocked && broker.profiles.length === 0) {
+      await this.ledger.appendEvent(
+        `${experimentId}:performance-policy:enforced`,
+        "policy.performance.enforced",
+        experimentId,
+        {
+          lessonId: blocked.lessonId,
+          mechanism: blocked.mechanism,
+          rejections: blocked.rejections,
+        },
+      );
+      await this.conclude(
+        (await this.ledger.getExperiment(experimentId))!,
+        "rejected",
+        `performance policy: mechanism "${blocked.mechanism}" was rejected on measurement ${blocked.rejections} time(s) (lesson ${blocked.lessonId}); repeating it without a profiling step is refused`,
+        [],
+        {
+          hypothesis: text.hypothesis,
+          whatChanged: text.whatChanged,
+          claim: text.claim,
+          seededFixture: result.seededFixture,
+          claimIssues: audit.issues,
+          profiled: false,
+        },
+        mission,
+      );
+      return "continue";
+    }
 
     const snapshot = this.artifacts.snapshot(this.paths.candidate, parent);
     await this.transaction(async (tx) => {
@@ -1514,6 +1648,7 @@ export class MissionController {
         seededFixture: result.seededFixture,
         aborted: result.aborted,
         claimIssues: audit.issues,
+        profiled: broker.profiles.length > 0,
       });
       await this.checkpoint(tx, "running", "optimize-search", experimentId, "snapshot_ready");
     });
@@ -1525,6 +1660,7 @@ export class MissionController {
       claim: text.claim,
       seededFixture: result.seededFixture,
       claimIssues: audit.issues,
+      profiled: broker.profiles.length > 0,
     });
     this.cyclesInSegment += 1;
     return "continue";
@@ -1538,7 +1674,9 @@ export class MissionController {
     const hash = experiment.candidateArtifactHash!;
     const mission = await this.mission();
     if (!this.artifacts.verify(hash)) throw new Error(`artifact ${hash} failed integrity check`);
-    await this.ledger.updateExperiment(experiment.experimentId, { status: "evaluating" });
+    await this.ledger.updateExperiment(experiment.experimentId, {
+      status: "evaluating",
+    });
     await this.ledger.appendEvent(
       `${experiment.experimentId}:evaluating:${experiment.attempt}`,
       "experiment.evaluating",
@@ -1640,7 +1778,19 @@ export class MissionController {
       decision = rerun.decision;
       if (rerun.candidate) accepted = rerun.candidate;
     }
-    if (decision.kind !== "accept")
+    if (decision.kind !== "accept") {
+      const lesson =
+        decision.kind === "reject"
+          ? await this.planPerformanceLesson(
+              experiment,
+              "performance_negative",
+              story,
+              reports,
+              accepted.metrics.p95LatencyMs ?? null,
+              mission.bestP95Ms,
+              decision.reason,
+            )
+          : undefined;
       return this.conclude(
         experiment,
         decision.kind === "reject" ? "rejected" : "inconclusive",
@@ -1648,10 +1798,25 @@ export class MissionController {
         reports,
         story,
         mission,
+        null,
+        lesson,
       );
+    }
     const p95 = accepted.metrics.p95LatencyMs ?? null;
+    const lesson = await this.planPerformanceLesson(
+      experiment,
+      "performance_positive",
+      story,
+      reports,
+      p95,
+      mission.bestP95Ms,
+      decision.reason,
+    );
     await this.transaction(async (tx) => {
-      await tx.updateMission(this.config.missionId, { bestArtifactHash: hash, bestP95Ms: p95 });
+      await tx.updateMission(this.config.missionId, {
+        bestArtifactHash: hash,
+        bestP95Ms: p95,
+      });
       await tx.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, {
         p95,
         previous: mission.bestP95Ms,
@@ -1665,6 +1830,8 @@ export class MissionController {
       reports,
       story,
       await this.mission(),
+      null,
+      lesson,
     );
     const target =
       (mission.baselineP95Ms ?? Number.POSITIVE_INFINITY) * (1 - this.config.targetP95Reduction);
@@ -1754,6 +1921,7 @@ export class MissionController {
     story: Story,
     mission: MissionRow,
     failureSignature: string | null = null,
+    performanceLesson: PlannedPerformanceLesson | undefined = undefined,
   ): Promise<Verdict> {
     const perf = reports.find((r) => r.suite === "performance");
     const episodeId = `ep-${experiment.experimentId}-v1`;
@@ -1818,6 +1986,18 @@ export class MissionController {
         createdAt: new Date().toISOString(),
       });
       await this.outbox.enqueue(payload, tx);
+      if (performanceLesson) {
+        await tx.upsertLesson(
+          encodePerformanceLesson(this.config.missionId, performanceLesson.lesson),
+        );
+        await tx.appendEvent(
+          `${experiment.experimentId}:lesson:${performanceLesson.lesson.lessonId}`,
+          "lesson.performance",
+          performanceLesson.lesson.lessonId,
+          performanceLesson.event,
+        );
+        this.crash("lesson-written");
+      }
       await tx.appendEvent(
         `${experiment.experimentId}:concluded`,
         "experiment.concluded",
@@ -1838,7 +2018,7 @@ export class MissionController {
   private nextActionAfter(verdict: Verdict, reason: string, mission: MissionRow): string {
     if (verdict === "accepted")
       return "profile the new best artifact and look for the next bottleneck";
-    if (reason.startsWith("stagnation"))
+    if (reason.startsWith("stagnation") || reason.startsWith("performance policy"))
       return "profile the current best artifact before editing, or try a mechanism not yet attempted";
     if (verdict === "inconclusive" && reason.includes("timing"))
       return "the timing difference was within measurement noise; look for a mechanism with a larger effect or profile to confirm the bottleneck";
@@ -1902,7 +2082,12 @@ export class MissionController {
         `reuse:${experimentId}:${suite}:${prior.reportId}`,
         "verification.reused",
         experimentId,
-        { suite, hash, reportId: prior.reportId, fromExperiment: prior.experimentId },
+        {
+          suite,
+          hash,
+          reportId: prior.reportId,
+          fromExperiment: prior.experimentId,
+        },
       );
       this.log(
         `  ${suite}: ${prior.status} (identical artifact ${hash.slice(0, 12)} already failed in ${prior.experimentId}; report ${prior.reportId} reused)`,
@@ -2008,12 +2193,85 @@ export class MissionController {
             materializedScenarioId: null,
             transitions: [
               ...(current?.transitions ?? []),
-              { state, at: new Date().toISOString(), evidenceId: assertion.evidenceId },
+              {
+                state,
+                at: new Date().toISOString(),
+                evidenceId: assertion.evidenceId,
+              },
             ],
           });
         }
       }
     }
+  }
+
+  private async performanceLessons(): Promise<PerformanceLesson[]> {
+    return (await this.ledger.listLessons(this.config.missionId))
+      .map(decodePerformanceLesson)
+      .filter((l): l is PerformanceLesson => l !== undefined);
+  }
+
+  /** Metric-driven policy derived from durable lessons, so the decision survives restarts and backends alike. */
+  async performancePolicy(): Promise<PerformancePolicy> {
+    return decidePerformancePolicy(
+      await this.performanceLessons(),
+      this.config.performanceRejectionLimit ?? DEFAULT_PERFORMANCE_REJECTION_LIMIT,
+    );
+  }
+
+  /**
+   * Plans a measured performance outcome as a durable lesson keyed by mechanism; the
+   * write itself happens inside `conclude()`'s transaction so a lesson is never
+   * durable for a verdict that is not. Every observation cites the performance
+   * report(s) and evidence IDs that produced the numbers; the lesson never stores
+   * the worker's claim as fact.
+   */
+  private async planPerformanceLesson(
+    experiment: ExperimentRow,
+    kind: PerformanceLessonKind,
+    story: Story,
+    reports: VerificationReport[],
+    candidateP95Ms: number | null,
+    comparedP95Ms: number | null,
+    reason: string,
+  ): Promise<PlannedPerformanceLesson | undefined> {
+    const mechanism = normalizeHypothesis(story.hypothesis);
+    if (!mechanism || !isMeasuredP95Comparison(candidateP95Ms, comparedP95Ms)) return undefined;
+    const lessonId = performanceLessonId(this.config.missionId, kind, mechanism);
+    const existing = (await this.performanceLessons()).find((l) => l.lessonId === lessonId);
+    const perfReports = reports.filter((r) => r.suite === "performance");
+    const lesson = recordPerformanceObservation(existing, {
+      missionId: this.config.missionId,
+      kind,
+      mechanism,
+      hypothesis: story.hypothesis,
+      featureIds: this.featuresFor(reports),
+      observation: {
+        experimentId: experiment.experimentId,
+        episodeId: `ep-${experiment.experimentId}-v1`,
+        candidateP95Ms,
+        comparedP95Ms,
+        deltaFraction: deltaFraction(candidateP95Ms, comparedP95Ms),
+        reportIds: perfReports.map((r) => r.reportId),
+        evidenceIds: perfReports.flatMap((r) => r.evidenceIds).slice(0, 8),
+        profiled: story.profiled ?? false,
+        reason,
+        at: new Date().toISOString(),
+      },
+    });
+    if (lesson === existing) return undefined;
+    return {
+      lesson,
+      event: {
+        kind,
+        mechanism,
+        observations: lesson.observations.length,
+        candidateP95Ms,
+        comparedP95Ms,
+        deltaFraction: deltaFraction(candidateP95Ms, comparedP95Ms),
+        evidenceIds: lesson.observations.at(-1)!.evidenceIds,
+      },
+    };
   }
 
   private async handleProposal(
@@ -2112,7 +2370,11 @@ export class MissionController {
       positiveEvidenceId: positiveEvidence,
     });
     if (!this.config.memory.materializeCorrections)
-      return { accepted: true, reason: `${validation.reason}; materialization disabled`, lessonId };
+      return {
+        accepted: true,
+        reason: `${validation.reason}; materialization disabled`,
+        lessonId,
+      };
 
     const scenario: Scenario = {
       ...shape.scenario,
@@ -2135,7 +2397,9 @@ export class MissionController {
         version,
         path,
       );
-      await tx.updateMission(this.config.missionId, { learnedSuiteVersion: version });
+      await tx.updateMission(this.config.missionId, {
+        learnedSuiteVersion: version,
+      });
       await transition(
         "materialized",
         positiveEvidence,
@@ -2175,6 +2439,7 @@ export class MissionController {
   private async retrievalQuery(
     experiments: ExperimentRow[],
     experimentId: string,
+    focusFeatureIds: string[] = [],
   ): Promise<string> {
     const task = (await this.ledger.listTasks(this.config.missionId)).find(
       (t) => t.taskId === "optimize-search",
@@ -2186,7 +2451,8 @@ export class MissionController {
     return composeRetrievalQuery({
       taskId: "optimize-search",
       hypothesis: last?.hypothesis ?? task?.hypothesis ?? null,
-      featureIds: episode?.featureIds ?? [],
+      // Features touched by accepted mechanisms come first so ranking leans toward episodes that share them.
+      featureIds: [...new Set([...focusFeatureIds, ...(episode?.featureIds ?? [])])],
       invariantIds: episode?.invariantIds ?? [],
       lastVerdict: last?.verdict ?? null,
       lastFailureSignature: last?.failureSignature ?? null,
@@ -2197,6 +2463,7 @@ export class MissionController {
     mission: MissionRow,
     experimentId: string,
     stagnation: StagnationState,
+    policy: PerformancePolicy,
   ): Promise<ContextPacket> {
     const experiments = (await this.ledger.listExperiments(this.config.missionId)).filter(
       (e) => e.taskId === "optimize-search",
@@ -2215,7 +2482,8 @@ export class MissionController {
     const recent = recentLines.join("\n\n");
     const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
     const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
-    const query = await this.retrievalQuery(experiments, experimentId);
+    const query = await this.retrievalQuery(experiments, experimentId, policy.focusFeatureIds);
+    const lessons = rankPerformanceLessons(await this.performanceLessons());
     const nextAction =
       (await this.ledger.listTasks(this.config.missionId)).find(
         (t) => t.taskId === "optimize-search",
@@ -2237,6 +2505,24 @@ export class MissionController {
           () => this.spendMemoryOperation(),
         )
       : { injected: [], filteredOut: [], degraded: false };
+    const crossTags = this.config.memory.crossMission?.readTags ?? [];
+    const cross =
+      this.config.memory.enabled && crossTags.length > 0
+        ? await retrieveCrossMissionEpisodes(
+            this.memory,
+            {
+              missionId: this.config.missionId,
+              readTags: crossTags,
+              contractVersion: this.config.contractVersion,
+            },
+            query,
+            10,
+            2,
+            () => this.spendMemoryOperation(),
+          )
+        : { injected: [], filteredOut: [], degraded: false };
+    const retrievedAll = [...retrieval.injected, ...cross.injected];
+    const filteredOut = [...retrieval.filteredOut, ...cross.filteredOut];
     const retrievalMs = performance.now() - retrievalStartedAt;
     const lastVerdict = experiments.at(-1)?.verdict ?? "no experiments yet";
     const pinned = [
@@ -2255,12 +2541,24 @@ export class MissionController {
         pinned,
         featureMap: `${features}\n\n${skill}`,
         recent: recent || "No experiments yet.",
-        retrieved: retrieval.injected.map((r) => ({ episodeId: r.episodeId, text: r.text })),
+        retrieved: retrievedAll.map((r) => ({
+          episodeId: r.episodeId,
+          text: r.text,
+        })),
+        ...(lessons.length > 0 ? { lessons: renderPerformanceLessons(lessons, policy) } : {}),
         next: `Last verdict: ${lastVerdict}\nNext action: ${nextAction}\n${
           stagnation.stagnated
             ? `Stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}). This cycle must call profile_candidate before editing or try a mechanism other than: ${stagnation.triedHypotheses.join(" | ")}. Repeating one of those without profiling is rejected without verification.\n`
             : ""
-        }Filtered from retrieval: ${retrieval.filteredOut.map((f) => `${f.episodeId ?? "?"} (${f.reason})`).join("; ") || "none"}`,
+        }${
+          policy.blockedMechanisms.length > 0
+            ? `Performance policy: the following mechanisms were rejected on measurement at least ${policy.limit} times and are blocked unless this cycle calls profile_candidate first: ${policy.blockedMechanisms.map((b) => `"${b.mechanism}" (${b.rejections}x, evidence ${b.evidenceIds.slice(0, 2).join(", ") || "-"})`).join(" | ")}. Choose a different mechanism or profile a different target.\n`
+            : ""
+        }${
+          policy.preferredMechanisms.length > 0
+            ? `Accepted mechanisms so far: ${policy.preferredMechanisms.map((p) => `"${p.mechanism}"`).join(" | ")}; retrieval is weighted toward features ${policy.focusFeatureIds.join(", ") || "-"}.\n`
+            : ""
+        }Filtered from retrieval: ${filteredOut.map((f) => `${f.episodeId ?? "?"} (${f.reason})`).join("; ") || "none"}`,
       },
       DEFAULT_PACKET_BUDGET,
     );
@@ -2271,8 +2569,29 @@ export class MissionController {
       sections: packet.sections,
       injected: packet.injectedEpisodeIds,
       dropped: packet.droppedEpisodeIds,
-      filteredOut: retrieval.filteredOut,
+      filteredOut,
       degraded: retrieval.degraded,
+      crossMission: {
+        readTags: crossTags,
+        degraded: cross.degraded,
+        fetched: cross.injected.map((r) => r.episodeId),
+        injected: cross.injected
+          .filter((r) => packet.injectedEpisodeIds.includes(r.episodeId))
+          .map((r) => ({ episodeId: r.episodeId, ...r.provenance! })),
+        dropped: cross.injected
+          .filter((r) => packet.droppedEpisodeIds.includes(r.episodeId))
+          .map((r) => r.episodeId),
+      },
+      lessons: lessons.map((l) => ({
+        lessonId: l.lessonId,
+        kind: l.kind,
+        observations: l.observations.length,
+      })),
+      policy: {
+        blocked: policy.blockedMechanisms.map((b) => b.lessonId),
+        preferred: policy.preferredMechanisms.map((p) => p.lessonId),
+        focusFeatureIds: policy.focusFeatureIds,
+      },
     });
     return packet;
   }

@@ -49,14 +49,21 @@ export interface MissionConfig {
   };
   /** Consecutive experiments without valid improvement before a new mechanism/profile is required. */
   stagnationLimit: number;
+  /** Measured-only rejections of one mechanism before it is blocked without a fresh profile. Defaults to 2. */
+  performanceRejectionLimit?: number;
   model: { provider: string; id: string };
   /** "scripted" runs the deterministic worker adapter; "pi" runs a live Pi session. */
   worker: "scripted" | "pi";
   memory: {
     enabled: boolean;
-    /** Mission-specific containerTag; cross-mission memory is disabled in the MVP. */
+    /** Mission-specific containerTag; the only tag this mission ever writes to. */
     containerTag: string;
     materializeCorrections: boolean;
+    /**
+     * Optional read-only tier shared across missions on one codebase, e.g. `horizon-codebase-<hash>`.
+     * Retrieval from it is post-filtered and every injected item carries its origin mission.
+     */
+    crossMission?: { readTags: string[] };
   };
   /**
    * Ledger backend. "mongodb" requires `MONGODB_URI` and never falls back to SQLite;
@@ -166,6 +173,27 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     fail("memory config incomplete");
   if (c.memory!.containerTag !== `horizon-${c.missionId}`)
     fail("memory.containerTag must be horizon-<missionId> (mission-scoped)");
+  const cross = c.memory!.crossMission;
+  if (cross !== undefined) {
+    if (
+      typeof cross !== "object" ||
+      cross === null ||
+      !Array.isArray(cross.readTags) ||
+      cross.readTags.some(
+        (t) => typeof t !== "string" || !/^horizon-codebase-[A-Za-z0-9._-]+$/.test(t),
+      )
+    )
+      fail("memory.crossMission.readTags must be horizon-codebase-<hash> tags");
+    if (cross.readTags.includes(c.memory!.containerTag))
+      fail("memory.crossMission.readTags must not include the mission's own write tag");
+  }
+  if (
+    c.performanceRejectionLimit !== undefined &&
+    (typeof c.performanceRejectionLimit !== "number" ||
+      !Number.isInteger(c.performanceRejectionLimit) ||
+      c.performanceRejectionLimit < 1)
+  )
+    fail("performanceRejectionLimit >= 1 (integer)");
   if (
     c.ledger !== undefined &&
     (typeof c.ledger !== "object" ||
@@ -185,6 +213,7 @@ export const OPERATING_FIELDS = [
   "budget",
   "segmentRotationCycles",
   "stagnationLimit",
+  "performanceRejectionLimit",
   "model",
   "worker",
   "memory",
