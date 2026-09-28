@@ -6,11 +6,7 @@ import { buildPacket, DEFAULT_PACKET_BUDGET } from "../src/context-packet.ts";
 import { SimulatedCrash } from "../src/controller.ts";
 import { LocalMemoryAdapter } from "../src/memory-adapter.ts";
 import { retrieveCrossMissionEpisodes } from "../src/memory-outbox.ts";
-import {
-  contractHash,
-  OPERATING_FIELDS,
-  validateMissionConfig,
-} from "../src/mission-contract.ts";
+import { contractHash, OPERATING_FIELDS, validateMissionConfig } from "../src/mission-contract.ts";
 import {
   decidePerformancePolicy,
   decodePerformanceLesson,
@@ -25,17 +21,9 @@ import {
 } from "../src/performance-lesson.ts";
 import { SqliteLedger } from "../src/sqlite-ledger.ts";
 import type { Worker, WorkerCycleInput } from "../src/worker.ts";
-import {
-  controllerFor,
-  EXAMPLE_CONFIG,
-  tempRunsRoot,
-  testConfig,
-} from "./helpers.ts";
+import { controllerFor, EXAMPLE_CONFIG, tempRunsRoot, testConfig } from "./helpers.ts";
 
-const SEED_ENGINE = readFileSync(
-  `${SEED_DIR}src/search/search-engine.ts`,
-  "utf8",
-);
+const SEED_ENGINE = readFileSync(`${SEED_DIR}src/search/search-engine.ts`, "utf8");
 /** Correct but measurably slower: a fixed busy-wait on every query so the verdict is a measured p95 rejection, never a correctness one. */
 const SLOW_ENGINE = SEED_ENGINE.replace(
   "const ids: string[] = [];",
@@ -73,8 +61,7 @@ class SlowWorker implements Worker {
       content: this.engine,
     });
     return {
-      hypothesis:
-        input.cycle % 2 === 0 ? "Batch the scan!" : "batch   the scan",
+      hypothesis: input.cycle % 2 === 0 ? "Batch the scan!" : "batch   the scan",
       whatChanged: "scan in fixed batches",
       claim: "should be faster",
       usage: { inputTokens: 10, outputTokens: 10, uncertain: false },
@@ -87,9 +74,7 @@ class SlowWorker implements Worker {
   async abort() {}
 }
 
-function payloadOf(
-  event: { payload: unknown } | undefined,
-): Record<string, unknown> {
+function payloadOf(event: { payload: unknown } | undefined): Record<string, unknown> {
   assert.ok(event, "event recorded");
   return event.payload as Record<string, unknown>;
 }
@@ -227,33 +212,21 @@ test("policy blocks a mechanism only at the rejection limit, ranks positives by 
     featureIds: ["search-mutation"],
     observation: observation("exp-e", 6, 10),
   });
-  const lessons: PerformanceLesson[] = [
-    rejectedOnce,
-    small,
-    rejectedTwice,
-    big,
-  ];
+  const lessons: PerformanceLesson[] = [rejectedOnce, small, rejectedTwice, big];
   assert.deepEqual(
     rankPerformanceLessons(lessons).map((l) => l.mechanism),
     ["big win", "small win", "twice", "once"],
   );
   const policy = decidePerformancePolicy(lessons, 2);
   assert.deepEqual(
-    policy.blockedMechanisms.map((b) => [
-      b.mechanism,
-      b.rejections,
-      b.evidenceIds,
-    ]),
+    policy.blockedMechanisms.map((b) => [b.mechanism, b.rejections, b.evidenceIds]),
     [["twice", 2, ["ev-exp-b", "ev-exp-c"]]],
   );
   assert.deepEqual(
     policy.preferredMechanisms.map((p) => p.mechanism),
     ["big win", "small win"],
   );
-  assert.deepEqual(policy.focusFeatureIds, [
-    "search-mutation",
-    "search-matching",
-  ]);
+  assert.deepEqual(policy.focusFeatureIds, ["search-mutation", "search-matching"]);
   assert.equal(decidePerformancePolicy(lessons, 3).blockedMechanisms.length, 0);
 
   const rendered = renderPerformanceLessons(lessons, policy);
@@ -269,10 +242,7 @@ test("policy blocks a mechanism only at the rejection limit, ranks positives by 
     rendered,
     /exp-b: p95 15ms vs 10ms \(\+50\.0%\); evidence ev-exp-b; reports rep-exp-b/,
   );
-  assert.doesNotMatch(
-    rendered,
-    /mechanism "once" \(rejected 1x on measurement; BLOCKED/,
-  );
+  assert.doesNotMatch(rendered, /mechanism "once" \(rejected 1x on measurement; BLOCKED/);
 
   const packet = buildPacket(
     {
@@ -290,15 +260,9 @@ test("policy blocks a mechanism only at the rejection limit, ranks positives by 
     },
     DEFAULT_PACKET_BUDGET,
   );
-  assert.match(
-    packet.text,
-    /## Performance lessons \(ranked, measured, with evidence\)/,
-  );
+  assert.match(packet.text, /## Performance lessons \(ranked, measured, with evidence\)/);
   assert.ok(packet.sections.lessons > 0);
-  assert.ok(
-    packet.sections.lessons + packet.sections.retrieved <=
-      DEFAULT_PACKET_BUDGET.retrieved,
-  );
+  assert.ok(packet.sections.lessons + packet.sections.retrieved <= DEFAULT_PACKET_BUDGET.retrieved);
   assert.deepEqual(
     packet.droppedEpisodeIds,
     ["ep-x"],
@@ -385,22 +349,13 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
     (typeof experiments)[0],
     (typeof experiments)[0],
   ];
-  const lessonId = performanceLessonId(
-    "perf-lessons",
-    "performance_negative",
-    "batch the scan",
-  );
+  const lessonId = performanceLessonId("perf-lessons", "performance_negative", "batch the scan");
 
   // Cycle 1: correctness passes, the measured p95 does not; that alone creates a lesson with evidence.
   assert.equal(first.status, "rejected");
   assert.match(first.verdict ?? "", /^p95 .* not below/);
-  const afterFirst = await ledger.findEvent(
-    `${first.experimentId}:lesson:${lessonId}`,
-  );
-  assert.ok(
-    afterFirst,
-    "lesson.performance event recorded for the first measured rejection",
-  );
+  const afterFirst = await ledger.findEvent(`${first.experimentId}:lesson:${lessonId}`);
+  assert.ok(afterFirst, "lesson.performance event recorded for the first measured rejection");
   assert.equal(payloadOf(afterFirst).kind, "performance_negative");
   assert.equal(payloadOf(afterFirst).observations, 1);
   assert.ok(
@@ -424,10 +379,7 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
     dropped: string[];
   };
   // The oversized verified hit passes post-filtering but not the packet budget: fetched, not injected.
-  assert.deepEqual(
-    new Set(crossAudit.fetched),
-    new Set(["ep-other-1-v1", "ep-other-3-v1"]),
-  );
+  assert.deepEqual(new Set(crossAudit.fetched), new Set(["ep-other-1-v1", "ep-other-3-v1"]));
   assert.deepEqual(crossAudit.injected, [
     {
       episodeId: "ep-other-1-v1",
@@ -436,9 +388,7 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
     },
   ]);
   assert.deepEqual(crossAudit.dropped, ["ep-other-3-v1"]);
-  assert.ok(
-    (payloadOf(firstPacket).dropped as string[]).includes("ep-other-3-v1"),
-  );
+  assert.ok((payloadOf(firstPacket).dropped as string[]).includes("ep-other-3-v1"));
   assert.doesNotMatch(worker.packets[0]!, /documents trace/);
   assert.ok(
     (
@@ -447,9 +397,7 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
         reason: string;
       }[]
     ).some(
-      (f) =>
-        f.episodeId === "ep-other-2-v1" &&
-        f.reason === "cross-mission: not verifier-backed",
+      (f) => f.episodeId === "ep-other-2-v1" && f.reason === "cross-mission: not verifier-backed",
     ),
   );
   assert.equal(
@@ -457,17 +405,12 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
     0,
     "the mission never writes to the codebase tier",
   );
-  assert.ok(
-    (await memory.search("horizon-perf-lessons", "batch scan", 10)).length > 0,
-  );
+  assert.ok((await memory.search("horizon-perf-lessons", "batch scan", 10)).length > 0);
 
   // Cycle 2: same mechanism, reworded; the lesson hardens to reproduced and the packet showed the first observation.
   assert.equal(second.status, "rejected");
   assert.match(second.verdict ?? "", /^p95 .* not below/);
-  assert.match(
-    worker.packets[1]!,
-    /## Performance lessons \(ranked, measured, with evidence\)/,
-  );
+  assert.match(worker.packets[1]!, /## Performance lessons \(ranked, measured, with evidence\)/);
   assert.match(
     worker.packets[1]!,
     new RegExp(
@@ -475,18 +418,12 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
     ),
   );
   assert.doesNotMatch(worker.packets[1]!, /Performance policy:/);
-  const lesson = (await ledger.listLessons("perf-lessons")).find(
-    (l) => l.lessonId === lessonId,
-  );
+  const lesson = (await ledger.listLessons("perf-lessons")).find((l) => l.lessonId === lessonId);
   assert.ok(lesson);
   assert.equal(lesson.state, "reproduced");
   assert.equal(lesson.invariantId, "PERF-P95");
   const decoded = decodePerformanceLesson(lesson)!;
-  assert.equal(
-    decoded.observations.length,
-    3,
-    "cycles 1, 2 and 4 were measured",
-  );
+  assert.equal(decoded.observations.length, 3, "cycles 1, 2 and 4 were measured");
   for (const o of decoded.observations) {
     assert.ok(
       o.candidateP95Ms! > o.comparedP95Ms!,
@@ -501,21 +438,18 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
   const verifications = await ledger.listVerifications("perf-lessons");
   for (const o of decoded.observations)
     assert.ok(
-      verifications.some(
-        (v) => o.reportIds.includes(v.reportId) && v.suite === "performance",
-      ),
+      verifications.some((v) => o.reportIds.includes(v.reportId) && v.suite === "performance"),
       "every cited report is a committed performance verification",
     );
 
   // Cycle 3: at the limit the packet carries the policy and the ranked lesson, and the unprofiled repeat is refused without verification.
-  const decided = await ledger.findEvent(
-    `${third.experimentId}:performance-policy`,
-  );
+  const decided = await ledger.findEvent(`${third.experimentId}:performance-policy`);
   assert.ok(decided, "policy.performance recorded before the third cycle");
   assert.deepEqual(
-    (
-      payloadOf(decided).blocked as { lessonId: string; rejections: number }[]
-    ).map((b) => [b.lessonId, b.rejections]),
+    (payloadOf(decided).blocked as { lessonId: string; rejections: number }[]).map((b) => [
+      b.lessonId,
+      b.rejections,
+    ]),
     [[lessonId, 2]],
   );
   assert.match(
@@ -523,33 +457,22 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
     /Performance policy: the following mechanisms were rejected on measurement at least 2 times/,
   );
   assert.match(worker.packets[2]!, /"batch the scan" \(2x, evidence /);
-  assert.match(
-    worker.packets[2]!,
-    /rejected 2x on measurement; BLOCKED \(limit 2\)/,
-  );
+  assert.match(worker.packets[2]!, /rejected 2x on measurement; BLOCKED \(limit 2\)/);
   assert.equal(third.status, "rejected");
   assert.match(
     third.verdict ?? "",
     /^performance policy: mechanism "batch the scan" was rejected on measurement 2 time\(s\)/,
   );
   assert.equal(third.candidateArtifactHash, null);
-  assert.equal(
-    verifications.filter((v) => v.experimentId === third.experimentId).length,
-    0,
-  );
-  const enforced = await ledger.findEvent(
-    `${third.experimentId}:performance-policy:enforced`,
-  );
+  assert.equal(verifications.filter((v) => v.experimentId === third.experimentId).length, 0);
+  const enforced = await ledger.findEvent(`${third.experimentId}:performance-policy:enforced`);
   assert.deepEqual(enforced?.payload, {
     lessonId,
     mechanism: "batch the scan",
     rejections: 2,
   });
   const episode = await ledger.getEpisode(`ep-${third.experimentId}-v1`);
-  assert.match(
-    episode!.summary,
-    /profile the current best artifact before editing/,
-  );
+  assert.match(episode!.summary, /profile the current best artifact before editing/);
   assert.equal(
     await ledger.findEvent(`${third.experimentId}:stagnation`),
     undefined,
@@ -557,20 +480,14 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
   );
 
   // Cycle 4: still blocked, but the worker profiled first, so the mechanism is measured again and the lesson grows.
-  assert.ok(
-    await ledger.findEvent(`${fourth.experimentId}:performance-policy`),
-  );
+  assert.ok(await ledger.findEvent(`${fourth.experimentId}:performance-policy`));
   assert.equal(
-    await ledger.findEvent(
-      `${fourth.experimentId}:performance-policy:enforced`,
-    ),
+    await ledger.findEvent(`${fourth.experimentId}:performance-policy:enforced`),
     undefined,
   );
   assert.match(fourth.verdict ?? "", /^p95 .* not below/);
   assert.equal(
-    payloadOf(
-      await ledger.findEvent(`${fourth.experimentId}:lesson:${lessonId}`),
-    ).observations,
+    payloadOf(await ledger.findEvent(`${fourth.experimentId}:lesson:${lessonId}`)).observations,
     3,
   );
   await controller.close();
@@ -578,11 +495,7 @@ test("a performance-only rejection becomes a durable lesson, and repeating the m
 
 test("a performance suite failed on the memory limit is not a PERF-P95 lesson and never blocks the mechanism", async () => {
   assert.equal(isMeasuredP95Comparison(null, 10), false, "no candidate p95");
-  assert.equal(
-    isMeasuredP95Comparison(12, null),
-    false,
-    "no best p95 to compare against",
-  );
+  assert.equal(isMeasuredP95Comparison(12, null), false, "no best p95 to compare against");
   assert.equal(isMeasuredP95Comparison(12, 0), false);
   assert.equal(isMeasuredP95Comparison(12, 10), true);
 
@@ -611,22 +524,15 @@ test("a performance suite failed on the memory limit is not a PERF-P95 lesson an
   }
   const verifications = await ledger.listVerifications("perf-memory");
   assert.equal(
-    verifications.filter(
-      (v) => v.suite === "performance" && v.status === "failed",
-    ).length,
+    verifications.filter((v) => v.suite === "performance" && v.status === "failed").length,
     3,
     "every cycle was measured; the resource failure alone was the verdict",
   );
   assert.deepEqual(
-    (await ledger.listLessons("perf-memory")).filter(
-      (l) => l.invariantId === "PERF-P95",
-    ),
+    (await ledger.listLessons("perf-memory")).filter((l) => l.invariantId === "PERF-P95"),
     [],
   );
-  assert.equal(
-    (await controller.performancePolicy()).blockedMechanisms.length,
-    0,
-  );
+  assert.equal((await controller.performancePolicy()).blockedMechanisms.length, 0);
   for (const e of experiments)
     assert.equal(
       await ledger.findEvent(`${e.experimentId}:performance-policy:enforced`),
@@ -643,11 +549,7 @@ test("a performance suite failed on the memory limit is not a PERF-P95 lesson an
 test("cross-mission retrieval is read-only, post-filtered and degrades to nothing when the tier is unavailable", async () => {
   const memory = new LocalMemoryAdapter();
   const tag = "horizon-codebase-abc";
-  const meta = (
-    missionId: string,
-    episodeId: string,
-    extra: Record<string, unknown> = {},
-  ) => ({
+  const meta = (missionId: string, episodeId: string, extra: Record<string, unknown> = {}) => ({
     missionId,
     episodeId,
     contractVersion: 1,
@@ -655,18 +557,8 @@ test("cross-mission retrieval is read-only, post-filtered and degrades to nothin
     seededFixture: "",
     ...extra,
   });
-  memory.injectForeign(
-    tag,
-    "ep-a",
-    "prenormalize documents accepted",
-    meta("m-a", "ep-a"),
-  );
-  memory.injectForeign(
-    tag,
-    "ep-own",
-    "prenormalize documents own",
-    meta("me", "ep-own"),
-  );
+  memory.injectForeign(tag, "ep-a", "prenormalize documents accepted", meta("m-a", "ep-a"));
+  memory.injectForeign(tag, "ep-own", "prenormalize documents own", meta("me", "ep-own"));
   memory.injectForeign(
     tag,
     "ep-v2",
@@ -683,12 +575,7 @@ test("cross-mission retrieval is read-only, post-filtered and degrades to nothin
     episodeId: "ep-anon",
   });
   const { seededFixture: _dropped, ...noSeedStatus } = meta("m-d", "ep-noseed");
-  memory.injectForeign(
-    tag,
-    "ep-noseed",
-    "prenormalize documents legacy",
-    noSeedStatus,
-  );
+  memory.injectForeign(tag, "ep-noseed", "prenormalize documents legacy", noSeedStatus);
   memory.injectForeign(
     tag,
     "ep-nullseed",
@@ -743,47 +630,31 @@ test("mission contract: cross-mission tags are codebase-scoped and never the mis
   assert.deepEqual(withTags(["horizon-codebase-abc123"]).memory.crossMission, {
     readTags: ["horizon-codebase-abc123"],
   });
-  assert.throws(
-    () => withTags(["horizon-other-mission"]),
-    /horizon-codebase-<hash>/,
-  );
+  assert.throws(() => withTags(["horizon-other-mission"]), /horizon-codebase-<hash>/);
   assert.throws(
     () => withTags([base.memory.containerTag]),
     /horizon-codebase-<hash>|own write tag/,
   );
-  assert.throws(
-    () => withTags("horizon-codebase-abc"),
-    /horizon-codebase-<hash>/,
-  );
+  assert.throws(() => withTags("horizon-codebase-abc"), /horizon-codebase-<hash>/);
   assert.throws(
     () => validateMissionConfig({ ...base, performanceRejectionLimit: 0 }),
     /performanceRejectionLimit >= 1/,
   );
   assert.equal(
-    validateMissionConfig({ ...base, performanceRejectionLimit: 3 })
-      .performanceRejectionLimit,
+    validateMissionConfig({ ...base, performanceRejectionLimit: 3 }).performanceRejectionLimit,
     3,
   );
 });
 
 test("performanceRejectionLimit is an amendable operating parameter: outside the contract hash, and the amended value drives the policy", async () => {
-  assert.ok(
-    (OPERATING_FIELDS as readonly string[]).includes(
-      "performanceRejectionLimit",
-    ),
-  );
+  assert.ok((OPERATING_FIELDS as readonly string[]).includes("performanceRejectionLimit"));
   const id = "perf-limit-amend";
   const strict = testConfig(id, { performanceRejectionLimit: 2 });
   const lenient = testConfig(id, { performanceRejectionLimit: 5 });
   assert.equal(contractHash(strict), contractHash(lenient));
 
   const runs = tempRunsRoot();
-  const controller = controllerFor(
-    id,
-    runs,
-    {},
-    { performanceRejectionLimit: 2 },
-  );
+  const controller = controllerFor(id, runs, {}, { performanceRejectionLimit: 2 });
   await controller.initialize();
   let lesson: PerformanceLesson | undefined;
   for (const exp of ["exp-1", "exp-2"])
@@ -796,17 +667,12 @@ test("performanceRejectionLimit is an amendable operating parameter: outside the
       observation: observation(exp, 12, 10),
     });
   await controller.ledger.upsertLesson(encodePerformanceLesson(id, lesson!));
-  assert.equal(
-    (await controller.performancePolicy()).blockedMechanisms.length,
-    1,
-  );
+  assert.equal((await controller.performancePolicy()).blockedMechanisms.length, 1);
   await controller.close();
 
   const amender = controllerFor(id, runs, {}, { performanceRejectionLimit: 2 });
   const plan = await amender.amend(lenient);
-  assert.deepEqual(plan.changes, [
-    { path: "performanceRejectionLimit", from: 2, to: 5 },
-  ]);
+  assert.deepEqual(plan.changes, [{ path: "performanceRejectionLimit", from: 2, to: 5 }]);
   assert.equal(amender.config.performanceRejectionLimit, 5);
   assert.equal(
     (await amender.performancePolicy()).blockedMechanisms.length,
@@ -835,26 +701,18 @@ test("crash after the lesson is written but before conclude() commits: neither v
   );
   await first.initialize();
   await assert.rejects(first.run(), SimulatedCrash);
-  const lessonId = performanceLessonId(
-    "perf-atomic",
-    "performance_negative",
-    "batch the scan",
-  );
+  const lessonId = performanceLessonId("perf-atomic", "performance_negative", "batch the scan");
   const interrupted = (await first.ledger.listExperiments("perf-atomic")).find(
     (e) => e.taskId === "optimize-search",
   )!;
   assert.notEqual(interrupted.status, "rejected", "verdict was not committed");
   assert.equal(
-    (await first.ledger.listLessons("perf-atomic")).filter(
-      (l) => l.lessonId === lessonId,
-    ).length,
+    (await first.ledger.listLessons("perf-atomic")).filter((l) => l.lessonId === lessonId).length,
     0,
     "lesson row rolled back with the verdict",
   );
   assert.equal(
-    await first.ledger.findEvent(
-      `${interrupted.experimentId}:lesson:${lessonId}`,
-    ),
+    await first.ledger.findEvent(`${interrupted.experimentId}:lesson:${lessonId}`),
     undefined,
     "lesson.performance event rolled back with the verdict",
   );
@@ -867,30 +725,17 @@ test("crash after the lesson is written but before conclude() commits: neither v
     { stagnationLimit: 10 },
   );
   await second.run();
-  const experiments = (
-    await second.ledger.listExperiments("perf-atomic")
-  ).filter((e) => e.taskId === "optimize-search");
+  const experiments = (await second.ledger.listExperiments("perf-atomic")).filter(
+    (e) => e.taskId === "optimize-search",
+  );
   const concluded = experiments.filter((e) => e.status === "rejected");
   assert.equal(concluded.length, 1);
   const lesson = decodePerformanceLesson(
-    (await second.ledger.listLessons("perf-atomic")).find(
-      (l) => l.lessonId === lessonId,
-    )!,
+    (await second.ledger.listLessons("perf-atomic")).find((l) => l.lessonId === lessonId)!,
   )!;
-  assert.equal(
-    lesson.observations.length,
-    1,
-    "one observation for the one committed verdict",
-  );
-  assert.equal(
-    lesson.observations[0]!.experimentId,
-    concluded[0]!.experimentId,
-  );
-  assert.ok(
-    await second.ledger.findEvent(
-      `${concluded[0]!.experimentId}:lesson:${lessonId}`,
-    ),
-  );
+  assert.equal(lesson.observations.length, 1, "one observation for the one committed verdict");
+  assert.equal(lesson.observations[0]!.experimentId, concluded[0]!.experimentId);
+  assert.ok(await second.ledger.findEvent(`${concluded[0]!.experimentId}:lesson:${lessonId}`));
   await second.close();
 });
 

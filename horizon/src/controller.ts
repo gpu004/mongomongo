@@ -18,17 +18,10 @@ import {
   type HostRuntime,
   runSuite,
 } from "../verification/runner.ts";
-import {
-  loadScenarios,
-  type Scenario,
-} from "../verification/scenarios/index.ts";
+import { loadScenarios, type Scenario } from "../verification/scenarios/index.ts";
 import { ArtifactStore } from "./artifact-store.ts";
 import { auditClaim } from "./claim-audit.ts";
-import {
-  buildPacket,
-  type ContextPacket,
-  DEFAULT_PACKET_BUDGET,
-} from "./context-packet.ts";
+import { buildPacket, type ContextPacket, DEFAULT_PACKET_BUDGET } from "./context-packet.ts";
 import {
   type ExperimentRow,
   type LeaseRow,
@@ -85,20 +78,12 @@ import {
   type MissionPaths,
   writeJsonAtomic,
 } from "./mission-paths.ts";
-import {
-  type ContainerRuntime,
-  recover,
-  type RecoveryOutcome,
-} from "./recovery.ts";
+import { type ContainerRuntime, recover, type RecoveryOutcome } from "./recovery.ts";
 import { retainedArtifactHashes } from "./retention.ts";
 import { assertSandboxAvailable, cleanupOrphanContainers } from "./sandbox.ts";
 import { ScriptedWorker } from "./scripted-worker.ts";
 import { archiveSession, removeArchivedSession } from "./session-archive.ts";
-import {
-  type BrokerHooks,
-  type ExecSandbox,
-  ToolBroker,
-} from "./tool-broker.ts";
+import { type BrokerHooks, type ExecSandbox, ToolBroker } from "./tool-broker.ts";
 import {
   firstComparison,
   freezeAcceptanceMargin,
@@ -107,11 +92,7 @@ import {
   type TimingDecision,
   type TimingPolicy,
 } from "./timing-policy.ts";
-import {
-  type Worker,
-  type WorkerCycleResult,
-  WorkerUnavailableError,
-} from "./worker.ts";
+import { type Worker, type WorkerCycleResult, WorkerUnavailableError } from "./worker.ts";
 
 export const RESOURCES_DIR = new URL("../resources/", import.meta.url).pathname;
 
@@ -227,11 +208,7 @@ export interface StagnationState {
 }
 
 /** Deterministic behavior suites whose failed report for an artifact can be reused across experiments. */
-const REUSABLE_FAILURE_SUITES = new Set<Suite>([
-  "smoke",
-  "correctness",
-  "structural",
-]);
+const REUSABLE_FAILURE_SUITES = new Set<Suite>(["smoke", "correctness", "structural"]);
 
 const TASKS = [
   {
@@ -239,8 +216,7 @@ const TASKS = [
     ordinal: 1,
     dependsOn: [] as string[],
     hypothesis: "measure the seed",
-    completionCriteria:
-      "seed passes correctness and has a valid performance report",
+    completionCriteria: "seed passes correctness and has a valid performance report",
     nextAction: "run fixed suites on the seed artifact",
   },
   {
@@ -299,27 +275,21 @@ export class MissionController {
   /** Wall time since this mark has not yet been added to mission.spentWallMs. */
   private wallMark = Date.now();
 
-  constructor(
-    config: MissionConfig,
-    paths: MissionPaths,
-    options: ControllerOptions = {},
-  ) {
+  constructor(config: MissionConfig, paths: MissionPaths, options: ControllerOptions = {}) {
     this.currentConfig = config;
     this.paths = paths;
     ensureMissionDirs(paths);
     this.openLedger = options.ledger ?? (() => openLedger(config, paths));
     this.leaseTtlMs = options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
     this.leaseOwner =
-      options.leaseOwner ??
-      `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
+      options.leaseOwner ?? `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
     this.artifacts = new ArtifactStore(paths.artifacts);
     this.evidence = new FileEvidenceStore(paths.evidence);
     this.log = options.log ?? (() => {});
     this.crashAt = options.crashAt;
     this.maxCycles = options.maxCycles ?? Number.POSITIVE_INFINITY;
     this.containerRuntime = options.containerRuntime;
-    this.sleep =
-      options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.evaluatorHash = computeEvaluatorHash();
     this.environment = environmentFingerprint(
       config.isolation,
@@ -344,9 +314,7 @@ export class MissionController {
   /** The mission ledger; opened on first use by `initialize()`, `run()` or `mission()`. */
   get ledger(): AsyncLedger {
     if (!this.ledgerHandle)
-      throw new Error(
-        `mission ${this.config.missionId} ledger not open; call open() first`,
-      );
+      throw new Error(`mission ${this.config.missionId} ledger not open; call open() first`);
     return this.ledgerHandle;
   }
 
@@ -390,9 +358,7 @@ export class MissionController {
   }
 
   /** Runs `fn` in one ledger transaction after pending tool-call events are durable. */
-  private async transaction<T>(
-    fn: (tx: AsyncLedger) => Promise<T>,
-  ): Promise<T> {
+  private async transaction<T>(fn: (tx: AsyncLedger) => Promise<T>): Promise<T> {
     await this.flushToolEvents();
     return this.ledger.transaction(fn);
   }
@@ -466,9 +432,7 @@ export class MissionController {
   /** The persisted manifest, or undefined before `initialize()`. */
   readManifest(): MissionManifest | undefined {
     if (!existsSync(this.paths.manifest)) return undefined;
-    return JSON.parse(
-      readFileSync(this.paths.manifest, "utf8"),
-    ) as MissionManifest;
+    return JSON.parse(readFileSync(this.paths.manifest, "utf8")) as MissionManifest;
   }
 
   private writeManifest(manifest: MissionManifest): void {
@@ -476,10 +440,7 @@ export class MissionController {
   }
 
   /** Rewrites the manifest so it mirrors the ledger's identities and the current config. */
-  private syncManifest(
-    mission: MissionRow,
-    pendingAmendment?: PendingAmendment,
-  ): void {
+  private syncManifest(mission: MissionRow, pendingAmendment?: PendingAmendment): void {
     const previous = this.readManifest();
     this.writeManifest({
       ...(pendingAmendment ? { pendingAmendment } : {}),
@@ -491,8 +452,7 @@ export class MissionController {
         mission.environmentHash === this.environmentHash
           ? this.environment
           : (previous?.environment ?? this.environment),
-      seedArtifactHash:
-        mission.seedArtifactHash ?? previous?.seedArtifactHash ?? "",
+      seedArtifactHash: mission.seedArtifactHash ?? previous?.seedArtifactHash ?? "",
       ledgerBackend: this.ledger.backend,
       config: { ...this.config, ledger: { backend: this.ledger.backend } },
     });
@@ -518,13 +478,8 @@ export class MissionController {
           ...config,
           ledger: { backend: this.ledger.backend },
         };
-        this.log(
-          `recovery: amendment ${amendmentId} committed; manifest reconciled from ledger`,
-        );
-      } else
-        this.log(
-          `recovery: amendment ${amendmentId} never committed; discarded`,
-        );
+        this.log(`recovery: amendment ${amendmentId} committed; manifest reconciled from ledger`);
+      } else this.log(`recovery: amendment ${amendmentId} never committed; discarded`);
       dirty = true;
     }
     if (
@@ -583,32 +538,27 @@ export class MissionController {
         return amendment;
       }
       const amendedAt = new Date().toISOString();
-      const amendmentId = sha256(
-        canonicalJson({ changes: amendment.changes, amendedAt }),
-      ).slice(0, 16);
+      const amendmentId = sha256(canonicalJson({ changes: amendment.changes, amendedAt })).slice(
+        0,
+        16,
+      );
       const eventKey = `mission:${this.config.missionId}:amended:${amendmentId}`;
       const amended: MissionConfig = {
         ...next,
         ledger: { backend: this.ledger.backend },
       };
       const reopened =
-        mission.status === "budget_exhausted" &&
-        amendment.budgetExtensions.length > 0;
+        mission.status === "budget_exhausted" && amendment.budgetExtensions.length > 0;
       this.syncManifest(mission, { amendmentId, eventKey, config: amended });
       await this.transaction(async (tx) => {
-        await tx.appendEvent(
-          eventKey,
-          "mission.amended",
-          this.config.missionId,
-          {
-            amendmentId,
-            contractHash: this.contractHash,
-            changes: amendment.changes,
-            operating: operatingOf(amended),
-            previousStatus: mission.status,
-            status: reopened ? "ready" : mission.status,
-          },
-        );
+        await tx.appendEvent(eventKey, "mission.amended", this.config.missionId, {
+          amendmentId,
+          contractHash: this.contractHash,
+          changes: amendment.changes,
+          operating: operatingOf(amended),
+          previousStatus: mission.status,
+          status: reopened ? "ready" : mission.status,
+        });
         for (const extension of amendment.budgetExtensions)
           await tx.appendEvent(
             `mission:${this.config.missionId}:budget-extended:${amendmentId}:${extension.path}`,
@@ -629,8 +579,7 @@ export class MissionController {
         this.log(
           `amend: ${change.path} ${JSON.stringify(change.from)} -> ${JSON.stringify(change.to)}`,
         );
-      if (reopened)
-        this.log("amend: budget extended; mission is ready to resume");
+      if (reopened) this.log("amend: budget extended; mission is ready to resume");
       return amendment;
     } finally {
       await this.releaseLease();
@@ -704,26 +653,20 @@ export class MissionController {
         bestRetained: before.bestArtifactHash === previousBest,
       };
       if (!drifted && !resuming) {
-        this.log(
-          "rebaseline: evaluator and environment match the frozen mission; nothing to do",
-        );
+        this.log("rebaseline: evaluator and environment match the frozen mission; nothing to do");
         return outcome;
       }
       if (
         resuming &&
         before.baselineP95Ms !== null &&
-        (!remeasureId ||
-          (await this.ledger.findEvent(`${remeasureId}:remeasured`)))
+        (!remeasureId || (await this.ledger.findEvent(`${remeasureId}:remeasured`)))
       ) {
         this.log(`rebaseline: ${rebaselineId} already complete; nothing to do`);
         return outcome;
       }
       if (resuming)
-        this.log(
-          `rebaseline: ${rebaselineId} was interrupted; re-measuring from the ledger`,
-        );
-      if (this.config.isolation === "container")
-        assertSandboxAvailable(this.config.containerImage);
+        this.log(`rebaseline: ${rebaselineId} was interrupted; re-measuring from the ledger`);
+      if (this.config.isolation === "container") assertSandboxAvailable(this.config.containerImage);
       await this.transaction(async (tx) => {
         await tx.updateMission(this.config.missionId, {
           evaluatorHash: this.evaluatorHash,
@@ -749,19 +692,8 @@ export class MissionController {
           await tx.updateMission(this.config.missionId, {
             bestArtifactHash: seed,
           });
-        await tx.appendEvent(
-          rebaselineKey,
-          "evaluator.rebaselined",
-          this.config.missionId,
-          origin,
-        );
-        await this.checkpoint(
-          tx,
-          "ready",
-          "baseline",
-          null,
-          `rebaselined:${rebaselineId}`,
-        );
+        await tx.appendEvent(rebaselineKey, "evaluator.rebaselined", this.config.missionId, origin);
+        await this.checkpoint(tx, "ready", "baseline", null, `rebaselined:${rebaselineId}`);
       });
       this.syncManifest(await this.mission());
       this.log(
@@ -782,8 +714,7 @@ export class MissionController {
             taskId: "optimize-search",
             parentArtifactHash: seed,
             strategy: "rebaseline",
-            hypothesis:
-              "previous best still beats the seed under the new evaluator",
+            hypothesis: "previous best still beats the seed under the new evaluator",
             status: "snapshot_ready",
             attempt: 1,
             segmentOrdinal: this.segmentOrdinal,
@@ -859,14 +790,9 @@ export class MissionController {
       register: async (name) => {
         await this.transaction(async (tx) => {
           await tx.registerContainer(name, missionId, experimentId);
-          await tx.appendEvent(
-            `container:${name}:launched`,
-            "container.launched",
-            experimentId,
-            {
-              containerName: name,
-            },
-          );
+          await tx.appendEvent(`container:${name}:launched`, "container.launched", experimentId, {
+            containerName: name,
+          });
         });
       },
       release: (name) => this.ledger.releaseContainer(name),
@@ -958,14 +884,10 @@ export class MissionController {
       if (this.config.isolation === "container") {
         // Fail before any work is scheduled; the sandbox is never silently replaced by the host.
         const sandbox = assertSandboxAvailable(this.config.containerImage);
-        this.log(
-          `sandbox: docker ${sandbox.serverVersion}, image ${sandbox.imageId.slice(0, 19)}`,
-        );
+        this.log(`sandbox: docker ${sandbox.serverVersion}, image ${sandbox.imageId.slice(0, 19)}`);
         const orphans = cleanupOrphanContainers(this.config.missionId);
         if (orphans.length > 0)
-          this.log(
-            `recovery: removed ${orphans.length} orphaned container(s) from a previous run`,
-          );
+          this.log(`recovery: removed ${orphans.length} orphaned container(s) from a previous run`);
       }
       const recoveryStartedAt = performance.now();
       const recovery = await recover(
@@ -987,17 +909,13 @@ export class MissionController {
         this.config.missionId,
         { durationMs: performance.now() - recoveryStartedAt },
       );
-      for (const action of recovery.actions)
-        this.log(`recovery: ${action.kind} ${action.detail}`);
+      for (const action of recovery.actions) this.log(`recovery: ${action.kind} ${action.detail}`);
       if (recovery.actions.some((a) => a.kind === "environment_drift_accepted"))
         this.syncManifest(await this.mission());
       this.segmentOrdinal = recovery.checkpoint?.segmentOrdinal ?? 0;
-      this.cyclesInSegment = (
-        await this.ledger.listExperiments(this.config.missionId)
-      ).filter(
+      this.cyclesInSegment = (await this.ledger.listExperiments(this.config.missionId)).filter(
         (experiment) =>
-          experiment.segmentOrdinal === this.segmentOrdinal &&
-          experiment.finishedAt !== null,
+          experiment.segmentOrdinal === this.segmentOrdinal && experiment.finishedAt !== null,
       ).length;
       await this.applyRetention();
       await this.honourWakeTime();
@@ -1076,14 +994,9 @@ export class MissionController {
 
   private async nextTask() {
     const tasks = await this.ledger.listTasks(this.config.missionId);
-    const done = new Set(
-      tasks.filter((t) => t.status === "done").map((t) => t.taskId),
-    );
+    const done = new Set(tasks.filter((t) => t.status === "done").map((t) => t.taskId));
     return tasks.find(
-      (t) =>
-        t.status !== "done" &&
-        t.status !== "skipped" &&
-        t.dependsOn.every((d) => done.has(d)),
+      (t) => t.status !== "done" && t.status !== "skipped" && t.dependsOn.every((d) => done.has(d)),
     );
   }
 
@@ -1093,9 +1006,7 @@ export class MissionController {
     if (mission.status !== "waiting" || !mission.nextWakeAt) return;
     const delay = Date.parse(mission.nextWakeAt) - Date.now();
     if (delay <= 0) return;
-    this.log(
-      `mission waiting until ${mission.nextWakeAt} (${Math.ceil(delay / 1000)}s)`,
-    );
+    this.log(`mission waiting until ${mission.nextWakeAt} (${Math.ceil(delay / 1000)}s)`);
     await this.sleep(delay);
     this.wallMark = Date.now();
   }
@@ -1128,9 +1039,7 @@ export class MissionController {
       await this.finish("blocked", error.message);
       return "blocked";
     }
-    const nextWakeAt = new Date(
-      Date.now() + (error.retryAfterMs ?? 0),
-    ).toISOString();
+    const nextWakeAt = new Date(Date.now() + (error.retryAfterMs ?? 0)).toISOString();
     await this.transaction(async (tx) => {
       await tx.updateMission(this.config.missionId, {
         status: "waiting",
@@ -1143,17 +1052,9 @@ export class MissionController {
         this.config.missionId,
         { reason: error.message, nextWakeAt },
       );
-      await this.checkpoint(
-        tx,
-        "waiting",
-        "optimize-search",
-        null,
-        "waiting:provider",
-      );
+      await this.checkpoint(tx, "waiting", "optimize-search", null, "waiting:provider");
     });
-    this.log(
-      `mission waiting: ${error.message}; resume at or after ${nextWakeAt}`,
-    );
+    this.log(`mission waiting: ${error.message}; resume at or after ${nextWakeAt}`);
     return "waiting";
   }
 
@@ -1228,9 +1129,7 @@ export class MissionController {
     const perf = reports.find((r) => r.suite === "performance");
     const allPassed = reports.every((r) => r.status === "passed");
     if (!allPassed || !perf || perf.metrics.p95LatencyMs === undefined) {
-      const infra = reports.find(
-        (r) => r.status === "infra_error" || r.status === "timeout",
-      );
+      const infra = reports.find((r) => r.status === "infra_error" || r.status === "timeout");
       await this.ledger.updateExperiment(experimentId, {
         status: infra ? "inconclusive" : "rejected",
         verdict: infra
@@ -1266,8 +1165,7 @@ export class MissionController {
           {
             repetitionSpread: noise,
             acceptanceMargin: this.config.acceptanceMargin,
-            maxRepetitionSpread:
-              this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
+            maxRepetitionSpread: this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
             reportId: perf.reportId,
           },
         );
@@ -1314,13 +1212,7 @@ export class MissionController {
           marginCoversNoise: floor.acceptanceMargin >= noise,
         },
       );
-      await this.checkpoint(
-        tx,
-        "running",
-        "optimize-search",
-        null,
-        "baseline-complete",
-      );
+      await this.checkpoint(tx, "running", "optimize-search", null, "baseline-complete");
     });
     this.log(
       `baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms; repetition spread ${(noise * 100).toFixed(1)}%)`,
@@ -1335,8 +1227,7 @@ export class MissionController {
   /** Margin frozen after the baseline measured its noise; the configured value before that. */
   private timingPolicy(mission: MissionRow): TimingPolicy {
     return {
-      acceptanceMargin:
-        mission.frozenAcceptanceMargin ?? this.config.acceptanceMargin,
+      acceptanceMargin: mission.frozenAcceptanceMargin ?? this.config.acceptanceMargin,
       requiredImprovedRepetitions: this.config.requiredImprovedRepetitions,
     };
   }
@@ -1367,11 +1258,7 @@ export class MissionController {
     const passed = report?.status === "passed";
     await this.transaction(async (tx) => {
       await tx.updateExperiment(experimentId, {
-        status: passed
-          ? "accepted"
-          : report?.status === "failed"
-            ? "rejected"
-            : "inconclusive",
+        status: passed ? "accepted" : report?.status === "failed" ? "rejected" : "inconclusive",
         verdict: `holdout ${report?.status ?? "missing"}`,
         finishedAt: new Date().toISOString(),
       });
@@ -1382,10 +1269,7 @@ export class MissionController {
       });
     });
     if (!passed)
-      await this.finish(
-        "blocked",
-        `holdout ${report?.status ?? "missing"} on best artifact`,
-      );
+      await this.finish("blocked", `holdout ${report?.status ?? "missing"} on best artifact`);
   }
 
   private async runCycle(
@@ -1397,8 +1281,7 @@ export class MissionController {
     try {
       await this.ensureSegment();
     } catch (error) {
-      if (error instanceof WorkerUnavailableError)
-        return this.parkOnWorkerFault(error, null);
+      if (error instanceof WorkerUnavailableError) return this.parkOnWorkerFault(error, null);
       throw error;
     }
 
@@ -1419,21 +1302,10 @@ export class MissionController {
         activeTaskId: "optimize-search",
         spentExperiments: mission.spentExperiments + 1,
       });
-      await tx.appendEvent(
-        `${experimentId}:planned`,
-        "experiment.planned",
-        experimentId,
-        {
-          parent,
-        },
-      );
-      await this.checkpoint(
-        tx,
-        "running",
-        "optimize-search",
-        experimentId,
-        "planned",
-      );
+      await tx.appendEvent(`${experimentId}:planned`, "experiment.planned", experimentId, {
+        parent,
+      });
+      await this.checkpoint(tx, "running", "optimize-search", experimentId, "planned");
     });
 
     // Restore the workspace from the immutable parent so a crashed edit never leaks in.
@@ -1480,12 +1352,7 @@ export class MissionController {
         `  performance policy: ${policy.blockedMechanisms.length} mechanism(s) blocked after >= ${policy.limit} measured rejections; requiring a profile or a different mechanism`,
       );
     }
-    const packet = await this.buildPacket(
-      mission,
-      experimentId,
-      stagnation,
-      policy,
-    );
+    const packet = await this.buildPacket(mission, experimentId, stagnation, policy);
     this.cycleDeadline = Date.now() + this.config.budget.cycleTimeoutMs;
     const broker = new ToolBroker(
       this.paths.candidate,
@@ -1494,9 +1361,7 @@ export class MissionController {
       () => this.cycleDeadline,
       this.execSandbox(experimentId),
     );
-    const recoveryNote = recovery.actions.find(
-      (a) => a.kind === "interrupted_edit",
-    )?.detail;
+    const recoveryNote = recovery.actions.find((a) => a.kind === "interrupted_edit")?.detail;
     let result: WorkerCycleResult;
     try {
       result = await this.worker.runCycle({
@@ -1517,18 +1382,12 @@ export class MissionController {
     await this.spendTokens(result.usage);
     const audit = auditClaim(result.claim, broker.verifications);
     const text = this.boundWorkerText(result);
-    await this.ledger.appendEvent(
-      `${experimentId}:claim-audit`,
-      "claim.audited",
-      experimentId,
-      {
-        claim: text.claim,
-        observed: broker.verifications,
-        ...audit,
-      },
-    );
-    if (!audit.supported)
-      this.log(`  unsupported worker claim: ${audit.issues.join("; ")}`);
+    await this.ledger.appendEvent(`${experimentId}:claim-audit`, "claim.audited", experimentId, {
+      claim: text.claim,
+      observed: broker.verifications,
+      ...audit,
+    });
+    if (!audit.supported) this.log(`  unsupported worker claim: ${audit.issues.join("; ")}`);
     if (result.hypothesis === "none" && result.whatChanged === "nothing") {
       await this.ledger.updateExperiment(experimentId, {
         status: "inconclusive",
@@ -1540,9 +1399,7 @@ export class MissionController {
     if (
       stagnation.stagnated &&
       broker.profiles.length === 0 &&
-      stagnation.triedHypotheses.includes(
-        normalizeHypothesis(result.hypothesis),
-      )
+      stagnation.triedHypotheses.includes(normalizeHypothesis(result.hypothesis))
     ) {
       await this.conclude(
         (await this.ledger.getExperiment(experimentId))!,
@@ -1606,28 +1463,17 @@ export class MissionController {
         status: "snapshot_ready",
         candidateArtifactHash: snapshot.hash,
       });
-      await tx.appendEvent(
-        `${experimentId}:snapshot`,
-        "experiment.snapshot",
-        experimentId,
-        {
-          hash: snapshot.hash,
-          hypothesis: text.hypothesis,
-          whatChanged: text.whatChanged,
-          claim: text.claim,
-          seededFixture: result.seededFixture,
-          aborted: result.aborted,
-          claimIssues: audit.issues,
-          profiled: broker.profiles.length > 0,
-        },
-      );
-      await this.checkpoint(
-        tx,
-        "running",
-        "optimize-search",
-        experimentId,
-        "snapshot_ready",
-      );
+      await tx.appendEvent(`${experimentId}:snapshot`, "experiment.snapshot", experimentId, {
+        hash: snapshot.hash,
+        hypothesis: text.hypothesis,
+        whatChanged: text.whatChanged,
+        claim: text.claim,
+        seededFixture: result.seededFixture,
+        aborted: result.aborted,
+        claimIssues: audit.issues,
+        profiled: broker.profiles.length > 0,
+      });
+      await this.checkpoint(tx, "running", "optimize-search", experimentId, "snapshot_ready");
     });
     this.crash("snapshot_ready");
     const experiment = (await this.ledger.getExperiment(experimentId))!;
@@ -1650,8 +1496,7 @@ export class MissionController {
   ): Promise<Verdict> {
     const hash = experiment.candidateArtifactHash!;
     const mission = await this.mission();
-    if (!this.artifacts.verify(hash))
-      throw new Error(`artifact ${hash} failed integrity check`);
+    if (!this.artifacts.verify(hash)) throw new Error(`artifact ${hash} failed integrity check`);
     await this.ledger.updateExperiment(experiment.experimentId, {
       status: "evaluating",
     });
@@ -1662,9 +1507,7 @@ export class MissionController {
       { attempt: experiment.attempt },
     );
 
-    const snapshotEvent = await this.ledger.findEvent(
-      `${experiment.experimentId}:snapshot`,
-    );
+    const snapshotEvent = await this.ledger.findEvent(`${experiment.experimentId}:snapshot`);
     const story =
       narrative ??
       (snapshotEvent
@@ -1693,9 +1536,7 @@ export class MissionController {
       "learned",
     ]);
     this.crash("after-gate");
-    const infra = gate.find(
-      (r) => r.status === "infra_error" || r.status === "timeout",
-    );
+    const infra = gate.find((r) => r.status === "infra_error" || r.status === "timeout");
     if (infra)
       return this.conclude(
         experiment,
@@ -1709,9 +1550,7 @@ export class MissionController {
     if (failing.length > 0) {
       const signature = sha256(
         canonicalJson(
-          failing.flatMap((r) =>
-            r.assertions.filter((a) => !a.passed).map((a) => a.id),
-          ),
+          failing.flatMap((r) => r.assertions.filter((a) => !a.passed).map((a) => a.id)),
         ),
       ).slice(0, 16);
       await this.observeLesson(experiment, failing);
@@ -1725,9 +1564,7 @@ export class MissionController {
         signature,
       );
     }
-    const [perf] = await this.runSuites(experiment.experimentId, hash, [
-      "performance",
-    ]);
+    const [perf] = await this.runSuites(experiment.experimentId, hash, ["performance"]);
     if (!perf || perf.status !== "passed") {
       const kind = perf?.status === "failed" ? "rejected" : "inconclusive";
       return this.conclude(
@@ -1747,9 +1584,7 @@ export class MissionController {
       );
     }
     const reports = [...gate, perf];
-    const bestReps =
-      (await this.bestPerformanceReport(mission))?.metrics.repetitionP95Ms ??
-      [];
+    const bestReps = (await this.bestPerformanceReport(mission))?.metrics.repetitionP95Ms ?? [];
     let decision: TimingDecision = firstComparison(
       perf.metrics,
       mission.bestP95Ms,
@@ -1761,13 +1596,7 @@ export class MissionController {
       this.log(
         `  timing ambiguous (${decision.reason}); re-measuring best and candidate back-to-back`,
       );
-      const rerun = await this.retime(
-        experiment.experimentId,
-        hash,
-        mission,
-        perf,
-        bestReps,
-      );
+      const rerun = await this.retime(experiment.experimentId, hash, mission, perf, bestReps);
       reports.push(...rerun.reports);
       decision = rerun.decision;
       if (rerun.candidate) accepted = rerun.candidate;
@@ -1811,16 +1640,11 @@ export class MissionController {
         bestArtifactHash: hash,
         bestP95Ms: p95,
       });
-      await tx.appendEvent(
-        `${experiment.experimentId}:accepted`,
-        "artifact.accepted",
-        hash,
-        {
-          p95,
-          previous: mission.bestP95Ms,
-          reportId: accepted.reportId,
-        },
-      );
+      await tx.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, {
+        p95,
+        previous: mission.bestP95Ms,
+        reportId: accepted.reportId,
+      });
     });
     const verdict = await this.conclude(
       experiment,
@@ -1833,8 +1657,7 @@ export class MissionController {
       lesson,
     );
     const target =
-      (mission.baselineP95Ms ?? Number.POSITIVE_INFINITY) *
-      (1 - this.config.targetP95Reduction);
+      (mission.baselineP95Ms ?? Number.POSITIVE_INFINITY) * (1 - this.config.targetP95Reduction);
     if ((p95 ?? Number.POSITIVE_INFINITY) <= target) {
       await this.ledger.upsertTask({
         ...TASKS[1]!,
@@ -1872,11 +1695,7 @@ export class MissionController {
       best,
       "performance",
     );
-    const candidate = await this.verifyArtifact(
-      `${experimentId}-retime`,
-      hash,
-      "performance",
-    );
+    const candidate = await this.verifyArtifact(`${experimentId}-retime`, hash, "performance");
     const reports = [bestReport, candidate];
     if (bestReport.status !== "passed" || candidate.status !== "passed") {
       return {
@@ -1942,9 +1761,7 @@ export class MissionController {
       invariantIds: [
         ...new Set(
           reports.flatMap((r) =>
-            r.assertions
-              .filter((a) => !a.passed)
-              .flatMap((a) => a.invariantIds ?? []),
+            r.assertions.filter((a) => !a.passed).flatMap((a) => a.invariantIds ?? []),
           ),
         ),
       ],
@@ -1994,10 +1811,7 @@ export class MissionController {
       await this.outbox.enqueue(payload, tx);
       if (performanceLesson) {
         await tx.upsertLesson(
-          encodePerformanceLesson(
-            this.config.missionId,
-            performanceLesson.lesson,
-          ),
+          encodePerformanceLesson(this.config.missionId, performanceLesson.lesson),
         );
         await tx.appendEvent(
           `${experiment.experimentId}:lesson:${performanceLesson.lesson.lessonId}`,
@@ -2014,13 +1828,7 @@ export class MissionController {
         { verdict, reason },
       );
       await tx.updateMission(this.config.missionId, { activeTaskId: null });
-      await this.checkpoint(
-        tx,
-        "running",
-        "optimize-search",
-        null,
-        "concluded",
-      );
+      await this.checkpoint(tx, "running", "optimize-search", null, "concluded");
     });
     this.crash("concluded");
     this.log(
@@ -2030,17 +1838,10 @@ export class MissionController {
     return verdict;
   }
 
-  private nextActionAfter(
-    verdict: Verdict,
-    reason: string,
-    mission: MissionRow,
-  ): string {
+  private nextActionAfter(verdict: Verdict, reason: string, mission: MissionRow): string {
     if (verdict === "accepted")
       return "profile the new best artifact and look for the next bottleneck";
-    if (
-      reason.startsWith("stagnation") ||
-      reason.startsWith("performance policy")
-    )
+    if (reason.startsWith("stagnation") || reason.startsWith("performance policy"))
       return "profile the current best artifact before editing, or try a mechanism not yet attempted";
     if (verdict === "inconclusive" && reason.includes("timing"))
       return "the timing difference was within measurement noise; look for a mechanism with a larger effect or profile to confirm the bottleneck";
@@ -2054,9 +1855,7 @@ export class MissionController {
   }
 
   private featuresFor(reports: VerificationReport[]): string[] {
-    const features = JSON.parse(
-      readFileSync(join(RESOURCES_DIR, "features.json"), "utf8"),
-    ) as {
+    const features = JSON.parse(readFileSync(join(RESOURCES_DIR, "features.json"), "utf8")) as {
       features: { id: string; invariants: string[] }[];
     };
     const touched = new Set(
@@ -2086,22 +1885,15 @@ export class MissionController {
     hash: string,
     suite: Suite,
   ): Promise<VerificationReport> {
-    const existing = await this.ledger.findVerification(
-      experimentId,
-      hash,
-      suite,
-    );
+    const existing = await this.ledger.findVerification(experimentId, hash, suite);
     if (
       existing &&
       existing.evaluatorHash === this.evaluatorHash &&
       existing.environmentHash === this.environmentHash &&
       existsSync(existing.path)
     ) {
-      const parsed = JSON.parse(
-        readFileSync(existing.path, "utf8"),
-      ) as VerificationReport;
-      if (parsed.status === "passed" || parsed.status === "failed")
-        return parsed;
+      const parsed = JSON.parse(readFileSync(existing.path, "utf8")) as VerificationReport;
+      if (parsed.status === "passed" || parsed.status === "failed") return parsed;
     }
     const prior = REUSABLE_FAILURE_SUITES.has(suite)
       ? await this.priorFailure(hash, suite)
@@ -2124,8 +1916,7 @@ export class MissionController {
       return prior;
     }
     const artifact = this.artifacts.pathFor(hash);
-    if (!this.artifacts.verify(hash))
-      throw new Error(`artifact ${hash} does not verify`);
+    if (!this.artifacts.verify(hash)) throw new Error(`artifact ${hash} does not verify`);
     const mission = await this.mission();
     const report = await runSuite(
       {
@@ -2158,32 +1949,24 @@ export class MissionController {
       workloadHash: report.workloadHash,
       environmentHash: this.environmentHash,
     });
-    if (!check.ok)
-      throw new Error(`runner produced an invalid report: ${check.reason}`);
+    if (!check.ok) throw new Error(`runner produced an invalid report: ${check.reason}`);
     const dir = join(this.paths.reports, experimentId);
     mkdirSync(dir, { recursive: true });
     const path = join(dir, `${suite}-${report.reportId}.json`);
     writeJsonAtomic(path, report);
-    if (
-      (await this.ledger.getExperiment(experimentId))?.status === "evaluating"
-    )
+    if ((await this.ledger.getExperiment(experimentId))?.status === "evaluating")
       this.crash(
         `report-written:${experimentId.startsWith("exp-0") ? "optimize" : "fixed"}:${suite}`,
       );
     await this.transaction(async (tx) => {
       await tx.insertVerification(report, path);
-      await tx.appendEvent(
-        `report:${report.reportId}`,
-        "verification.recorded",
-        experimentId,
-        {
-          suite,
-          status: report.status,
-          hash,
-          p95: report.metrics.p95LatencyMs ?? null,
-          isolation: report.isolation,
-        },
-      );
+      await tx.appendEvent(`report:${report.reportId}`, "verification.recorded", experimentId, {
+        suite,
+        status: report.status,
+        hash,
+        p95: report.metrics.p95LatencyMs ?? null,
+        isolation: report.isolation,
+      });
     });
     this.log(
       `  ${suite}: ${report.status}${report.metrics.p95LatencyMs !== undefined ? ` p95=${report.metrics.p95LatencyMs}ms` : ""}${report.infraMessage ? ` (${report.infraMessage})` : ""}`,
@@ -2192,13 +1975,8 @@ export class MissionController {
   }
 
   /** A committed failed report for the same content, suite, evaluator and environment from any experiment of this mission. */
-  private async priorFailure(
-    hash: string,
-    suite: Suite,
-  ): Promise<VerificationReport | undefined> {
-    const row = (
-      await this.ledger.listVerifications(this.config.missionId)
-    ).find(
+  private async priorFailure(hash: string, suite: Suite): Promise<VerificationReport | undefined> {
+    const row = (await this.ledger.listVerifications(this.config.missionId)).find(
       (v) =>
         v.artifactHash === hash &&
         v.suite === suite &&
@@ -2218,18 +1996,16 @@ export class MissionController {
       for (const assertion of report.assertions.filter((a) => !a.passed)) {
         for (const invariantId of assertion.invariantIds ?? []) {
           const lessonId = `lesson-${invariantId.toLowerCase()}`;
-          const current = (
-            await this.ledger.listLessons(this.config.missionId)
-          ).find((l) => l.lessonId === lessonId);
+          const current = (await this.ledger.listLessons(this.config.missionId)).find(
+            (l) => l.lessonId === lessonId,
+          );
           if (current && current.state !== "observed") continue;
           const episodeId = `ep-${experiment.experimentId}-v1`;
           const state: LessonState = current ? "reproduced" : "observed";
           await this.ledger.upsertLesson({
             lessonId,
             missionId: this.config.missionId,
-            sourceEpisodeIds: [
-              ...new Set([...(current?.sourceEpisodeIds ?? []), episodeId]),
-            ],
+            sourceEpisodeIds: [...new Set([...(current?.sourceEpisodeIds ?? []), episodeId])],
             invariantId,
             state,
             proposal: current?.proposal ?? "",
@@ -2260,8 +2036,7 @@ export class MissionController {
   async performancePolicy(): Promise<PerformancePolicy> {
     return decidePerformancePolicy(
       await this.performanceLessons(),
-      this.config.performanceRejectionLimit ??
-        DEFAULT_PERFORMANCE_REJECTION_LIMIT,
+      this.config.performanceRejectionLimit ?? DEFAULT_PERFORMANCE_REJECTION_LIMIT,
     );
   }
 
@@ -2282,16 +2057,9 @@ export class MissionController {
     reason: string,
   ): Promise<PlannedPerformanceLesson | undefined> {
     const mechanism = normalizeHypothesis(story.hypothesis);
-    if (!mechanism || !isMeasuredP95Comparison(candidateP95Ms, comparedP95Ms))
-      return undefined;
-    const lessonId = performanceLessonId(
-      this.config.missionId,
-      kind,
-      mechanism,
-    );
-    const existing = (await this.performanceLessons()).find(
-      (l) => l.lessonId === lessonId,
-    );
+    if (!mechanism || !isMeasuredP95Comparison(candidateP95Ms, comparedP95Ms)) return undefined;
+    const lessonId = performanceLessonId(this.config.missionId, kind, mechanism);
+    const existing = (await this.performanceLessons()).find((l) => l.lessonId === lessonId);
     const perfReports = reports.filter((r) => r.suite === "performance");
     const lesson = recordPerformanceObservation(existing, {
       missionId: this.config.missionId,
@@ -2334,9 +2102,7 @@ export class MissionController {
     const mission = await this.mission();
     const existingIds = new Set([
       ...loadScenarios().map((s) => s.scenarioId),
-      ...(await this.ledger.listLearnedScenarios(this.config.missionId)).map(
-        (s) => s.scenarioId,
-      ),
+      ...(await this.ledger.listLearnedScenarios(this.config.missionId)).map((s) => s.scenarioId),
     ]);
     const shape = validateProposalShape(proposal, existingIds);
     const lessonId = `lesson-${proposal.invariantId.toLowerCase()}`;
@@ -2382,15 +2148,8 @@ export class MissionController {
     await transition("proposed", null);
 
     const seed = mission.seedArtifactHash!;
-    const { artifact: negative } = this.artifacts.importFixture(
-      "stale-cache",
-      seed,
-    );
-    const runLearned = (
-      snapshotDir: string,
-      artifactHash: string,
-      scenarioDir: string,
-    ) =>
+    const { artifact: negative } = this.artifacts.importFixture("stale-cache", seed);
+    const runLearned = (snapshotDir: string, artifactHash: string, scenarioDir: string) =>
       runSuite(
         {
           missionId: this.config.missionId,
@@ -2408,9 +2167,7 @@ export class MissionController {
           holdoutWorkload: this.config.holdoutWorkload,
           learnedScenariosDir: scenarioDir,
           evidence: this.evidence,
-          containerRegistry: this.containerRegistry(
-            `lesson-${lessonId}-${experimentId}`,
-          ),
+          containerRegistry: this.containerRegistry(`lesson-${lessonId}-${experimentId}`),
         },
         "learned",
       );
@@ -2420,14 +2177,8 @@ export class MissionController {
       { snapshotDir: negative.path, artifactHash: negative.hash },
       { snapshotDir: this.artifacts.pathFor(seed), artifactHash: seed },
     );
-    const negativeEvidence = this.evidence.write(
-      "lesson-negative",
-      validation.negativeReport,
-    );
-    const positiveEvidence = this.evidence.write(
-      "lesson-positive",
-      validation.positiveReport,
-    );
+    const negativeEvidence = this.evidence.write("lesson-negative", validation.negativeReport);
+    const positiveEvidence = this.evidence.write("lesson-positive", validation.positiveReport);
     if (!validation.accepted) {
       await transition("rejected", negativeEvidence, {
         negativeEvidenceId: negativeEvidence,
@@ -2456,10 +2207,7 @@ export class MissionController {
       },
     };
     mkdirSync(this.paths.learnedScenarios, { recursive: true });
-    const path = join(
-      this.paths.learnedScenarios,
-      `${scenario.scenarioId}.json`,
-    );
+    const path = join(this.paths.learnedScenarios, `${scenario.scenarioId}.json`);
     writeJsonAtomic(path, scenario);
     await this.transaction(async (tx) => {
       const version = (await this.missionOn(tx)).learnedSuiteVersion + 1;
@@ -2479,32 +2227,21 @@ export class MissionController {
         { materializedScenarioId: scenario.scenarioId },
         tx,
       );
-      await tx.appendEvent(
-        `lesson:${lessonId}:materialized`,
-        "lesson.materialized",
-        lessonId,
-        {
-          scenarioId: scenario.scenarioId,
-          version,
-        },
-      );
+      await tx.appendEvent(`lesson:${lessonId}:materialized`, "lesson.materialized", lessonId, {
+        scenarioId: scenario.scenarioId,
+        version,
+      });
     });
-    this.log(
-      `  lesson ${lessonId} materialized as learned scenario ${scenario.scenarioId}`,
-    );
+    this.log(`  lesson ${lessonId} materialized as learned scenario ${scenario.scenarioId}`);
     return { accepted: true, reason: validation.reason, lessonId };
   }
 
   /** Consecutive concluded optimize-search experiments since the last accepted one; none of them improved the best. */
   async stagnation(): Promise<StagnationState> {
-    const concluded = (
-      await this.ledger.listExperiments(this.config.missionId)
-    ).filter(
+    const concluded = (await this.ledger.listExperiments(this.config.missionId)).filter(
       (e) =>
         e.taskId === "optimize-search" &&
-        (e.status === "accepted" ||
-          e.status === "rejected" ||
-          e.status === "inconclusive"),
+        (e.status === "accepted" || e.status === "rejected" || e.status === "inconclusive"),
     );
     const run: ExperimentRow[] = [];
     for (let i = concluded.length - 1; i >= 0; i -= 1) {
@@ -2514,9 +2251,7 @@ export class MissionController {
     }
     return {
       count: run.length,
-      triedHypotheses: [
-        ...new Set(run.map((e) => normalizeHypothesis(e.hypothesis))),
-      ],
+      triedHypotheses: [...new Set(run.map((e) => normalizeHypothesis(e.hypothesis)))],
       stagnated: run.length >= this.config.stagnationLimit,
     };
   }
@@ -2533,16 +2268,12 @@ export class MissionController {
     const last = experiments
       .filter((e) => e.experimentId !== experimentId && e.verdict !== null)
       .at(-1);
-    const episode = last
-      ? await this.ledger.getEpisode(`ep-${last.experimentId}-v1`)
-      : undefined;
+    const episode = last ? await this.ledger.getEpisode(`ep-${last.experimentId}-v1`) : undefined;
     return composeRetrievalQuery({
       taskId: "optimize-search",
       hypothesis: last?.hypothesis ?? task?.hypothesis ?? null,
       // Features touched by accepted mechanisms come first so ranking leans toward episodes that share them.
-      featureIds: [
-        ...new Set([...focusFeatureIds, ...(episode?.featureIds ?? [])]),
-      ],
+      featureIds: [...new Set([...focusFeatureIds, ...(episode?.featureIds ?? [])])],
       invariantIds: episode?.invariantIds ?? [],
       lastVerdict: last?.verdict ?? null,
       lastFailureSignature: last?.failureSignature ?? null,
@@ -2555,9 +2286,9 @@ export class MissionController {
     stagnation: StagnationState,
     policy: PerformancePolicy,
   ): Promise<ContextPacket> {
-    const experiments = (
-      await this.ledger.listExperiments(this.config.missionId)
-    ).filter((e) => e.taskId === "optimize-search");
+    const experiments = (await this.ledger.listExperiments(this.config.missionId)).filter(
+      (e) => e.taskId === "optimize-search",
+    );
     // Bounded recent history: only this segment's experiments are replayed verbatim; older segments are reachable through retrieval.
     const recentRows = experiments
       .filter((e) => e.segmentOrdinal === this.segmentOrdinal)
@@ -2566,22 +2297,13 @@ export class MissionController {
     for (const e of recentRows) {
       const episode = await this.ledger.getEpisode(`ep-${e.experimentId}-v1`);
       recentLines.push(
-        episode
-          ? episode.summary
-          : `${e.experimentId}: ${e.status} ${e.verdict ?? ""}`,
+        episode ? episode.summary : `${e.experimentId}: ${e.status} ${e.verdict ?? ""}`,
       );
     }
     const recent = recentLines.join("\n\n");
     const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
-    const skill = readFileSync(
-      join(RESOURCES_DIR, "skills/verify-search/SKILL.md"),
-      "utf8",
-    );
-    const query = await this.retrievalQuery(
-      experiments,
-      experimentId,
-      policy.focusFeatureIds,
-    );
+    const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
+    const query = await this.retrievalQuery(experiments, experimentId, policy.focusFeatureIds);
     const lessons = rankPerformanceLessons(await this.performanceLessons());
     const nextAction =
       (await this.ledger.listTasks(this.config.missionId)).find(
@@ -2644,9 +2366,7 @@ export class MissionController {
           episodeId: r.episodeId,
           text: r.text,
         })),
-        ...(lessons.length > 0
-          ? { lessons: renderPerformanceLessons(lessons, policy) }
-          : {}),
+        ...(lessons.length > 0 ? { lessons: renderPerformanceLessons(lessons, policy) } : {}),
         next: `Last verdict: ${lastVerdict}\nNext action: ${nextAction}\n${
           stagnation.stagnated
             ? `Stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}). This cycle must call profile_candidate before editing or try a mechanism other than: ${stagnation.triedHypotheses.join(" | ")}. Repeating one of those without profiling is rejected without verification.\n`
@@ -2663,42 +2383,37 @@ export class MissionController {
       },
       DEFAULT_PACKET_BUDGET,
     );
-    await this.ledger.appendEvent(
-      `${experimentId}:packet`,
-      "packet.built",
-      experimentId,
-      {
-        query,
-        tokens: packet.tokens,
-        retrievalMs,
-        sections: packet.sections,
-        injected: packet.injectedEpisodeIds,
-        dropped: packet.droppedEpisodeIds,
-        filteredOut,
-        degraded: retrieval.degraded,
-        crossMission: {
-          readTags: crossTags,
-          degraded: cross.degraded,
-          fetched: cross.injected.map((r) => r.episodeId),
-          injected: cross.injected
-            .filter((r) => packet.injectedEpisodeIds.includes(r.episodeId))
-            .map((r) => ({ episodeId: r.episodeId, ...r.provenance! })),
-          dropped: cross.injected
-            .filter((r) => packet.droppedEpisodeIds.includes(r.episodeId))
-            .map((r) => r.episodeId),
-        },
-        lessons: lessons.map((l) => ({
-          lessonId: l.lessonId,
-          kind: l.kind,
-          observations: l.observations.length,
-        })),
-        policy: {
-          blocked: policy.blockedMechanisms.map((b) => b.lessonId),
-          preferred: policy.preferredMechanisms.map((p) => p.lessonId),
-          focusFeatureIds: policy.focusFeatureIds,
-        },
+    await this.ledger.appendEvent(`${experimentId}:packet`, "packet.built", experimentId, {
+      query,
+      tokens: packet.tokens,
+      retrievalMs,
+      sections: packet.sections,
+      injected: packet.injectedEpisodeIds,
+      dropped: packet.droppedEpisodeIds,
+      filteredOut,
+      degraded: retrieval.degraded,
+      crossMission: {
+        readTags: crossTags,
+        degraded: cross.degraded,
+        fetched: cross.injected.map((r) => r.episodeId),
+        injected: cross.injected
+          .filter((r) => packet.injectedEpisodeIds.includes(r.episodeId))
+          .map((r) => ({ episodeId: r.episodeId, ...r.provenance! })),
+        dropped: cross.injected
+          .filter((r) => packet.droppedEpisodeIds.includes(r.episodeId))
+          .map((r) => r.episodeId),
       },
-    );
+      lessons: lessons.map((l) => ({
+        lessonId: l.lessonId,
+        kind: l.kind,
+        observations: l.observations.length,
+      })),
+      policy: {
+        blocked: policy.blockedMechanisms.map((b) => b.lessonId),
+        preferred: policy.preferredMechanisms.map((p) => p.lessonId),
+        focusFeatureIds: policy.focusFeatureIds,
+      },
+    });
     return packet;
   }
 
@@ -2706,27 +2421,15 @@ export class MissionController {
     return {
       verify: async (suite) => {
         const snapshot = await this.snapshotCandidate();
-        const report = await this.verifyArtifact(
-          experimentId,
-          snapshot.hash,
-          suite,
-        );
+        const report = await this.verifyArtifact(experimentId, snapshot.hash, suite);
         return {
           report,
-          reportPath: join(
-            this.paths.reports,
-            experimentId,
-            `${suite}-${report.reportId}.json`,
-          ),
+          reportPath: join(this.paths.reports, experimentId, `${suite}-${report.reportId}.json`),
         };
       },
       profile: async (scenario) => {
         const snapshot = await this.snapshotCandidate();
-        const report = await this.verifyArtifact(
-          experimentId,
-          snapshot.hash,
-          "performance",
-        );
+        const report = await this.verifyArtifact(experimentId, snapshot.hash, "performance");
         const evidenceId = this.evidence.write("profile", {
           scenario,
           metrics: report.metrics,
@@ -2765,8 +2468,7 @@ export class MissionController {
         }
         return out;
       },
-      proposeRegression: (proposal) =>
-        this.handleProposal(experimentId, proposal),
+      proposeRegression: (proposal) => this.handleProposal(experimentId, proposal),
       onToolEvent: (name, params, summary) => {
         const eventId = `${experimentId}:tool:${randomUUID()}`;
         this.toolEvents = this.toolEvents.then(async () => {
@@ -2798,14 +2500,8 @@ export class MissionController {
   private async ensureSegment(): Promise<void> {
     const active = await this.ledger.activeSegment(this.config.missionId);
     const needsRotation =
-      active !== undefined &&
-      this.cyclesInSegment >= this.config.segmentRotationCycles;
-    if (
-      active &&
-      !needsRotation &&
-      this.openedSegmentOrdinal === active.ordinal
-    )
-      return;
+      active !== undefined && this.cyclesInSegment >= this.config.segmentRotationCycles;
+    if (active && !needsRotation && this.openedSegmentOrdinal === active.ordinal) return;
     const previous = active
       ? { sessionPath: active.sessionPath, sessionId: active.sessionId ?? "" }
       : null;
@@ -2820,14 +2516,8 @@ export class MissionController {
     // A new segment is a fresh bounded context; `previous` is only for resuming a committed segment.
     const handle = await this.worker.openSegment(ordinal, null);
     await this.transaction(async (tx) => {
-      if (active)
-        await tx.closeSegment(this.config.missionId, active.ordinal, null);
-      await tx.openSegment(
-        this.config.missionId,
-        ordinal,
-        handle.sessionPath,
-        handle.sessionId,
-      );
+      if (active) await tx.closeSegment(this.config.missionId, active.ordinal, null);
+      await tx.openSegment(this.config.missionId, ordinal, handle.sessionPath, handle.sessionId);
       const checkpoint = await this.checkpoint(
         tx,
         "running",
@@ -2835,28 +2525,17 @@ export class MissionController {
         null,
         `segment-open:${ordinal}`,
       );
-      await tx.commitSegment(
-        this.config.missionId,
+      await tx.commitSegment(this.config.missionId, ordinal, checkpoint.checkpointId);
+      await tx.appendEvent(`segment:${ordinal}:open`, "segment.opened", this.config.missionId, {
         ordinal,
-        checkpoint.checkpointId,
-      );
-      await tx.appendEvent(
-        `segment:${ordinal}:open`,
-        "segment.opened",
-        this.config.missionId,
-        {
-          ordinal,
-          rotatedFrom: active?.ordinal ?? null,
-        },
-      );
+        rotatedFrom: active?.ordinal ?? null,
+      });
     });
     this.segmentOrdinal = ordinal;
     this.openedSegmentOrdinal = ordinal;
     this.cyclesInSegment = 0;
     await this.archiveOldSegments();
-    this.log(
-      `segment ${ordinal} open${active ? ` (rotated from ${active.ordinal})` : ""}`,
-    );
+    this.log(`segment ${ordinal} open${active ? ` (rotated from ${active.ordinal})` : ""}`);
   }
 
   private async applyRetention(): Promise<void> {
@@ -2864,15 +2543,12 @@ export class MissionController {
     if (!policy) return;
     this.assertLeaseLive();
     const mission = await this.mission();
-    const experiments = await this.ledger.listExperiments(
-      this.config.missionId,
-    );
+    const experiments = await this.ledger.listExperiments(this.config.missionId);
     this.artifacts.pruneExcept(
       retainedArtifactHashes(mission, experiments, policy.keepRecentCandidates),
     );
     await this.archiveOldSegments();
-    const cutoff =
-      (await this.ledger.lastEventSeq()) - policy.compactEventsAfter;
+    const cutoff = (await this.ledger.lastEventSeq()) - policy.compactEventsAfter;
     if (cutoff > 0) {
       while (await this.ledger.compactEventsBefore(cutoff)) {
         this.assertLeaseLive();
@@ -2886,31 +2562,15 @@ export class MissionController {
     this.assertLeaseLive();
     const segments = await this.ledger.listSegments(this.config.missionId);
     for (const segment of segments.slice(0, -policy.keepRecentSegments)) {
-      if (!segment.committed || !segment.closedAt || !segment.sessionPath)
-        continue;
+      if (!segment.committed || !segment.closedAt || !segment.sessionPath) continue;
       if (!segment.archiveHash && !existsSync(segment.sessionPath))
-        throw new Error(
-          `closed segment ${segment.ordinal} has no session file or archive`,
-        );
+        throw new Error(`closed segment ${segment.ordinal} has no session file or archive`);
       const hash =
         segment.archiveHash ??
-        archiveSession(
-          segment.sessionPath,
-          this.paths.sessions,
-          this.paths.evidence,
-        );
+        archiveSession(segment.sessionPath, this.paths.sessions, this.paths.evidence);
       if (!segment.archiveHash)
-        await this.ledger.setSegmentArchive(
-          this.config.missionId,
-          segment.ordinal,
-          hash,
-        );
-      removeArchivedSession(
-        segment.sessionPath,
-        this.paths.sessions,
-        this.paths.evidence,
-        hash,
-      );
+        await this.ledger.setSegmentArchive(this.config.missionId, segment.ordinal, hash);
+      removeArchivedSession(segment.sessionPath, this.paths.sessions, this.paths.evidence, hash);
     }
   }
 
@@ -2989,11 +2649,8 @@ export class MissionController {
     });
   }
 
-  private async episodePayload(
-    episodeId: string,
-  ): Promise<EpisodePayload | undefined> {
-    return (await this.ledger.outboxPayloadForEpisode(episodeId)) as
-      EpisodePayload | undefined;
+  private async episodePayload(episodeId: string): Promise<EpisodePayload | undefined> {
+    return (await this.ledger.outboxPayloadForEpisode(episodeId)) as EpisodePayload | undefined;
   }
 
   async drainOutbox(): Promise<void> {
@@ -3001,9 +2658,7 @@ export class MissionController {
     try {
       const result = await this.outbox.drain();
       if (result.degraded)
-        this.log(
-          `memory delivery degraded (${result.failed} failed, will retry)`,
-        );
+        this.log(`memory delivery degraded (${result.failed} failed, will retry)`);
     } catch (error) {
       this.log(
         `memory delivery skipped: ${error instanceof Error ? error.message : String(error)}`,
