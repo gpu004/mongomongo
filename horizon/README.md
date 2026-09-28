@@ -56,7 +56,9 @@ contract covers both adapters.
 npm run horizon -- doctor
 npm run horizon -- mission create --config mission.example.json
 npm run horizon -- run --mission search-p95-demo
-npm run horizon -- resume --mission search-p95-demo      # after an interruption
+npm run horizon -- resume --mission search-p95-demo      # after an interruption or pause
+npm run horizon -- stop --mission search-p95-demo        # ask the running controller to stop after in-flight work (Ctrl-C/SIGTERM does the same)
+npm run horizon -- pause --mission search-p95-demo       # like stop, but `run` stays paused until `resume`
 npm run horizon -- amend --config mission.example.json    # raise budgets / change model, worker, rotation, stagnation, memory
 npm run horizon -- rebaseline --mission search-p95-demo  # after the evaluator (or an invalidating runtime change) drifted
 npm run horizon -- doctor --mission search-p95-demo      # contract / evaluator / environment drift notes for a frozen mission

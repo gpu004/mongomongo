@@ -50,6 +50,7 @@ import {
   retrieveCrossMissionEpisodes,
   retrieveEpisodes,
 } from "./memory-outbox.ts";
+import { type ControlRequest, clearControl, readControl } from "./operator-control.ts";
 import {
   type Amendment,
   contractHash,
@@ -106,8 +107,10 @@ export interface ControllerOptions {
   maxCycles?: number;
   /** Test hook: container runtime used by resume to remove orphaned candidate containers. */
   containerRuntime?: ContainerRuntime;
-  /** Test hook: how `run()` waits for a persisted `nextWakeAt` (default: real sleep). */
-  sleep?: (ms: number) => Promise<void>;
+  /** Test hook: how `run()` waits for a persisted `nextWakeAt` (default: real sleep, cut short by `signal`). */
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  /** How often a waiting `run()` re-reads the operator control file (default 1s). */
+  controlPollMs?: number;
   /** Test hook: opens the ledger instead of `openLedger(config, paths)` (backend selection). */
   ledger?: () => Promise<AsyncLedger>;
   /** Lease time-to-live; the heartbeat renews at a third of it. */
@@ -163,6 +166,39 @@ export interface RebaselineOutcome {
 }
 
 export const DEFAULT_LEASE_TTL_MS = 30_000;
+export const DEFAULT_CONTROL_POLL_MS = 1_000;
+
+export interface StopRequest {
+  /** `stop` rests the mission as `interrupted`; `pause` as `paused` until `horizon resume`. */
+  intent: "stop" | "pause";
+  source: "signal" | "operator";
+  reason: string;
+  /** The control-file request being honoured, consumed once its checkpoint commits. */
+  control?: ControlRequest;
+}
+
+/** Thrown at a shutdown boundary inside a cycle; `run()` turns it into the interruption checkpoint. */
+export class MissionInterrupted extends Error {
+  readonly experimentId: string | null;
+  constructor(experimentId: string | null) {
+    super("mission interrupted");
+    this.name = "MissionInterrupted";
+    this.experimentId = experimentId;
+  }
+}
+
+export function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
 
 export type Verdict = "accepted" | "rejected" | "inconclusive";
 
@@ -256,12 +292,16 @@ export class MissionController {
   private readonly crashAt: string | undefined;
   private readonly maxCycles: number;
   private readonly containerRuntime: ContainerRuntime | undefined;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+  private readonly controlPollMs: number;
   private readonly leaseTtlMs: number;
   private readonly leaseOwner: string;
   private leaseRow: LeaseRow | undefined;
   private heartbeat: NodeJS.Timeout | undefined;
   private heartbeatError: unknown;
+  private stopRequest: StopRequest | undefined;
+  private activeBroker: ToolBroker | undefined;
+  private waitAbort: AbortController | undefined;
   /** Tool-call audit events are appended in order without blocking the broker; flushed before every transaction. */
   private toolEvents: Promise<void> = Promise.resolve();
   readonly evaluatorHash: string;
@@ -289,7 +329,8 @@ export class MissionController {
     this.crashAt = options.crashAt;
     this.maxCycles = options.maxCycles ?? Number.POSITIVE_INFINITY;
     this.containerRuntime = options.containerRuntime;
-    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.sleep = options.sleep ?? abortableSleep;
+    this.controlPollMs = options.controlPollMs ?? DEFAULT_CONTROL_POLL_MS;
     this.evaluatorHash = computeEvaluatorHash();
     this.environment = environmentFingerprint(
       config.isolation,
@@ -347,6 +388,28 @@ export class MissionController {
   /** Lease currently held by this controller's run, if any. */
   get lease(): LeaseRow | undefined {
     return this.leaseRow;
+  }
+
+  /** Pending stop/pause request (signal or operator), if `run()` is winding down or has wound down because of one. */
+  get stopRequested(): StopRequest | undefined {
+    return this.stopRequest;
+  }
+
+  /**
+   * Graceful shutdown: no further cycle starts, the active worker session and broker
+   * children are aborted, the in-flight ledger transaction finishes, then `run()`
+   * checkpoints, records `mission.interrupted` (or `mission.paused`) and releases the lease.
+   */
+  async requestStop(request: StopRequest): Promise<void> {
+    if (this.stopRequest) return;
+    this.stopRequest = request;
+    this.log(
+      `${request.intent} requested (${request.source}: ${request.reason}); finishing in-flight work`,
+    );
+    this.waitAbort?.abort();
+    const broker = this.activeBroker;
+    await this.worker.abort().catch(() => {});
+    broker?.terminateChildren();
   }
 
   async close(): Promise<void> {
@@ -919,6 +982,11 @@ export class MissionController {
       ).length;
       await this.applyRetention();
       await this.honourWakeTime();
+      await this.pollControl();
+      if (this.stopRequest) {
+        await this.interrupt(recovery.activeExperiment?.experimentId ?? null);
+        return await this.mission();
+      }
       await this.ledger.updateMission(this.config.missionId, {
         status: "running",
         nextWakeAt: null,
@@ -929,6 +997,11 @@ export class MissionController {
       let active = recovery.activeExperiment;
       while (cycles < this.maxCycles) {
         this.assertLeaseLive();
+        await this.pollControl();
+        if (this.stopRequest) {
+          await this.interrupt(active?.experimentId ?? null);
+          break;
+        }
         const mission = await this.mission();
         const stop = this.stopReason(mission);
         if (stop) {
@@ -940,26 +1013,32 @@ export class MissionController {
           await this.finish("succeeded");
           break;
         }
-        if (task.taskId === "baseline") {
-          await this.runBaseline();
-          continue;
-        }
-        if (task.taskId === "holdout") {
-          await this.runHoldout();
-          continue;
-        }
-        cycles += 1;
-        if (active) {
-          await this.evaluateExperiment(active, recovery);
-          this.cyclesInSegment += 1;
-          active = undefined;
-        } else {
-          const done = await this.runCycle(cycles, recovery);
-          if (done === "exhausted") {
-            await this.finish("blocked", "worker has no further hypotheses");
-            break;
+        try {
+          if (task.taskId === "baseline") {
+            await this.runBaseline();
+            continue;
           }
-          if (done === "blocked" || done === "waiting") break;
+          if (task.taskId === "holdout") {
+            await this.runHoldout();
+            continue;
+          }
+          cycles += 1;
+          if (active) {
+            await this.evaluateExperiment(active, recovery);
+            this.cyclesInSegment += 1;
+            active = undefined;
+          } else {
+            const done = await this.runCycle(cycles, recovery);
+            if (done === "exhausted") {
+              await this.finish("blocked", "worker has no further hypotheses");
+              break;
+            }
+            if (done === "blocked" || done === "waiting") break;
+          }
+        } catch (error) {
+          if (!(error instanceof MissionInterrupted)) throw error;
+          await this.interrupt(error.experimentId);
+          break;
         }
         await this.applyRetention();
       }
@@ -977,6 +1056,70 @@ export class MissionController {
   /** A heartbeat that lost the lease means another controller owns the mission; stop before the next write. */
   private assertLeaseLive(): void {
     if (this.heartbeatError instanceof LeaseError) throw this.heartbeatError;
+  }
+
+  /**
+   * Between cycles: adopt an operator `stop` or `pause`. The control file stays in place
+   * until the interruption checkpoint has committed (`interrupt()` consumes a `stop`;
+   * `pause` is kept until `horizon resume`), so a crash in between cannot lose the request.
+   */
+  private async pollControl(): Promise<void> {
+    if (this.stopRequest) return;
+    const control = readControl(this.paths);
+    if (!control) return;
+    await this.requestStop({
+      intent: control.command,
+      source: "operator",
+      reason: `${control.command} requested by ${control.by || "operator"} at ${control.requestedAt}`,
+      control,
+    });
+  }
+
+  /**
+   * Winds the mission down after a stop/pause request once in-flight ledger work has
+   * committed: one transaction records the resting status, the `mission.interrupted`
+   * (or `mission.paused`) event and a checkpoint that `resume` picks up from.
+   * Open experiments keep their state; startup recovery reconciles them exactly as
+   * after a crash, so nothing is planned or evaluated twice.
+   */
+  private async interrupt(activeExperimentId: string | null): Promise<void> {
+    const request = this.stopRequest!;
+    const mission = await this.mission();
+    const status: MissionStatus =
+      request.intent === "pause"
+        ? "paused"
+        : mission.status === "waiting"
+          ? "waiting"
+          : "interrupted";
+    const type = request.intent === "pause" ? "mission.paused" : "mission.interrupted";
+    await this.transaction(async (tx) => {
+      await tx.updateMission(this.config.missionId, { status });
+      await tx.appendEvent(
+        `mission:${this.config.missionId}:${request.intent}:${Date.now()}`,
+        type,
+        this.config.missionId,
+        {
+          reason: request.source,
+          detail: request.reason,
+          previousStatus: mission.status,
+          activeExperimentId,
+          nextWakeAt: mission.nextWakeAt,
+        },
+      );
+      await this.checkpoint(
+        tx,
+        status,
+        mission.activeTaskId,
+        activeExperimentId,
+        `${request.intent}:${request.source}`,
+      );
+    });
+    // Only now is the operator's stop durable in the ledger; a newer request is left for the next run.
+    if (request.control?.command === "stop" && clearControl(this.paths, request.control))
+      this.log("control: stop request consumed");
+    this.log(
+      `mission ${status} (${request.source}); checkpointed${activeExperimentId ? ` with ${activeExperimentId} open` : ""}; run \`horizon resume\` to continue`,
+    );
   }
 
   private stopReason(mission: MissionRow): MissionStatus | undefined {
@@ -1007,7 +1150,14 @@ export class MissionController {
     const delay = Date.parse(mission.nextWakeAt) - Date.now();
     if (delay <= 0) return;
     this.log(`mission waiting until ${mission.nextWakeAt} (${Math.ceil(delay / 1000)}s)`);
-    await this.sleep(delay);
+    this.waitAbort = new AbortController();
+    const poll = setInterval(() => void this.pollControl(), this.controlPollMs);
+    try {
+      await this.sleep(delay, this.waitAbort.signal);
+    } finally {
+      clearInterval(poll);
+      this.waitAbort = undefined;
+    }
     this.wallMark = Date.now();
   }
 
@@ -1056,6 +1206,24 @@ export class MissionController {
     });
     this.log(`mission waiting: ${error.message}; resume at or after ${nextWakeAt}`);
     return "waiting";
+  }
+
+  private async interruptExperiment(experimentId: string, cause: unknown): Promise<void> {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    await this.transaction(async (tx) => {
+      await tx.updateExperiment(experimentId, {
+        status: "interrupted",
+        verdict: `worker aborted on ${this.stopRequest!.intent} request: ${message}`,
+        finishedAt: new Date().toISOString(),
+      });
+      await tx.appendEvent(
+        `${experimentId}:interrupted:${this.stopRequest!.intent}`,
+        "experiment.interrupted",
+        experimentId,
+        { previousStatus: "editing", reason: this.stopRequest!.source, detail: message },
+      );
+    });
+    this.log(`  ${experimentId} interrupted: worker aborted (${message})`);
   }
 
   private async finish(status: MissionStatus, detail = ""): Promise<void> {
@@ -1363,6 +1531,7 @@ export class MissionController {
     );
     const recoveryNote = recovery.actions.find((a) => a.kind === "interrupted_edit")?.detail;
     let result: WorkerCycleResult;
+    this.activeBroker = broker;
     try {
       result = await this.worker.runCycle({
         cycle,
@@ -1373,9 +1542,17 @@ export class MissionController {
       });
     } catch (error) {
       broker.terminateChildren();
+      if (this.stopRequest) {
+        // The abort we asked for surfaced as the worker's failure (possibly dressed as a provider
+        // error); the edit is discarded, the experiment closed, and the stop wins over parking.
+        await this.interruptExperiment(experimentId, error);
+        throw new MissionInterrupted(null);
+      }
       if (error instanceof WorkerUnavailableError)
         return this.parkOnWorkerFault(error, experimentId);
       throw error;
+    } finally {
+      this.activeBroker = undefined;
     }
     broker.terminateChildren();
     await this.flushToolEvents();
@@ -1873,6 +2050,8 @@ export class MissionController {
   ): Promise<VerificationReport[]> {
     const reports: VerificationReport[] = [];
     for (const suite of suites) {
+      // Suites are the shutdown boundary: a finished one is durable, the next is not started.
+      if (this.stopRequest) throw new MissionInterrupted(experimentId);
       reports.push(await this.verifyArtifact(experimentId, hash, suite));
       if (reports.at(-1)!.status !== "passed") break;
     }
