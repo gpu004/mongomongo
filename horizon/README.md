@@ -138,8 +138,9 @@ To author another objective:
    the controller runs (`structural`, `smoke`, `correctness`, `performance`, `holdout`; `learned` only
    when it accepts regressions). It must check the snapshot hash against the artifact and its own hash
    against the frozen one, record evidence ids, and put the metric in `metrics[metric.key]` and the
-   per-repetition values in `metrics[metric.repetitionsKey]`. Its hash must cover its code, reference and
-   every fixed and held-out scenario, so an edit to any of them is evaluator drift (resume refuses, and
+   per-repetition values in `metrics[metric.repetitionsKey]`. Its hash must cover every file that decides a verdict: its code,
+   reference, the report schema, the spec module (metric key and direction), `src/objective-metric.ts`,
+   `src/timing-policy.ts` and every fixed and held-out scenario, so an edit to any of them is evaluator drift (resume refuses, and
    `rebaseline` re-measures the seed and best under the new hash).
 3. Add fixed scenarios and held-out scenarios, each naming the invariants it protects, and
    `resources/<objective>/features.json` mapping features to invariants and scenarios, plus a verification

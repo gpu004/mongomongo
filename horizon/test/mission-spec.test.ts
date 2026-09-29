@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
   bundleBytes,
-  BUNDLE_VERIFICATION_DIR,
   computeBundleEvaluatorHash,
+  runBundleCases,
   runBundleSuite,
 } from "../verification/bundle-size/evaluator.ts";
 import { computeEvaluatorHash, hashDirectory } from "../verification/runner.ts";
@@ -27,6 +27,7 @@ import { BUNDLE_SIZE, TEXT_KIT_SEED_DIR } from "../src/objectives/bundle-size.ts
 import { findMissionSpec, missionSpecFor, missionSpecIds } from "../src/objectives/index.ts";
 import { SEARCH_P95 } from "../src/objectives/search-p95.ts";
 import { systemPrompt } from "../src/pi-worker.ts";
+import { assertSandboxAvailable } from "../src/sandbox.ts";
 import { ScriptedWorker } from "../src/scripted-worker.ts";
 import { EXAMPLE_CONFIG, tempRunsRoot, testConfig } from "./helpers.ts";
 
@@ -203,14 +204,98 @@ test("bundle evaluator: seed passes every suite, bytes are exact, behavior and b
   assert.ok(BUNDLE_SIZE.structuralViolations(broken).length > 0);
 });
 
-test("bundle evaluator identity covers held-out scenarios", () => {
+const HORIZON_ROOT = join(import.meta.dirname, "..");
+
+function horizonCopy(): string {
   const root = mkdtempSync(join(tmpdir(), "horizon-bundle-hash-"));
-  cpSync(BUNDLE_VERIFICATION_DIR, root, { recursive: true });
+  for (const dir of ["src", "verification"])
+    cpSync(join(HORIZON_ROOT, dir), join(root, dir), { recursive: true });
+  return root;
+}
+
+function edit(file: string, from: string, to: string): void {
+  const text = readFileSync(file, "utf8");
+  assert.ok(text.includes(from), `${file} contains ${from}`);
+  writeFileSync(file, text.replace(from, to));
+}
+
+test("bundle evaluator identity covers held-out scenarios", () => {
+  const root = horizonCopy();
   assert.equal(computeBundleEvaluatorHash(root), computeBundleEvaluatorHash());
-  const holdout = join(root, "holdout/holdout-unicode-text.json");
-  writeFileSync(holdout, readFileSync(holdout, "utf8").replace("日本語", "nihongo"));
+  edit(
+    join(root, "verification/bundle-size/holdout/holdout-unicode-text.json"),
+    "日本語",
+    "nihongo",
+  );
   assert.notEqual(computeBundleEvaluatorHash(root), computeBundleEvaluatorHash());
   assert.notEqual(BUNDLE_SIZE.evaluator.hash(), SEARCH_P95.evaluator.hash());
+});
+
+test("bundle evaluator identity covers the objective metric and its comparison semantics", () => {
+  const edits: [string, string, string][] = [
+    ["src/objectives/bundle-size.ts", 'direction: "minimize"', 'direction: "maximize"'],
+    ["src/objectives/bundle-size.ts", "key: BUNDLE_METRIC_KEY", 'key: "bundleFiles"'],
+    ["src/objective-metric.ts", "export function improvedBound", "export function improvedBound2"],
+    ["src/timing-policy.ts", "export", "export /* changed */"],
+  ];
+  for (const [file, from, to] of edits) {
+    const root = horizonCopy();
+    edit(join(root, file), from, to);
+    assert.notEqual(
+      computeBundleEvaluatorHash(root),
+      computeBundleEvaluatorHash(),
+      `${file}: ${to}`,
+    );
+  }
+  const unrelated = horizonCopy();
+  edit(join(unrelated, "src/objectives/search-p95.ts"), "export", "export /* changed */");
+  assert.equal(computeBundleEvaluatorHash(unrelated), computeBundleEvaluatorHash());
+  assert.equal(SEARCH_P95.evaluator.hash(), computeEvaluatorHash());
+});
+
+test("bundle scenario processes cannot read the cases, result marker or entry from the environment", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "horizon-bundle-env-"));
+  mkdirSync(join(dir, "src"));
+  writeFileSync(
+    join(dir, "src/index.ts"),
+    'export const visible = (): string[] => Object.keys(process.env).filter((k) => k.startsWith("HORIZON_"));\n',
+  );
+  const evidence = new FileEvidenceStore(mkdtempSync(join(tmpdir(), "horizon-bundle-env-ev-")));
+  const probe = (isolation: "subprocess" | "container", containerImage: string) =>
+    runBundleCases(
+      {
+        missionId: "bundle-env",
+        experimentId: `env-${isolation}`,
+        artifactHash: hashDirectory(dir).hash,
+        evaluatorHash: computeBundleEvaluatorHash(),
+        environmentHash: "env",
+        snapshotDir: dir,
+        isolation,
+        containerImage,
+        timeoutMs: 20_000,
+        memoryLimitBytes: 256 * 1024 * 1024,
+        evidence,
+      },
+      [
+        { fn: "visible", args: [] },
+        { fn: "visible", args: ["second"] },
+      ],
+    );
+  const expected = [
+    { ok: true, value: [] },
+    { ok: true, value: [] },
+  ];
+  assert.deepEqual((await probe("subprocess", "")).outcomes, expected);
+
+  const image = loadMissionConfig(BUNDLE_CONFIG).containerImage;
+  try {
+    assertSandboxAvailable(image);
+  } catch (error) {
+    if (process.env.HORIZON_REQUIRE_DOCKER === "1") throw error;
+    t.diagnostic(`container probe skipped: ${String(error)}`);
+    return;
+  }
+  assert.deepEqual((await probe("container", image)).outcomes, expected);
 });
 
 test("bundle-size mission runs baseline -> shrink-bundle -> holdout and reaches its target", async () => {

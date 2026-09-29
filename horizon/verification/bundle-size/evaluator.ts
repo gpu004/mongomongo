@@ -68,22 +68,30 @@ export function loadBundleScenarios(dir: string): BundleScenario[] {
     .map((name) => JSON.parse(readFileSync(join(dir, name), "utf8")) as BundleScenario);
 }
 
-/** Hash of every file that decides a bundle-size verdict. */
+const HORIZON_ROOT = new URL("../../", import.meta.url).pathname;
+
 /**
- * Identity of the bundle evaluator: its code, the reference, the report
- * schema and every fixed and held-out scenario under `root`.
+ * Identity of the bundle-size objective: every file that decides a verdict,
+ * i.e. this evaluator, the reference, the report schema, the objective's
+ * metric and task definition, the metric comparison semantics, the paired
+ * repetition verdict, and every fixed and held-out scenario under `horizonRoot`.
  */
-export function computeBundleEvaluatorHash(root = BUNDLE_VERIFICATION_DIR): string {
-  const files: [string, string][] = [
-    ["bundle-size/evaluator.ts", join(root, "evaluator.ts")],
-    ["bundle-size/reference.ts", join(root, "reference.ts")],
-    ["reports.ts", join(BUNDLE_VERIFICATION_DIR, "../reports.ts")],
+export function computeBundleEvaluatorHash(horizonRoot = HORIZON_ROOT): string {
+  const files = [
+    "verification/bundle-size/evaluator.ts",
+    "verification/bundle-size/reference.ts",
+    "verification/reports.ts",
+    "src/objectives/bundle-size.ts",
+    "src/objective-metric.ts",
+    "src/timing-policy.ts",
   ];
-  for (const dir of ["scenarios", "holdout"])
-    for (const name of readdirSync(join(root, dir)).sort())
-      if (name.endsWith(".json")) files.push([`bundle-size/${dir}/${name}`, join(root, dir, name)]);
+  for (const dir of ["verification/bundle-size/scenarios", "verification/bundle-size/holdout"])
+    for (const name of readdirSync(join(horizonRoot, dir)).sort())
+      if (name.endsWith(".json")) files.push(`${dir}/${name}`);
   return sha256(
-    files.map(([label, path]) => `${label}\n${readFileSync(path, "utf8")}`).join("\n---\n"),
+    files
+      .map((file) => `${file}\n${readFileSync(join(horizonRoot, file), "utf8")}`)
+      .join("\n---\n"),
   );
 }
 
@@ -147,27 +155,36 @@ export function checkSelfContained(snapshotDir: string): BundleViolation[] {
   return violations;
 }
 
-/** Runs inside the scenario process; the candidate cannot see the cases before they are called. */
+/**
+ * Runs inside the scenario process. The cases, result marker and entry are
+ * read into harness-private bindings and removed from the environment before
+ * the candidate is imported, so the candidate sees neither the cases before
+ * they are called nor the marker that authenticates the result line.
+ */
 const HARNESS = `
 const cases = JSON.parse(process.env.HORIZON_CASES);
+const marker = process.env.HORIZON_MARKER;
+const entry = process.env.HORIZON_ENTRY;
+for (const key of Object.keys(process.env)) if (key.startsWith("HORIZON_")) delete process.env[key];
 const out = [];
 let mod;
-try { mod = await import(process.env.HORIZON_ENTRY); } catch (e) { mod = {}; }
+try { mod = await import(entry); } catch (e) { mod = {}; }
 for (const c of cases) {
   const fn = mod[c.fn];
   if (typeof fn !== "function") { out.push({ ok: false, error: "MissingExport" }); continue; }
   try { out.push({ ok: true, value: await fn(...c.args) }); }
   catch (e) { out.push({ ok: false, error: e && typeof e.name === "string" ? e.name : "Error" }); }
 }
-process.stdout.write("\\n" + process.env.HORIZON_MARKER + JSON.stringify(out) + "\\n");
+process.stdout.write("\\n" + marker + JSON.stringify(out) + "\\n");
 `;
 
-interface CaseRun {
+export interface CaseRun {
   outcomes: CaseOutcome[] | null;
   detail: string;
 }
 
-function runCases(config: BundleRunConfig, cases: BundleCase[]): Promise<CaseRun> {
+/** Calls each case against the candidate in one fresh process (or container). */
+export function runBundleCases(config: BundleRunConfig, cases: BundleCase[]): Promise<CaseRun> {
   const marker = `HORIZON-RESULT-${randomUUID()}:`;
   const env = {
     HORIZON_CASES: JSON.stringify(cases),
@@ -255,7 +272,7 @@ async function runScenario(
   prefix: string,
   evidenceIds: string[],
 ): Promise<AssertionResult> {
-  const run = await runCases(config, scenario.cases);
+  const run = await runBundleCases(config, scenario.cases);
   const mismatches: { case: BundleCase; expected: CaseOutcome; observed: CaseOutcome | null }[] =
     [];
   scenario.cases.forEach((c, i) => {
