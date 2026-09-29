@@ -1,18 +1,23 @@
 import { sha256 } from "../verification/reports.ts";
 import type { LessonRow, LessonState } from "./ledger.ts";
+import { formatMetric, type ObjectiveMetric, P95_METRIC } from "./objective-metric.ts";
 
 export type PerformanceLessonKind = "performance_negative" | "performance_positive";
 
 /** Metric identifier recorded in `LessonRow.invariantId` for lessons about p95 rather than a correctness invariant. */
-export const PERFORMANCE_METRIC = "PERF-P95";
+export const PERFORMANCE_METRIC = P95_METRIC.lessonMetric;
 
-/** One measured outcome of trying a mechanism; every number points back to a committed report. */
+/**
+ * One measured outcome of trying a mechanism; every number points back to a committed report.
+ * `candidateP95Ms`/`comparedP95Ms` hold the mission metric's value; the names are the persisted
+ * format from the first (p95) objective.
+ */
 export interface PerformanceObservation {
   experimentId: string;
   episodeId: string;
   candidateP95Ms: number | null;
   comparedP95Ms: number | null;
-  /** (candidate - compared) / compared; negative is faster. Null when either side is unmeasured. */
+  /** (candidate - compared) / compared; negative is smaller. Null when either side is unmeasured. */
   deltaFraction: number | null;
   reportIds: string[];
   evidenceIds: string[];
@@ -30,6 +35,8 @@ export interface PerformanceLesson {
   hypothesis: string;
   featureIds: string[];
   observations: PerformanceObservation[];
+  /** `ObjectiveMetric.lessonMetric` the observations measure; PERF-P95 when absent. */
+  metric?: string;
 }
 
 /** Mission-scoped: the lesson table is keyed by `lessonId` alone on every backend, so two missions trying one mechanism must not share a row. */
@@ -42,12 +49,15 @@ export function performanceLessonId(
   return `${prefix}-${sha256(`${missionId}\n${mechanism}`).slice(0, 12)}`;
 }
 
-export function isPerformanceLesson(row: LessonRow): boolean {
-  return row.invariantId === PERFORMANCE_METRIC;
+export function isPerformanceLesson(row: LessonRow, metric: ObjectiveMetric = P95_METRIC): boolean {
+  return row.invariantId === metric.lessonMetric;
 }
 
-export function decodePerformanceLesson(row: LessonRow): PerformanceLesson | undefined {
-  if (!isPerformanceLesson(row) || !row.proposal) return undefined;
+export function decodePerformanceLesson(
+  row: LessonRow,
+  metric: ObjectiveMetric = P95_METRIC,
+): PerformanceLesson | undefined {
+  if (!isPerformanceLesson(row, metric) || !row.proposal) return undefined;
   const parsed = JSON.parse(row.proposal) as PerformanceLesson;
   return { ...parsed, lessonId: row.lessonId };
 }
@@ -66,7 +76,7 @@ export function encodePerformanceLesson(missionId: string, lesson: PerformanceLe
     lessonId: lesson.lessonId,
     missionId,
     sourceEpisodeIds: [...new Set(lesson.observations.map((o) => o.episodeId))],
-    invariantId: PERFORMANCE_METRIC,
+    invariantId: lesson.metric ?? PERFORMANCE_METRIC,
     state,
     proposal: JSON.stringify(lesson),
     positiveEvidenceId: lesson.kind === "performance_positive" ? evidenceId : null,
@@ -97,8 +107,8 @@ export function deltaFraction(
 }
 
 /**
- * A PERF-P95 lesson requires two comparable measurements. A failed performance
- * suite (resource limit, correctness under load, missing p95) is not a p95 verdict
+ * A performance lesson requires two comparable measurements. A failed performance
+ * suite (resource limit, correctness under load, missing metric) is not a metric verdict
  * and must not count toward the mechanism's rejection tally.
  */
 export function isMeasuredP95Comparison(
@@ -118,6 +128,8 @@ export function recordPerformanceObservation(
     hypothesis: string;
     featureIds: string[];
     observation: PerformanceObservation;
+    /** Lesson metric id; omitted for PERF-P95 so p95 lessons keep their persisted shape. */
+    metric?: string;
   },
 ): PerformanceLesson {
   const base: PerformanceLesson = existing ?? {
@@ -127,6 +139,7 @@ export function recordPerformanceObservation(
     hypothesis: input.hypothesis,
     featureIds: [],
     observations: [],
+    ...(input.metric && input.metric !== PERFORMANCE_METRIC ? { metric: input.metric } : {}),
   };
   if (base.observations.some((o) => o.experimentId === input.observation.experimentId)) return base;
   return {
@@ -155,34 +168,53 @@ export interface PerformancePolicy {
   limit: number;
 }
 
-function bestDelta(lesson: PerformanceLesson): number | null {
-  const deltas = lesson.observations
+/** Deltas oriented so that smaller is better in the metric's direction. */
+function orientedDeltas(lesson: PerformanceLesson, metric: ObjectiveMetric): number[] {
+  const sign = metric.direction === "minimize" ? 1 : -1;
+  return lesson.observations
     .map((o) => o.deltaFraction)
-    .filter((d): d is number => d !== null);
-  return deltas.length > 0 ? Math.min(...deltas) : null;
+    .filter((d): d is number => d !== null)
+    .map((d) => d * sign);
 }
 
-function worstDelta(lesson: PerformanceLesson): number {
-  const deltas = lesson.observations
-    .map((o) => o.deltaFraction)
-    .filter((d): d is number => d !== null);
+function bestDelta(lesson: PerformanceLesson, metric: ObjectiveMetric): number | null {
+  const deltas = orientedDeltas(lesson, metric);
+  if (deltas.length === 0) return null;
+  const best = Math.min(...deltas);
+  return metric.direction === "minimize" ? best : -best;
+}
+
+function bestOriented(lesson: PerformanceLesson, metric: ObjectiveMetric): number {
+  const deltas = orientedDeltas(lesson, metric);
+  return deltas.length > 0 ? Math.min(...deltas) : 0;
+}
+
+function worstOriented(lesson: PerformanceLesson, metric: ObjectiveMetric): number {
+  const deltas = orientedDeltas(lesson, metric);
   return deltas.length > 0 ? Math.max(...deltas) : 0;
 }
 
 /** Ranks lessons for a packet: positives by largest improvement, negatives by rejections then worst regression. */
-export function rankPerformanceLessons(lessons: PerformanceLesson[]): PerformanceLesson[] {
+export function rankPerformanceLessons(
+  lessons: PerformanceLesson[],
+  metric: ObjectiveMetric = P95_METRIC,
+): PerformanceLesson[] {
   return [...lessons].sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "performance_positive" ? -1 : 1;
-    if (a.kind === "performance_positive") return (bestDelta(a) ?? 0) - (bestDelta(b) ?? 0);
-    return b.observations.length - a.observations.length || worstDelta(b) - worstDelta(a);
+    if (a.kind === "performance_positive") return bestOriented(a, metric) - bestOriented(b, metric);
+    return (
+      b.observations.length - a.observations.length ||
+      worstOriented(b, metric) - worstOriented(a, metric)
+    );
   });
 }
 
 export function decidePerformancePolicy(
   lessons: PerformanceLesson[],
   limit: number,
+  metric: ObjectiveMetric = P95_METRIC,
 ): PerformancePolicy {
-  const ranked = rankPerformanceLessons(lessons);
+  const ranked = rankPerformanceLessons(lessons, metric);
   return {
     blockedMechanisms: ranked
       .filter((l) => l.kind === "performance_negative" && l.observations.length >= limit)
@@ -197,7 +229,7 @@ export function decidePerformancePolicy(
       .map((l) => ({
         lessonId: l.lessonId,
         mechanism: l.mechanism,
-        deltaFraction: bestDelta(l),
+        deltaFraction: bestDelta(l, metric),
       })),
     focusFeatureIds: [
       ...new Set(
@@ -216,21 +248,22 @@ function percent(delta: number | null): string {
 export function renderPerformanceLessons(
   lessons: PerformanceLesson[],
   policy: PerformancePolicy,
+  metric: ObjectiveMetric = P95_METRIC,
 ): string {
   if (lessons.length === 0) return "(none)";
   const blocked = new Set(policy.blockedMechanisms.map((b) => b.lessonId));
-  return rankPerformanceLessons(lessons)
+  return rankPerformanceLessons(lessons, metric)
     .map((lesson, i) => {
       const label = lesson.kind === "performance_positive" ? "POSITIVE" : "NEGATIVE";
       const obs = lesson.observations
         .map(
           (o) =>
-            `    ${o.experimentId}: p95 ${o.candidateP95Ms ?? "n/a"}ms vs ${o.comparedP95Ms ?? "n/a"}ms (${percent(o.deltaFraction)})${o.profiled ? ", profiled" : ""}; evidence ${o.evidenceIds.slice(0, 3).join(", ") || "-"}; reports ${o.reportIds.slice(0, 3).join(", ") || "-"}`,
+            `    ${o.experimentId}: ${formatMetric(o.candidateP95Ms, metric)} vs ${o.comparedP95Ms ?? "n/a"}${metric.unit} (${percent(o.deltaFraction)})${o.profiled ? ", profiled" : ""}; evidence ${o.evidenceIds.slice(0, 3).join(", ") || "-"}; reports ${o.reportIds.slice(0, 3).join(", ") || "-"}`,
         )
         .join("\n");
       const verdict =
         lesson.kind === "performance_positive"
-          ? `accepted; best delta ${percent(bestDelta(lesson))}`
+          ? `accepted; best delta ${percent(bestDelta(lesson, metric))}`
           : `rejected ${lesson.observations.length}x on measurement${blocked.has(lesson.lessonId) ? `; BLOCKED (limit ${policy.limit}): profile first or choose a different mechanism` : ""}`;
       return `${i + 1}. [${label}] ${lesson.lessonId} mechanism "${lesson.hypothesis}" (${verdict}); features ${lesson.featureIds.join(", ") || "-"}\n${obs}`;
     })

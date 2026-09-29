@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "holdout-unicode-text",
+  "description": "Word counting, slugs and title case on non-Latin and compatibility characters.",
+  "suite": "holdout",
+  "invariantIds": ["TK-WORD-COUNT", "TK-SLUG-DIACRITICS", "TK-TITLE-CASE"],
+  "cases": [
+    {
+      "fn": "wordCount",
+      "args": ["日本語 テキスト"]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["Ελληνικά κείμενα εδώ"]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["emoji 😀 are not words"]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["١٢٣ arabic digits"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["Ärger über Öl"]
+    },
+    {
+      "fn": "slugify",
+      "args": ["Ｆｕｌｌｗｉｄｔｈ Ｔｅｘｔ"]
+    },
+    {
+      "fn": "titleCase",
+      "args": ["ÇA VA"]
+    },
+    {
+      "fn": "titleCase",
+      "args": ["straße im winter"]
+    }
+  ]
+}

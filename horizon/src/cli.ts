@@ -6,14 +6,10 @@ import { parseArgs } from "node:util";
 import type { Suite } from "../verification/reports.ts";
 import {
   computeEnvironmentHash,
-  computeEvaluatorHash,
   environmentFingerprint,
   hashDirectory,
-  runSuite,
 } from "../verification/runner.ts";
-import { loadScenarios } from "../verification/scenarios/index.ts";
-import { checkImportBoundaries } from "../verification/structural.ts";
-import { ArtifactStore, SEED_DIR } from "./artifact-store.ts";
+import { ArtifactStore } from "./artifact-store.ts";
 import { compareConfigurations, renderComparison } from "./compare.ts";
 import {
   BaselineError,
@@ -35,6 +31,7 @@ import {
   loadMissionConfig,
   type MissionConfig,
 } from "./mission-contract.ts";
+import { missionSpecFor, missionSpecIds, findMissionSpec } from "./objectives/index.ts";
 import { FileEvidenceStore, missionPaths, RUNS_ROOT } from "./mission-paths.ts";
 import { clearControl, readControl, writeControl } from "./operator-control.ts";
 import { PiWorker, resolveProviderApiKey } from "./pi-worker.ts";
@@ -59,7 +56,7 @@ const USAGE = `horizon <command> [options]
   pause --mission M                        like stop, but the mission stays paused until \`resume\`
   verify --mission M --artifact A --suite smoke|correctness|performance|holdout|learned|structural
   profile --mission M --scenario search-read-heavy [--artifact A]
-  features check --artifact A|--dir DIR    structural import-boundary check + feature-map reference check
+  features check --artifact A|--dir DIR [--config C]  objective structural check + feature-map reference check
   inspect --mission M                      progress view
   export --mission M                       write exports/summary.{json,md}
   live-gate --mission M                    check the run against the plan.md live-mission criteria; write exports/live-gate.{json,md}
@@ -159,7 +156,7 @@ function driftNotes(manifest: MissionManifest): string[] {
     notes.push(
       `amendment ${manifest.pendingAmendment.amendmentId} pending: resume adopts it if the ledger holds it, else discards it`,
     );
-  const evaluator = computeEvaluatorHash();
+  const evaluator = missionSpecFor(config).evaluator.hash();
   notes.push(
     evaluator === manifest.evaluatorHash
       ? `evaluator ${evaluator.slice(0, 12)} matches`
@@ -178,13 +175,15 @@ function driftNotes(manifest: MissionManifest): string[] {
 }
 
 function makeWorker(config: MissionConfig, paths: ReturnType<typeof missionPaths>): Worker {
-  if (config.worker === "scripted") return new ScriptedWorker();
+  const spec = missionSpecFor(config);
+  if (config.worker === "scripted") return spec.scriptedWorker();
   const { apiKey } = resolveProviderApiKey(config.model.provider, process.env);
   return new PiWorker({
     workspaceDir: paths.candidate,
     agentDir: join(paths.root, "pi-agent"),
     sessionsDir: paths.sessions,
-    skillsDir: join(RESOURCES_DIR, "skills"),
+    skillsDir: spec.skillsDir,
+    objectivePrompt: spec.workerPrompt,
     provider: config.model.provider,
     modelId: config.model.id,
     compactionThreshold: 0.7,
@@ -233,13 +232,22 @@ async function main(): Promise<number> {
           }
         })(),
       ]);
-      checks.push([
-        "seed",
-        existsSync(join(SEED_DIR, "src/http/server.ts"))
-          ? `ok ${hashDirectory(SEED_DIR).hash.slice(0, 12)}`
-          : "missing",
-      ]);
-      checks.push(["evaluatorHash", computeEvaluatorHash().slice(0, 16)]);
+      for (const id of missionSpecIds()) {
+        const spec = findMissionSpec(id)!;
+        checks.push([
+          `objective ${id}`,
+          `${spec.metric.key} (${spec.metric.direction}); tasks ${Object.values(spec.tasks)
+            .map((t) => t.taskId)
+            .join(" -> ")}`,
+        ]);
+        checks.push([
+          `seed ${id}`,
+          existsSync(join(spec.seedDir, "src"))
+            ? `ok ${hashDirectory(spec.seedDir).hash.slice(0, 12)}`
+            : "missing",
+        ]);
+        checks.push([`evaluatorHash ${id}`, spec.evaluator.hash().slice(0, 16)]);
+      }
       checks.push([
         "environmentHash(subprocess)",
         computeEnvironmentHash("subprocess", "").slice(0, 16),
@@ -373,21 +381,16 @@ async function main(): Promise<number> {
         const hash = values.artifact ?? mission?.bestArtifactHash;
         if (!hash || !artifacts.verify(hash))
           throw new Error(`artifact ${hash ?? "(none)"} not found or corrupt`);
-        const report = await runSuite(
+        const spec = missionSpecFor(config);
+        const report = await spec.evaluator.run(
           {
             missionId: config.missionId,
             experimentId: `cli-${command}-${Date.now()}`,
             artifactHash: hash,
-            evaluatorHash: computeEvaluatorHash(),
+            evaluatorHash: spec.evaluator.hash(),
             environmentHash: computeEnvironmentHash(config.isolation, config.containerImage),
             snapshotDir: artifacts.pathFor(hash),
-            isolation: config.isolation,
-            containerImage: config.containerImage,
-            startupTimeoutMs: config.startupTimeoutMs,
-            requestTimeoutMs: config.requestTimeoutMs,
-            memoryLimitBytes: config.memoryLimitBytes,
-            workload: config.workload,
-            holdoutWorkload: config.holdoutWorkload,
+            config,
             learnedScenariosDir: paths.learnedScenarios,
             evidence: new FileEvidenceStore(paths.evidence),
           },
@@ -416,16 +419,19 @@ async function main(): Promise<number> {
     }
     case "features": {
       if (sub !== "check") throw new Error(USAGE);
+      let config = values.config ? loadMissionConfig(resolve(values.config)) : undefined;
       let dir = values.dir ? resolve(values.dir) : undefined;
       if (!dir && values.artifact) {
-        const { paths } = loadMission();
-        dir = new ArtifactStore(paths.artifacts).pathFor(values.artifact);
+        const mission = loadMission();
+        config = mission.config;
+        dir = new ArtifactStore(mission.paths.artifacts).pathFor(values.artifact);
       }
-      if (!dir) dir = SEED_DIR;
-      const violations = checkImportBoundaries(join(dir, "src"));
+      const spec = missionSpecFor(config ?? {});
+      if (!dir) dir = spec.seedDir;
+      const violations = spec.structuralViolations(dir);
       const featureMapIssues = validateFeatureMap(
-        loadFeatureMap(join(RESOURCES_DIR, "features.json")),
-        loadScenarios(),
+        loadFeatureMap(spec.featuresPath),
+        spec.scenarios(),
         dir,
       );
       log(

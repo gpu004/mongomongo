@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "title-case",
+  "description": "Text lowercases, then the first character after start or whitespace uppercases; whitespace is preserved.",
+  "suite": "correctness",
+  "invariantIds": ["TK-TITLE-CASE"],
+  "cases": [
+    {
+      "fn": "titleCase",
+      "args": ["hello world"]
+    },
+    {
+      "fn": "titleCase",
+      "args": ["HELLO   WORLD"]
+    },
+    {
+      "fn": "titleCase",
+      "args": ["  spaced\tout words "]
+    },
+    {
+      "fn": "titleCase",
+      "args": ["o'neil and mcdonald"]
+    },
+    {
+      "fn": "titleCase",
+      "args": ["ÉCOLE élémentaire"]
+    },
+    {
+      "fn": "titleCase",
+      "args": [""]
+    }
+  ]
+}

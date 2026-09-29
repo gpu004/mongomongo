@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "smoke-api-round-trip",
+  "description": "Every exported helper answers one plain ASCII call.",
+  "suite": "smoke",
+  "invariantIds": ["TK-API"],
+  "cases": [
+    {
+      "fn": "slugify",
+      "args": ["Hello World"]
+    },
+    {
+      "fn": "titleCase",
+      "args": ["hello world"]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["two words"]
+    },
+    {
+      "fn": "truncate",
+      "args": ["short", 10]
+    }
+  ]
+}

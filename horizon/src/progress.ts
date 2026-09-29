@@ -1,6 +1,8 @@
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { MissionConfig } from "./mission-contract.ts";
+import { type MissionConfig, targetImprovementOf } from "./mission-contract.ts";
+import { improvedBound, reaches } from "./objective-metric.ts";
+import { missionSpecFor } from "./objectives/index.ts";
 import type {
   ExperimentRow,
   LessonRow,
@@ -20,6 +22,8 @@ export interface MissionSummary {
     requiredP95Ms: number | null;
     bestP95Ms: number | null;
     reached: boolean;
+    /** The objective metric the `*P95Ms` fields hold (named after the first objective). */
+    metric: { key: string; label: string; unit: string; direction: string };
   };
   tasks: TaskRow[];
   experiments: ExperimentRow[];
@@ -40,9 +44,13 @@ export async function summarize(
 ): Promise<MissionSummary> {
   const mission = await ledger.getMission(config.missionId);
   const verifications = await ledger.listVerifications(config.missionId);
+  const spec = missionSpecFor(config);
+  const { metric } = spec;
+  const target = targetImprovementOf(config);
   const required =
-    mission?.baselineP95Ms != null ? mission.baselineP95Ms * (1 - config.targetP95Reduction) : null;
-  const reached = required !== null && mission?.bestP95Ms != null && mission.bestP95Ms <= required;
+    mission?.baselineP95Ms != null ? improvedBound(mission.baselineP95Ms, target, metric) : null;
+  const reached =
+    required !== null && mission?.bestP95Ms != null && reaches(mission.bestP95Ms, required, metric);
   const outbox: Record<string, number> = {};
   for (const row of await ledger.listOutbox()) outbox[row.state] = (outbox[row.state] ?? 0) + 1;
   const observedIsolation = [
@@ -55,15 +63,15 @@ export async function summarize(
   const unmet: string[] = [];
   if (!reached)
     unmet.push(
-      `target p95 reduction ${config.targetP95Reduction * 100}% not reached (best ${mission?.bestP95Ms ?? "n/a"}ms vs required ${required?.toFixed(2) ?? "n/a"}ms)`,
+      `target ${metric.label} ${metric.direction === "minimize" ? "reduction" : "increase"} ${target * 100}% not reached (best ${mission?.bestP95Ms ?? "n/a"}${metric.unit} vs required ${required?.toFixed(2) ?? "n/a"}${metric.unit})`,
     );
-  if (tasks.find((t) => t.taskId === "holdout")?.status !== "done")
+  if (tasks.find((t) => t.taskId === spec.tasks.holdout.taskId)?.status !== "done")
     unmet.push("holdout not passed on the chosen artifact");
   if (config.isolation === "container" && observedIsolation.some((i) => i !== "container"))
     unmet.push("some verifications ran under weaker subprocess isolation");
   if (config.isolation === "subprocess")
     unmet.push("isolation is cooperative subprocess mode, not the container target");
-  if (lessons.filter((l) => l.state === "materialized").length === 0)
+  if (spec.regressions && lessons.filter((l) => l.state === "materialized").length === 0)
     unmet.push("no correction materialized as a learned regression yet");
   if ((outbox.pending ?? 0) + (outbox.failed ?? 0) + (outbox.submitted ?? 0) > 0)
     unmet.push("memory delivery incomplete for some episodes");
@@ -73,6 +81,12 @@ export async function summarize(
       baselineP95Ms: mission?.baselineP95Ms ?? null,
       requiredP95Ms: required,
       bestP95Ms: mission?.bestP95Ms ?? null,
+      metric: {
+        key: metric.key,
+        label: metric.label,
+        unit: metric.unit,
+        direction: metric.direction,
+      },
       reached,
     },
     tasks,
@@ -106,7 +120,7 @@ export function renderProgress(s: MissionSummary): string {
     `Mission ${m.missionId}  status=${m.status}  contract=${m.contractHash.slice(0, 12)} evaluator=${m.evaluatorHash.slice(0, 12)} env=${m.environmentHash.slice(0, 12)}`,
   );
   lines.push(
-    `Goal: baseline p95 ${fmt(s.target.baselineP95Ms)} -> required ${fmt(s.target.requiredP95Ms)}; best ${fmt(s.target.bestP95Ms)} (${(m.bestArtifactHash ?? "").slice(0, 12)}) ${s.target.reached ? "REACHED" : "not reached"}; frozen acceptance margin ${m.frozenAcceptanceMargin ?? "n/a"}`,
+    `Goal: baseline ${s.target.metric.label} ${fmt(s.target.baselineP95Ms, s.target.metric.unit)} -> required ${fmt(s.target.requiredP95Ms, s.target.metric.unit)}; best ${fmt(s.target.bestP95Ms, s.target.metric.unit)} (${(m.bestArtifactHash ?? "").slice(0, 12)}) ${s.target.reached ? "REACHED" : "not reached"}; frozen acceptance margin ${m.frozenAcceptanceMargin ?? "n/a"}`,
   );
   lines.push(
     `Budget: experiments ${m.spentExperiments}, tokens in/out ${m.spentInputTokens}/${m.spentOutputTokens}${m.usageUncertain ? " (estimated)" : ""}, memory ops ${m.spentMemoryOperations}, wall ${(m.spentWallMs / 1000).toFixed(0)}s`,
@@ -148,8 +162,8 @@ export function renderProgress(s: MissionSummary): string {
   return lines.join("\n");
 }
 
-function fmt(v: number | null): string {
-  return v === null ? "n/a" : `${v.toFixed(2)}ms`;
+function fmt(v: number | null, unit: string): string {
+  return v === null ? "n/a" : `${v.toFixed(2)}${unit}`;
 }
 
 /** Writes summary.json and summary.md into exports/; reports and evidence are referenced by path, not copied. */

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "holdout-truncate-code-points",
+  "description": "Truncation counts code points, so astral characters are never split.",
+  "suite": "holdout",
+  "invariantIds": ["TK-TRUNCATE-CODE-POINTS"],
+  "cases": [
+    {
+      "fn": "truncate",
+      "args": ["😀😃😄😁😆", 3]
+    },
+    {
+      "fn": "truncate",
+      "args": ["naïve café 👩‍💻 code", 12]
+    },
+    {
+      "fn": "truncate",
+      "args": ["𝒜𝒷𝒸𝒹", 2]
+    },
+    {
+      "fn": "truncate",
+      "args": ["🎉", 1]
+    }
+  ]
+}

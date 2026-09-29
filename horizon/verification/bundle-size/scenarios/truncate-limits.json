@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "truncate-limits",
+  "description": "Text that fits is unchanged, longer text is cut to max code points including the ellipsis, invalid limits throw RangeError.",
+  "suite": "correctness",
+  "invariantIds": ["TK-TRUNCATE", "TK-TRUNCATE-RANGE"],
+  "cases": [
+    {
+      "fn": "truncate",
+      "args": ["short", 10]
+    },
+    {
+      "fn": "truncate",
+      "args": ["exactly twelve", 14]
+    },
+    {
+      "fn": "truncate",
+      "args": ["truncate me please", 10]
+    },
+    {
+      "fn": "truncate",
+      "args": ["abc", 0]
+    },
+    {
+      "fn": "truncate",
+      "args": ["abc", 1]
+    },
+    {
+      "fn": "truncate",
+      "args": ["abc", 3]
+    },
+    {
+      "fn": "truncate",
+      "args": ["abc", -1]
+    },
+    {
+      "fn": "truncate",
+      "args": ["abc", 1.5]
+    }
+  ]
+}

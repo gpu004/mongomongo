@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { canonicalJson, sha256 } from "../verification/reports.ts";
 import type { WorkloadSpec } from "../verification/workloads/index.ts";
+import { DEFAULT_MISSION_SPEC, findMissionSpec, missionSpecIds } from "./objectives/index.ts";
 import { isDigestPinnedImage } from "./sandbox.ts";
 
 /**
@@ -12,20 +13,28 @@ export interface MissionConfig {
   missionId: string;
   contractVersion: number;
   objective: string;
-  /** Relative p95 reduction required against the original seed baseline, e.g. 0.3. */
-  targetP95Reduction: number;
+  /**
+   * Objective plugin (`MissionSpec.id`, see `src/objectives/`). Omitted means
+   * `search-p95`, so configs written before objectives were pluggable keep their contract hash.
+   */
+  missionSpec?: string;
+  /** Relative improvement of the objective's metric required against the original seed baseline, e.g. 0.3. */
+  targetImprovement?: number;
+  /** search-p95's name for `targetImprovement`: relative p95 reduction against the seed baseline. */
+  targetP95Reduction?: number;
   /** Fractional improvement over the current best required to accept, floor 0.05. */
   acceptanceMargin: number;
   /**
    * Baseline repetition spread at or above which the mission is blocked before optimization
-   * instead of raising the frozen margin. Defaults to `targetP95Reduction`: noise as large as
+   * instead of raising the frozen margin. Defaults to the target improvement: noise as large as
    * the target cannot distinguish a useful change.
    */
   maxRepetitionSpread?: number;
   /** Of the paired repetitions, how many must improve (e.g. 4 of 5). */
   requiredImprovedRepetitions: number;
-  workload: WorkloadSpec;
-  holdoutWorkload: WorkloadSpec;
+  /** search-p95 only: fixed read-heavy workload and the held-out workload that must differ from it. */
+  workload?: WorkloadSpec;
+  holdoutWorkload?: WorkloadSpec;
   isolation: "container" | "subprocess";
   /** Sandbox image, pinned by digest (`repo@sha256:...`) when isolation is "container". */
   containerImage: string;
@@ -97,13 +106,10 @@ export function validateMissionConfig(value: unknown): MissionConfig {
     fail("missionId must be a lowercase slug");
   positiveInteger("contractVersion", c.contractVersion);
   if (typeof c.objective !== "string") fail("objective required");
-  if (
-    typeof c.targetP95Reduction !== "number" ||
-    !Number.isFinite(c.targetP95Reduction) ||
-    c.targetP95Reduction <= 0 ||
-    c.targetP95Reduction >= 1
-  )
-    fail("targetP95Reduction must be in (0,1)");
+  if (c.missionSpec !== undefined && typeof c.missionSpec !== "string")
+    fail("missionSpec must be a string");
+  const spec = findMissionSpec(c.missionSpec ?? DEFAULT_MISSION_SPEC);
+  if (!spec) fail(`unknown missionSpec ${c.missionSpec}; known: ${missionSpecIds().join(", ")}`);
   if (
     typeof c.acceptanceMargin !== "number" ||
     !Number.isFinite(c.acceptanceMargin) ||
@@ -120,12 +126,10 @@ export function validateMissionConfig(value: unknown): MissionConfig {
   )
     fail("maxRepetitionSpread must be in (0,1]");
   positiveInteger("requiredImprovedRepetitions", c.requiredImprovedRepetitions);
-  if (!c.workload || !c.holdoutWorkload) fail("workload and holdoutWorkload required");
-  if (c.workload!.repetitions < 2) fail("workload.repetitions must be >= 2");
-  if (c.requiredImprovedRepetitions! > c.workload!.repetitions)
+  const [problem] = spec!.validateConfig(c);
+  if (problem !== undefined) fail(problem);
+  if (c.requiredImprovedRepetitions! > spec!.repetitions(c))
     fail("requiredImprovedRepetitions exceeds repetitions");
-  if (canonicalJson(c.workload) === canonicalJson(c.holdoutWorkload))
-    fail("holdoutWorkload must differ from workload");
   if (c.isolation !== "container" && c.isolation !== "subprocess")
     fail("isolation must be container|subprocess");
   if (typeof c.containerImage !== "string")
@@ -202,6 +206,14 @@ export function validateMissionConfig(value: unknown): MissionConfig {
   )
     fail("ledger.backend must be sqlite|mongodb");
   return c as MissionConfig;
+}
+
+/** The relative target improvement, under whichever field name the mission's objective uses. */
+export function targetImprovementOf(config: MissionConfig): number {
+  const target = config.targetImprovement ?? config.targetP95Reduction;
+  if (target === undefined)
+    throw new Error(`mission ${config.missionId} has no target improvement`);
+  return target;
 }
 
 /**

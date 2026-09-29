@@ -14,6 +14,7 @@ import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { type TSchema, Type } from "typebox";
 import type { Operation } from "../verification/reference-model.ts";
 import type { Suite } from "../verification/reports.ts";
+import { SEARCH_P95 } from "./objectives/search-p95.ts";
 import type { ToolBroker } from "./tool-broker.ts";
 import {
   providerApiKeyEnv,
@@ -32,6 +33,8 @@ export interface PiWorkerOptions {
   agentDir: string;
   sessionsDir: string;
   skillsDir: string;
+  /** Objective paragraph of the system prompt (`MissionSpec.workerPrompt`); search-p95's when omitted. */
+  objectivePrompt?: string;
   provider: string;
   modelId: string;
   apiKey?: string;
@@ -53,15 +56,18 @@ export function resolveProviderApiKey(
   return { apiKey: found ? env[found] : undefined, envKeys };
 }
 
-const SYSTEM_PROMPT = `You are the Horizon worker for one bounded optimization mission on a small TypeScript document-search service.
+/** The host-enforced part of the system prompt, shared by every objective. */
+export function systemPrompt(objectivePrompt: string = SEARCH_P95.workerPrompt): string {
+  return `You are the Horizon worker for one bounded optimization mission.
+
+${objectivePrompt}
 
 Rules that are enforced by the host, not by you:
 - You can only read, search and edit files under src/ of the candidate workspace, and run a small allowlist of commands there.
 - You cannot change verification, scenarios, the reference model or the mission. The host judges every artifact independently; your own assessment is never authoritative.
-- Correctness comes before speed. The frozen contract (NFC normalization, lowercase, whitespace-split terms, every term a substring of title+" "+body, insertion order, limit after ordering, mutations visible immediately) must hold.
-- Mutations must go through the DocumentService entry point; the HTTP layer must not touch storage directly.
 
 Work in small steps: read what you need, make one bounded change, run verify_candidate with suite "smoke" then "correctness", and stop when the change is verified or you have learned why it fails. Use recall_history before repeating an approach. When you find a failure that the fixed suites missed, call propose_regression with an operation sequence and the invariant it protects. Finish each turn with a short plain-text summary: hypothesis, what changed, what the verifier said.`;
+}
 
 /**
  * Pi coding agent driven through the public SDK. Built-in tools are disabled;
@@ -114,7 +120,7 @@ export class PiWorker implements Worker {
       noContextFiles: true,
       noSkills: true,
       additionalSkillPaths: [this.options.skillsDir],
-      systemPrompt: SYSTEM_PROMPT,
+      systemPrompt: systemPrompt(this.options.objectivePrompt),
       extensionFactories: [
         { name: "horizon-context", factory: (pi) => this.registerContextExtension(pi) },
       ],

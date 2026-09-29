@@ -11,12 +11,10 @@ import {
 } from "../verification/reports.ts";
 import type { ContainerRegistry } from "../verification/candidate-process.ts";
 import {
-  computeEvaluatorHash,
   type EnvironmentFingerprint,
   environmentFingerprint,
   hashEnvironment,
   type HostRuntime,
-  runSuite,
 } from "../verification/runner.ts";
 import { loadScenarios, type Scenario } from "../verification/scenarios/index.ts";
 import { ArtifactStore } from "./artifact-store.ts";
@@ -58,7 +56,18 @@ import {
   type MissionConfig,
   operatingOf,
   planAmendment,
+  targetImprovementOf,
 } from "./mission-contract.ts";
+import { type MissionSpec, type TaskSeed, taskSeeds } from "./mission-spec.ts";
+import {
+  formatMetric,
+  improvedBound,
+  metricSeries,
+  metricValue,
+  type ObjectiveMetric,
+  reaches,
+} from "./objective-metric.ts";
+import { missionSpecFor } from "./objectives/index.ts";
 import {
   decidePerformancePolicy,
   decodePerformanceLesson,
@@ -82,7 +91,6 @@ import {
 import { type ContainerRuntime, recover, type RecoveryOutcome } from "./recovery.ts";
 import { retainedArtifactHashes } from "./retention.ts";
 import { assertSandboxAvailable, cleanupOrphanContainers } from "./sandbox.ts";
-import { ScriptedWorker } from "./scripted-worker.ts";
 import { archiveSession, removeArchivedSession } from "./session-archive.ts";
 import { type BrokerHooks, type ExecSandbox, ToolBroker } from "./tool-broker.ts";
 import {
@@ -236,7 +244,7 @@ export function normalizeHypothesis(text: string): string {
 }
 
 export interface StagnationState {
-  /** Concluded optimize-search experiments since the last accepted one. */
+  /** Concluded optimize-task experiments since the last accepted one. */
   count: number;
   /** Normalized hypotheses tried during that run. */
   triedHypotheses: string[];
@@ -245,33 +253,6 @@ export interface StagnationState {
 
 /** Deterministic behavior suites whose failed report for an artifact can be reused across experiments. */
 const REUSABLE_FAILURE_SUITES = new Set<Suite>(["smoke", "correctness", "structural"]);
-
-const TASKS = [
-  {
-    taskId: "baseline",
-    ordinal: 1,
-    dependsOn: [] as string[],
-    hypothesis: "measure the seed",
-    completionCriteria: "seed passes correctness and has a valid performance report",
-    nextAction: "run fixed suites on the seed artifact",
-  },
-  {
-    taskId: "optimize-search",
-    ordinal: 2,
-    dependsOn: ["baseline"],
-    hypothesis: "reduce read-path p95",
-    completionCriteria: "best artifact p95 <= baseline * (1 - target)",
-    nextAction: "profile the seed read path and propose one bounded change",
-  },
-  {
-    taskId: "holdout",
-    ordinal: 3,
-    dependsOn: ["optimize-search"],
-    hypothesis: "best artifact generalizes",
-    completionCriteria: "holdout suite passes on the chosen artifact",
-    nextAction: "run holdout on the best artifact",
-  },
-];
 
 /**
  * Owns the mission loop. Every state transition is a ledger write before the
@@ -304,6 +285,9 @@ export class MissionController {
   private waitAbort: AbortController | undefined;
   /** Tool-call audit events are appended in order without blocking the broker; flushed before every transaction. */
   private toolEvents: Promise<void> = Promise.resolve();
+  /** Objective plugin selected by `config.missionSpec`; fixed for the mission's lifetime. */
+  readonly spec: MissionSpec;
+  private readonly tasks: TaskSeed[];
   readonly evaluatorHash: string;
   readonly environment: EnvironmentFingerprint;
   readonly environmentHash: string;
@@ -331,7 +315,9 @@ export class MissionController {
     this.containerRuntime = options.containerRuntime;
     this.sleep = options.sleep ?? abortableSleep;
     this.controlPollMs = options.controlPollMs ?? DEFAULT_CONTROL_POLL_MS;
-    this.evaluatorHash = computeEvaluatorHash();
+    this.spec = missionSpecFor(config);
+    this.tasks = taskSeeds(this.spec.tasks);
+    this.evaluatorHash = this.spec.evaluator.hash();
     this.environment = environmentFingerprint(
       config.isolation,
       config.containerImage,
@@ -344,7 +330,15 @@ export class MissionController {
       (config.memory.enabled && process.env.SUPERMEMORY_API_KEY
         ? new SupermemoryAdapter(process.env.SUPERMEMORY_API_KEY)
         : new LocalMemoryAdapter());
-    this.worker = options.worker ?? new ScriptedWorker();
+    this.worker = options.worker ?? this.spec.scriptedWorker();
+  }
+
+  private get metric(): ObjectiveMetric {
+    return this.spec.metric;
+  }
+
+  private get optimizeTaskId(): string {
+    return this.spec.tasks.optimize.taskId;
   }
 
   /** Frozen objective plus the operating parameters as last amended. */
@@ -435,7 +429,7 @@ export class MissionController {
     const ledger = await this.open();
     const existing = await ledger.getMission(this.config.missionId);
     if (existing) return existing;
-    const seed = this.artifacts.importSeed();
+    const seed = this.artifacts.importSeed(this.spec.seedDir);
     await ledger.transaction(async (tx) => {
       await tx.createMission({
         missionId: this.config.missionId,
@@ -459,7 +453,7 @@ export class MissionController {
         manifestHash: sha256(canonicalJson(seed.manifest)),
         createdAt: new Date().toISOString(),
       });
-      for (const task of TASKS)
+      for (const task of this.tasks)
         await tx.upsertTask({
           ...task,
           missionId: this.config.missionId,
@@ -742,12 +736,12 @@ export class MissionController {
           nextWakeAt: null,
         });
         await tx.upsertTask({
-          ...TASKS[0]!,
+          ...this.tasks[0]!,
           missionId: this.config.missionId,
           status: "pending",
         });
         await tx.upsertTask({
-          ...TASKS[2]!,
+          ...this.tasks[2]!,
           missionId: this.config.missionId,
           status: "pending",
         });
@@ -756,7 +750,13 @@ export class MissionController {
             bestArtifactHash: seed,
           });
         await tx.appendEvent(rebaselineKey, "evaluator.rebaselined", this.config.missionId, origin);
-        await this.checkpoint(tx, "ready", "baseline", null, `rebaselined:${rebaselineId}`);
+        await this.checkpoint(
+          tx,
+          "ready",
+          this.spec.tasks.baseline.taskId,
+          null,
+          `rebaselined:${rebaselineId}`,
+        );
       });
       this.syncManifest(await this.mission());
       this.log(
@@ -774,7 +774,7 @@ export class MissionController {
           await this.ledger.insertExperiment({
             experimentId,
             missionId: this.config.missionId,
-            taskId: "optimize-search",
+            taskId: this.optimizeTaskId,
             parentArtifactHash: seed,
             strategy: "rebaseline",
             hypothesis: "previous best still beats the seed under the new evaluator",
@@ -802,7 +802,7 @@ export class MissionController {
             ? firstComparison(
                 perf.metrics,
                 measured.bestP95Ms,
-                baselineReport?.metrics.repetitionP95Ms,
+                baselineReport ? metricSeries(baselineReport.metrics, this.metric) : undefined,
                 this.timingPolicy(measured),
               )
             : {
@@ -819,7 +819,7 @@ export class MissionController {
           if (retained)
             await tx.updateMission(this.config.missionId, {
               bestArtifactHash: previousBest,
-              bestP95Ms: perf?.metrics.p95LatencyMs ?? null,
+              bestP95Ms: (perf && metricValue(perf.metrics, this.metric)) ?? null,
             });
           await tx.appendEvent(
             `${experimentId}:remeasured`,
@@ -828,7 +828,7 @@ export class MissionController {
             {
               artifactHash: previousBest,
               retained,
-              p95: perf?.metrics.p95LatencyMs ?? null,
+              [this.metric.label]: (perf && metricValue(perf.metrics, this.metric)) ?? null,
               baselineP95Ms: measured.baselineP95Ms,
               reason: decision.reason,
             },
@@ -1014,11 +1014,11 @@ export class MissionController {
           break;
         }
         try {
-          if (task.taskId === "baseline") {
+          if (task.taskId === this.spec.tasks.baseline.taskId) {
             await this.runBaseline();
             continue;
           }
-          if (task.taskId === "holdout") {
+          if (task.taskId === this.spec.tasks.holdout.taskId) {
             await this.runHoldout();
             continue;
           }
@@ -1202,7 +1202,7 @@ export class MissionController {
         this.config.missionId,
         { reason: error.message, nextWakeAt },
       );
-      await this.checkpoint(tx, "waiting", "optimize-search", null, "waiting:provider");
+      await this.checkpoint(tx, "waiting", this.optimizeTaskId, null, "waiting:provider");
     });
     this.log(`mission waiting: ${error.message}; resume at or after ${nextWakeAt}`);
     return "waiting";
@@ -1275,7 +1275,7 @@ export class MissionController {
       await this.ledger.insertExperiment({
         experimentId,
         missionId: this.config.missionId,
-        taskId: "baseline",
+        taskId: this.spec.tasks.baseline.taskId,
         parentArtifactHash: seed,
         strategy: "baseline",
         hypothesis: "seed measurement",
@@ -1296,7 +1296,8 @@ export class MissionController {
     ]);
     const perf = reports.find((r) => r.suite === "performance");
     const allPassed = reports.every((r) => r.status === "passed");
-    if (!allPassed || !perf || perf.metrics.p95LatencyMs === undefined) {
+    const baseline = perf && metricValue(perf.metrics, this.metric);
+    if (!allPassed || !perf || baseline === undefined) {
       const infra = reports.find((r) => r.status === "infra_error" || r.status === "timeout");
       await this.ledger.updateExperiment(experimentId, {
         status: infra ? "inconclusive" : "rejected",
@@ -1313,17 +1314,18 @@ export class MissionController {
       );
       throw new BaselineError("baseline not established");
     }
-    const noise = repetitionSpread(perf.metrics.repetitionP95Ms);
+    const target = targetImprovementOf(this.config);
+    const noise = repetitionSpread(metricSeries(perf.metrics, this.metric));
     const floor = freezeAcceptanceMargin(
       this.config.acceptanceMargin,
       noise,
-      this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
+      this.config.maxRepetitionSpread ?? target,
     );
     if (floor.kind === "repair") {
       await this.transaction(async (tx) => {
         await tx.updateExperiment(experimentId, {
           status: "inconclusive",
-          verdict: `baseline p95 ${perf.metrics.p95LatencyMs}ms; ${floor.reason}`,
+          verdict: `baseline ${formatMetric(baseline, this.metric)}; ${floor.reason}`,
           finishedAt: new Date().toISOString(),
         });
         await tx.appendEvent(
@@ -1333,13 +1335,13 @@ export class MissionController {
           {
             repetitionSpread: noise,
             acceptanceMargin: this.config.acceptanceMargin,
-            maxRepetitionSpread: this.config.maxRepetitionSpread ?? this.config.targetP95Reduction,
+            maxRepetitionSpread: this.config.maxRepetitionSpread ?? target,
             reportId: perf.reportId,
           },
         );
       });
       this.log(
-        `baseline p95 ${perf.metrics.p95LatencyMs}ms; repetition spread ${(noise * 100).toFixed(1)}% too large to distinguish useful changes`,
+        `baseline ${formatMetric(baseline, this.metric)}; repetition spread ${(noise * 100).toFixed(1)}% too large to distinguish useful changes`,
       );
       await this.finish("blocked", floor.reason);
       throw new BaselineError("baseline noise exceeds the measurable range");
@@ -1347,17 +1349,17 @@ export class MissionController {
     await this.transaction(async (tx) => {
       await tx.updateExperiment(experimentId, {
         status: "accepted",
-        verdict: `baseline p95 ${perf.metrics.p95LatencyMs}ms`,
+        verdict: `baseline ${formatMetric(baseline, this.metric)}`,
         finishedAt: new Date().toISOString(),
       });
       await tx.updateMission(this.config.missionId, {
-        baselineP95Ms: perf.metrics.p95LatencyMs ?? null,
+        baselineP95Ms: baseline,
         frozenAcceptanceMargin: floor.acceptanceMargin,
-        bestP95Ms: perf.metrics.p95LatencyMs ?? null,
+        bestP95Ms: baseline,
         bestArtifactHash: seed,
       });
       await tx.upsertTask({
-        ...TASKS[0]!,
+        ...this.tasks[0]!,
         missionId: this.config.missionId,
         status: "done",
       });
@@ -1365,7 +1367,7 @@ export class MissionController {
         `baseline:${this.config.missionId}${suffix}`,
         "mission.baseline",
         this.config.missionId,
-        { p95: perf.metrics.p95LatencyMs, reportId: perf.reportId },
+        { [this.metric.label]: baseline, reportId: perf.reportId },
       );
       await tx.appendEvent(
         `target:${this.config.missionId}:assessed${suffix}`,
@@ -1376,14 +1378,16 @@ export class MissionController {
           acceptanceMargin: this.config.acceptanceMargin,
           frozenAcceptanceMargin: floor.acceptanceMargin,
           marginRaised: floor.raised,
-          targetP95Reduction: this.config.targetP95Reduction,
+          ...(this.config.targetP95Reduction !== undefined
+            ? { targetP95Reduction: this.config.targetP95Reduction }
+            : { targetImprovement: target }),
           marginCoversNoise: floor.acceptanceMargin >= noise,
         },
       );
-      await this.checkpoint(tx, "running", "optimize-search", null, "baseline-complete");
+      await this.checkpoint(tx, "running", this.optimizeTaskId, null, "baseline-complete");
     });
     this.log(
-      `baseline p95 ${perf.metrics.p95LatencyMs}ms (target <= ${(perf.metrics.p95LatencyMs! * (1 - this.config.targetP95Reduction)).toFixed(2)}ms; repetition spread ${(noise * 100).toFixed(1)}%)`,
+      `baseline ${formatMetric(baseline, this.metric)} (target ${this.metric.direction === "minimize" ? "<=" : ">="} ${improvedBound(baseline, target, this.metric).toFixed(2)}${this.metric.unit}; repetition spread ${(noise * 100).toFixed(1)}%)`,
     );
     if (floor.raised)
       this.log(
@@ -1397,6 +1401,7 @@ export class MissionController {
     return {
       acceptanceMargin: mission.frozenAcceptanceMargin ?? this.config.acceptanceMargin,
       requiredImprovedRepetitions: this.config.requiredImprovedRepetitions,
+      metric: this.metric,
     };
   }
 
@@ -1409,7 +1414,7 @@ export class MissionController {
       await this.ledger.insertExperiment({
         experimentId,
         missionId: this.config.missionId,
-        taskId: "holdout",
+        taskId: this.spec.tasks.holdout.taskId,
         parentArtifactHash: best,
         strategy: "holdout",
         hypothesis: "best generalizes",
@@ -1431,7 +1436,7 @@ export class MissionController {
         finishedAt: new Date().toISOString(),
       });
       await tx.upsertTask({
-        ...TASKS[2]!,
+        ...this.tasks[2]!,
         missionId: this.config.missionId,
         status: passed ? "done" : "pending",
       });
@@ -1458,7 +1463,7 @@ export class MissionController {
       await tx.insertExperiment({
         experimentId,
         missionId: this.config.missionId,
-        taskId: "optimize-search",
+        taskId: this.optimizeTaskId,
         parentArtifactHash: parent,
         strategy: this.worker.mode,
         hypothesis: "(pending worker)",
@@ -1467,13 +1472,13 @@ export class MissionController {
         segmentOrdinal: this.segmentOrdinal,
       });
       await tx.updateMission(this.config.missionId, {
-        activeTaskId: "optimize-search",
+        activeTaskId: this.optimizeTaskId,
         spentExperiments: mission.spentExperiments + 1,
       });
       await tx.appendEvent(`${experimentId}:planned`, "experiment.planned", experimentId, {
         parent,
       });
-      await this.checkpoint(tx, "running", "optimize-search", experimentId, "planned");
+      await this.checkpoint(tx, "running", this.optimizeTaskId, experimentId, "planned");
     });
 
     // Restore the workspace from the immutable parent so a crashed edit never leaks in.
@@ -1650,7 +1655,7 @@ export class MissionController {
         claimIssues: audit.issues,
         profiled: broker.profiles.length > 0,
       });
-      await this.checkpoint(tx, "running", "optimize-search", experimentId, "snapshot_ready");
+      await this.checkpoint(tx, "running", this.optimizeTaskId, experimentId, "snapshot_ready");
     });
     this.crash("snapshot_ready");
     const experiment = (await this.ledger.getExperiment(experimentId))!;
@@ -1761,7 +1766,8 @@ export class MissionController {
       );
     }
     const reports = [...gate, perf];
-    const bestReps = (await this.bestPerformanceReport(mission))?.metrics.repetitionP95Ms ?? [];
+    const bestReport = await this.bestPerformanceReport(mission);
+    const bestReps = (bestReport && metricSeries(bestReport.metrics, this.metric)) ?? [];
     let decision: TimingDecision = firstComparison(
       perf.metrics,
       mission.bestP95Ms,
@@ -1786,7 +1792,7 @@ export class MissionController {
               "performance_negative",
               story,
               reports,
-              accepted.metrics.p95LatencyMs ?? null,
+              metricValue(accepted.metrics, this.metric) ?? null,
               mission.bestP95Ms,
               decision.reason,
             )
@@ -1802,23 +1808,23 @@ export class MissionController {
         lesson,
       );
     }
-    const p95 = accepted.metrics.p95LatencyMs ?? null;
+    const value = metricValue(accepted.metrics, this.metric) ?? null;
     const lesson = await this.planPerformanceLesson(
       experiment,
       "performance_positive",
       story,
       reports,
-      p95,
+      value,
       mission.bestP95Ms,
       decision.reason,
     );
     await this.transaction(async (tx) => {
       await tx.updateMission(this.config.missionId, {
         bestArtifactHash: hash,
-        bestP95Ms: p95,
+        bestP95Ms: value,
       });
       await tx.appendEvent(`${experiment.experimentId}:accepted`, "artifact.accepted", hash, {
-        p95,
+        [this.metric.label]: value,
         previous: mission.bestP95Ms,
         reportId: accepted.reportId,
       });
@@ -1834,14 +1840,18 @@ export class MissionController {
       lesson,
     );
     const target =
-      (mission.baselineP95Ms ?? Number.POSITIVE_INFINITY) * (1 - this.config.targetP95Reduction);
-    if ((p95 ?? Number.POSITIVE_INFINITY) <= target) {
+      mission.baselineP95Ms === null
+        ? null
+        : improvedBound(mission.baselineP95Ms, targetImprovementOf(this.config), this.metric);
+    if (value !== null && target !== null && reaches(value, target, this.metric)) {
       await this.ledger.upsertTask({
-        ...TASKS[1]!,
+        ...this.tasks[1]!,
         missionId: this.config.missionId,
         status: "done",
       });
-      this.log(`target reached: p95 ${p95}ms <= ${target.toFixed(2)}ms`);
+      this.log(
+        `target reached: ${formatMetric(value, this.metric)} ${this.metric.direction === "minimize" ? "<=" : ">="} ${target.toFixed(2)}${this.metric.unit}`,
+      );
     }
     return verdict;
   }
@@ -1951,7 +1961,7 @@ export class MissionController {
           .map((r) => `${r.suite}=${r.status}`)
           .join(", ") || "not run",
       performance: perf
-        ? `p95 ${perf.metrics.p95LatencyMs ?? "n/a"}ms (${perf.status}); best before ${mission.bestP95Ms ?? "n/a"}ms; baseline ${mission.baselineP95Ms ?? "n/a"}ms`
+        ? `${formatMetric(metricValue(perf.metrics, this.metric), this.metric)} (${perf.status}); best before ${mission.bestP95Ms ?? "n/a"}${this.metric.unit}; baseline ${mission.baselineP95Ms ?? "n/a"}${this.metric.unit}`
         : "not run",
       outcome: `${verdict}: ${reason}`,
       uncertainty: `${story.seededFixture ? `seeded fault-injection fixture: ${story.seededFixture}; worker claim "${story.claim}" is not evidence` : `worker claim "${story.claim}" is model interpretation; verifier reports are the evidence`}${story.claimIssues && story.claimIssues.length > 0 ? `; claim disagrees with verifier: ${story.claimIssues.join("; ")}` : ""}`,
@@ -2005,7 +2015,7 @@ export class MissionController {
         { verdict, reason },
       );
       await tx.updateMission(this.config.missionId, { activeTaskId: null });
-      await this.checkpoint(tx, "running", "optimize-search", null, "concluded");
+      await this.checkpoint(tx, "running", this.optimizeTaskId, null, "concluded");
     });
     this.crash("concluded");
     this.log(
@@ -2024,15 +2034,14 @@ export class MissionController {
       return "the timing difference was within measurement noise; look for a mechanism with a larger effect or profile to confirm the bottleneck";
     if (verdict === "inconclusive")
       return "retry the same change; the failure was infrastructure, not product";
-    if (reason.startsWith("correctness"))
-      return "read the failing assertion evidence, then restore invalidation before optimizing again";
+    if (reason.startsWith("correctness")) return this.spec.correctionHint;
     if (mission.bestP95Ms !== null)
       return "the change did not beat the current best by the margin; try a different mechanism";
     return "review evidence";
   }
 
   private featuresFor(reports: VerificationReport[]): string[] {
-    const features = JSON.parse(readFileSync(join(RESOURCES_DIR, "features.json"), "utf8")) as {
+    const features = JSON.parse(readFileSync(this.spec.featuresPath, "utf8")) as {
       features: { id: string; invariants: string[] }[];
     };
     const touched = new Set(
@@ -2097,7 +2106,7 @@ export class MissionController {
     const artifact = this.artifacts.pathFor(hash);
     if (!this.artifacts.verify(hash)) throw new Error(`artifact ${hash} does not verify`);
     const mission = await this.mission();
-    const report = await runSuite(
+    const report = await this.spec.evaluator.run(
       {
         missionId: this.config.missionId,
         experimentId,
@@ -2105,13 +2114,7 @@ export class MissionController {
         evaluatorHash: this.evaluatorHash,
         environmentHash: this.environmentHash,
         snapshotDir: artifact,
-        isolation: this.config.isolation,
-        containerImage: this.config.containerImage,
-        startupTimeoutMs: this.config.startupTimeoutMs,
-        requestTimeoutMs: this.config.requestTimeoutMs,
-        memoryLimitBytes: this.config.memoryLimitBytes,
-        workload: this.config.workload,
-        holdoutWorkload: this.config.holdoutWorkload,
+        config: this.config,
         learnedScenariosDir: this.paths.learnedScenarios,
         learnedSuiteVersion: mission.learnedSuiteVersion,
         evidence: this.evidence,
@@ -2119,15 +2122,19 @@ export class MissionController {
       },
       suite,
     );
-    const check = validateReport(report, {
-      missionId: this.config.missionId,
-      experimentId,
-      suite,
-      artifactHash: hash,
-      evaluatorHash: this.evaluatorHash,
-      workloadHash: report.workloadHash,
-      environmentHash: this.environmentHash,
-    });
+    const check = validateReport(
+      report,
+      {
+        missionId: this.config.missionId,
+        experimentId,
+        suite,
+        artifactHash: hash,
+        evaluatorHash: this.evaluatorHash,
+        workloadHash: report.workloadHash,
+        environmentHash: this.environmentHash,
+      },
+      this.metric,
+    );
     if (!check.ok) throw new Error(`runner produced an invalid report: ${check.reason}`);
     const dir = join(this.paths.reports, experimentId);
     mkdirSync(dir, { recursive: true });
@@ -2143,12 +2150,12 @@ export class MissionController {
         suite,
         status: report.status,
         hash,
-        p95: report.metrics.p95LatencyMs ?? null,
+        [this.metric.label]: metricValue(report.metrics, this.metric) ?? null,
         isolation: report.isolation,
       });
     });
     this.log(
-      `  ${suite}: ${report.status}${report.metrics.p95LatencyMs !== undefined ? ` p95=${report.metrics.p95LatencyMs}ms` : ""}${report.infraMessage ? ` (${report.infraMessage})` : ""}`,
+      `  ${suite}: ${report.status}${metricValue(report.metrics, this.metric) !== undefined ? ` ${this.metric.label}=${metricValue(report.metrics, this.metric)}${this.metric.unit}` : ""}${report.infraMessage ? ` (${report.infraMessage})` : ""}`,
     );
     return report;
   }
@@ -2207,7 +2214,7 @@ export class MissionController {
 
   private async performanceLessons(): Promise<PerformanceLesson[]> {
     return (await this.ledger.listLessons(this.config.missionId))
-      .map(decodePerformanceLesson)
+      .map((row) => decodePerformanceLesson(row, this.metric))
       .filter((l): l is PerformanceLesson => l !== undefined);
   }
 
@@ -2216,6 +2223,7 @@ export class MissionController {
     return decidePerformancePolicy(
       await this.performanceLessons(),
       this.config.performanceRejectionLimit ?? DEFAULT_PERFORMANCE_REJECTION_LIMIT,
+      this.metric,
     );
   }
 
@@ -2246,6 +2254,7 @@ export class MissionController {
       mechanism,
       hypothesis: story.hypothesis,
       featureIds: this.featuresFor(reports),
+      metric: this.metric.lessonMetric,
       observation: {
         experimentId: experiment.experimentId,
         episodeId: `ep-${experiment.experimentId}-v1`,
@@ -2278,9 +2287,15 @@ export class MissionController {
     experimentId: string,
     proposal: RegressionProposal,
   ): Promise<{ accepted: boolean; reason: string; lessonId?: string }> {
+    const regressions = this.spec.regressions;
+    if (!regressions)
+      return {
+        accepted: false,
+        reason: `objective ${this.spec.id} has no learned-regression suite`,
+      };
     const mission = await this.mission();
     const existingIds = new Set([
-      ...loadScenarios().map((s) => s.scenarioId),
+      ...loadScenarios(this.spec.scenariosDir).map((s) => s.scenarioId),
       ...(await this.ledger.listLearnedScenarios(this.config.missionId)).map((s) => s.scenarioId),
     ]);
     const shape = validateProposalShape(proposal, existingIds);
@@ -2327,9 +2342,9 @@ export class MissionController {
     await transition("proposed", null);
 
     const seed = mission.seedArtifactHash!;
-    const { artifact: negative } = this.artifacts.importFixture("stale-cache", seed);
+    const { artifact: negative } = this.artifacts.importFixture(regressions.negativeFixture, seed);
     const runLearned = (snapshotDir: string, artifactHash: string, scenarioDir: string) =>
-      runSuite(
+      this.spec.evaluator.run(
         {
           missionId: this.config.missionId,
           experimentId: `lesson-${lessonId}-${experimentId}`,
@@ -2337,13 +2352,7 @@ export class MissionController {
           evaluatorHash: this.evaluatorHash,
           environmentHash: this.environmentHash,
           snapshotDir,
-          isolation: this.config.isolation,
-          containerImage: this.config.containerImage,
-          startupTimeoutMs: this.config.startupTimeoutMs,
-          requestTimeoutMs: this.config.requestTimeoutMs,
-          memoryLimitBytes: this.config.memoryLimitBytes,
-          workload: this.config.workload,
-          holdoutWorkload: this.config.holdoutWorkload,
+          config: this.config,
           learnedScenariosDir: scenarioDir,
           evidence: this.evidence,
           containerRegistry: this.containerRegistry(`lesson-${lessonId}-${experimentId}`),
@@ -2415,11 +2424,11 @@ export class MissionController {
     return { accepted: true, reason: validation.reason, lessonId };
   }
 
-  /** Consecutive concluded optimize-search experiments since the last accepted one; none of them improved the best. */
+  /** Consecutive concluded optimize-task experiments since the last accepted one; none of them improved the best. */
   async stagnation(): Promise<StagnationState> {
     const concluded = (await this.ledger.listExperiments(this.config.missionId)).filter(
       (e) =>
-        e.taskId === "optimize-search" &&
+        e.taskId === this.optimizeTaskId &&
         (e.status === "accepted" || e.status === "rejected" || e.status === "inconclusive"),
     );
     const run: ExperimentRow[] = [];
@@ -2442,14 +2451,14 @@ export class MissionController {
     focusFeatureIds: string[] = [],
   ): Promise<string> {
     const task = (await this.ledger.listTasks(this.config.missionId)).find(
-      (t) => t.taskId === "optimize-search",
+      (t) => t.taskId === this.optimizeTaskId,
     );
     const last = experiments
       .filter((e) => e.experimentId !== experimentId && e.verdict !== null)
       .at(-1);
     const episode = last ? await this.ledger.getEpisode(`ep-${last.experimentId}-v1`) : undefined;
     return composeRetrievalQuery({
-      taskId: "optimize-search",
+      taskId: this.optimizeTaskId,
       hypothesis: last?.hypothesis ?? task?.hypothesis ?? null,
       // Features touched by accepted mechanisms come first so ranking leans toward episodes that share them.
       featureIds: [...new Set([...focusFeatureIds, ...(episode?.featureIds ?? [])])],
@@ -2466,7 +2475,7 @@ export class MissionController {
     policy: PerformancePolicy,
   ): Promise<ContextPacket> {
     const experiments = (await this.ledger.listExperiments(this.config.missionId)).filter(
-      (e) => e.taskId === "optimize-search",
+      (e) => e.taskId === this.optimizeTaskId,
     );
     // Bounded recent history: only this segment's experiments are replayed verbatim; older segments are reachable through retrieval.
     const recentRows = experiments
@@ -2480,13 +2489,13 @@ export class MissionController {
       );
     }
     const recent = recentLines.join("\n\n");
-    const features = readFileSync(join(RESOURCES_DIR, "features.json"), "utf8");
-    const skill = readFileSync(join(RESOURCES_DIR, "skills/verify-search/SKILL.md"), "utf8");
+    const features = readFileSync(this.spec.featuresPath, "utf8");
+    const skill = readFileSync(this.spec.skillPath, "utf8");
     const query = await this.retrievalQuery(experiments, experimentId, policy.focusFeatureIds);
-    const lessons = rankPerformanceLessons(await this.performanceLessons());
+    const lessons = rankPerformanceLessons(await this.performanceLessons(), this.metric);
     const nextAction =
       (await this.ledger.listTasks(this.config.missionId)).find(
-        (t) => t.taskId === "optimize-search",
+        (t) => t.taskId === this.optimizeTaskId,
       )?.nextAction ?? "";
     const retrievalStartedAt = performance.now();
     const retrieval = this.config.memory.enabled
@@ -2527,9 +2536,9 @@ export class MissionController {
     const lastVerdict = experiments.at(-1)?.verdict ?? "no experiments yet";
     const pinned = [
       `Mission ${mission.missionId} (contract v${mission.contractVersion}, hash ${mission.contractHash.slice(0, 12)}). Objective: ${this.config.objective}`,
-      `Baseline p95 ${mission.baselineP95Ms ?? "unmeasured"}ms; current best ${mission.bestP95Ms ?? "n/a"}ms (artifact ${(mission.bestArtifactHash ?? "").slice(0, 12)}); target <= ${mission.baselineP95Ms !== null ? (mission.baselineP95Ms * (1 - this.config.targetP95Reduction)).toFixed(2) : "?"}ms; acceptance margin ${this.timingPolicy(mission).acceptanceMargin}.`,
+      `Baseline ${this.metric.label} ${mission.baselineP95Ms ?? "unmeasured"}${this.metric.unit}; current best ${mission.bestP95Ms ?? "n/a"}${this.metric.unit} (artifact ${(mission.bestArtifactHash ?? "").slice(0, 12)}); target ${this.metric.direction === "minimize" ? "<=" : ">="} ${mission.baselineP95Ms !== null ? improvedBound(mission.baselineP95Ms, targetImprovementOf(this.config), this.metric).toFixed(2) : "?"}${this.metric.unit}; acceptance margin ${this.timingPolicy(mission).acceptanceMargin}.`,
       `Budget: experiments ${mission.spentExperiments}/${this.config.budget.maxExperiments}; tokens in ${mission.spentInputTokens}/${this.config.budget.maxInputTokens}, out ${mission.spentOutputTokens}/${this.config.budget.maxOutputTokens}; cycle limit ${this.config.budget.cycleTimeoutMs}ms.`,
-      `Constraints: edits only under src/; mutations via DocumentService; contract invariants are fixed; the verifier is the only source of truth. Experiment ${experimentId}.`,
+      `Constraints: ${this.spec.constraints} Experiment ${experimentId}.`,
       retrieval.degraded
         ? "Memory service degraded: retrieved episodes come from the local cache."
         : null,
@@ -2545,7 +2554,9 @@ export class MissionController {
           episodeId: r.episodeId,
           text: r.text,
         })),
-        ...(lessons.length > 0 ? { lessons: renderPerformanceLessons(lessons, policy) } : {}),
+        ...(lessons.length > 0
+          ? { lessons: renderPerformanceLessons(lessons, policy, this.metric) }
+          : {}),
         next: `Last verdict: ${lastVerdict}\nNext action: ${nextAction}\n${
           stagnation.stagnated
             ? `Stagnation: ${stagnation.count} completed experiments without a valid improvement (limit ${this.config.stagnationLimit}). This cycle must call profile_candidate before editing or try a mechanism other than: ${stagnation.triedHypotheses.join(" | ")}. Repeating one of those without profiling is rejected without verification.\n`
@@ -2617,7 +2628,7 @@ export class MissionController {
         });
         return {
           evidenceId,
-          summary: `${scenario}: ${report.status}; p95 ${report.metrics.p95LatencyMs ?? "n/a"}ms; per-repetition ${JSON.stringify(report.metrics.repetitionP95Ms ?? [])}`,
+          summary: `${scenario}: ${report.status}; ${formatMetric(metricValue(report.metrics, this.metric), this.metric)}; per-repetition ${JSON.stringify(metricSeries(report.metrics, this.metric) ?? [])}`,
         };
       },
       recall: async (query, limit) => {
@@ -2700,7 +2711,7 @@ export class MissionController {
       const checkpoint = await this.checkpoint(
         tx,
         "running",
-        "optimize-search",
+        this.optimizeTaskId,
         null,
         `segment-open:${ordinal}`,
       );

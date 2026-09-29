@@ -92,8 +92,9 @@ export class ArtifactStore {
   }
 
   /** Materialize the seed service as the parent of all experiments. */
-  importSeed(): ArtifactRecord {
-    return this.snapshot(SEED_DIR, null);
+  /** Snapshot the objective's seed artifact; the search-service demo when none is given. */
+  importSeed(seedDir: string = SEED_DIR): ArtifactRecord {
+    return this.snapshot(seedDir, null);
   }
 
   /** Build a labeled fault-injection artifact: seed + overlay. Never presented as a natural discovery. */

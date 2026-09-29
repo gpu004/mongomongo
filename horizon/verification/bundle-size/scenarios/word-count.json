@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "scenarioId": "word-count",
+  "description": "Words are maximal runs of letters or digits.",
+  "suite": "correctness",
+  "invariantIds": ["TK-WORD-COUNT"],
+  "cases": [
+    {
+      "fn": "wordCount",
+      "args": [""]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["one"]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["two words"]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["  many   spaces  here "]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["hyphen-ated and under_scored"]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["numbers 42 and 3.14"]
+    },
+    {
+      "fn": "wordCount",
+      "args": ["the and of a"]
+    }
+  ]
+}
